@@ -102,10 +102,13 @@ Purpose:
 
 Data sources:
 - CryptoPanic posts API (news)
-- Reddit via praw from:
+- Reddit public JSON endpoint from:
   - r/CryptoCurrency
   - r/Bitcoin
   - r/Ethereum
+- StockTwits symbol streams:
+  - BTC.X
+  - ETH.X
 
 Keyword filter:
 - BTC
@@ -116,32 +119,33 @@ Keyword filter:
 - Bearish
 
 Output in data/raw:
-- crypto_text_data.csv
+- crypto_text.csv
 
 Output fields:
 - timestamp
 - source
-- asset_tag
-- text_content
+- asset
+- text
+- user_sentiment
 - text_hash
-- metadata
 
 Design details:
 - Timestamp is aligned to Binance-style hourly UTC bucket in milliseconds.
 - Text cleaning removes URLs, emojis/non-ASCII, and special characters.
 - Deduplication uses SHA-256 text_hash to avoid duplicate rows across runs.
 - Historical backfill for CryptoPanic uses next-page pagination until limit.
-- Polite rate limiting is applied for both CryptoPanic and Reddit requests.
+- Polite rate limiting is applied for CryptoPanic, Reddit, and StockTwits requests.
 
 Required credentials for full collection:
-- CRYPTOPANIC_AUTH_TOKEN
-- REDDIT_CLIENT_ID
-- REDDIT_CLIENT_SECRET
-- REDDIT_USER_AGENT (recommended)
+- CRYPTOPANIC_API_KEY
+- REDDIT_USER_AGENT (required; use a non-default browser-like User-Agent)
+
+StockTwits credentials:
+- No API key required for the public symbol endpoint.
 
 Behavior when missing setup:
 - Missing CryptoPanic token: news collection is skipped with warning.
-- Missing praw or Reddit credentials: Reddit collection is skipped with warning.
+- Missing REDDIT_USER_AGENT: Reddit collection is skipped with warning.
 
 ## Environment and Dependencies
 

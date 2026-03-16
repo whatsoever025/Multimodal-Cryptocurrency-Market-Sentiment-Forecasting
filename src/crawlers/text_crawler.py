@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import praw
 import requests
 from dotenv import load_dotenv
 
@@ -42,42 +41,10 @@ class TextCrawler:
         load_dotenv(self.project_root / ".env")
 
         self.cryptopanic_api_key = os.getenv("CRYPTOPANIC_API_KEY")
-        self.reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
-        self.reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
         self.reddit_user_agent = os.getenv("REDDIT_USER_AGENT")
-
-        self.reddit = self._init_reddit_client()
 
         logger.info("TextCrawler initialized")
         logger.info(f"Output file: {self.output_file.absolute()}")
-
-    def _init_reddit_client(self):
-        """Initialize Reddit API client or return None if credentials are missing."""
-        required = [
-            self.reddit_client_id,
-            self.reddit_client_secret,
-            self.reddit_user_agent,
-        ]
-        if not all(required):
-            logger.warning(
-                "Reddit credentials missing. Skipping Reddit source. "
-                "Set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT in .env."
-            )
-            return None
-
-        try:
-            reddit = praw.Reddit(
-                client_id=self.reddit_client_id,
-                client_secret=self.reddit_client_secret,
-                user_agent=self.reddit_user_agent,
-            )
-            # Lightweight check to fail early on invalid credentials.
-            _ = reddit.read_only
-            logger.info("Reddit client initialized")
-            return reddit
-        except Exception as exc:
-            logger.warning(f"Failed to initialize Reddit client. Skipping Reddit source: {exc}")
-            return None
 
     @staticmethod
     def _align_timestamp_to_hour(dt):
@@ -106,9 +73,22 @@ class TextCrawler:
         payload = f"{asset.lower()}::{text.lower()}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def fetch_cryptopanic_news(self):
+    @staticmethod
+    def _default_user_agent():
+        """Fallback User-Agent for public endpoints that reject default requests UA."""
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ThesisBot/1.0"
+
+    def _fetch_cryptopanic(self):
         """
-        Fetch BTC/ETH news titles from CryptoPanic.
+        Fetch BTC/ETH news titles from CryptoPanic API V2 (DEVELOPER tier).
+
+        Strictly follows API V2 DEVELOPER tier documentation:
+        - Uses /api/developer/v2/posts/ endpoint
+        - Handles pagination via response['next'] URL (no size/last_pull parameters available)
+        - Extracts timestamp from published_at (ISO 8601 format)
+        - Extracts title from title field
+        - Maps assets from currencies or infers from instruments
+        - Applies 1-second rate limiting between paginated requests
 
         Returns:
             List of dictionaries with text records.
@@ -120,128 +100,245 @@ class TextCrawler:
             )
             return []
 
-        endpoint = "https://cryptopanic.com/api/v1/posts/"
+        # API V2 DEVELOPER tier endpoint as per documentation
+        base_endpoint = "https://cryptopanic.com/api/developer/v2/posts/"
+
+        # Initial request parameters per API V2 spec
         params = {
             "auth_token": self.cryptopanic_api_key,
+            "public": "true",  # Recommended for general data
             "currencies": "BTC,ETH",
-            "kind": "news",
-            "public": "true",
         }
 
         records = []
+        next_url = base_endpoint
 
         try:
-            response = requests.get(endpoint, params=params, timeout=self.request_timeout)
-            response.raise_for_status()
-            payload = response.json()
-
-            for item in payload.get("results", []):
-                title = self._clean_text(item.get("title", ""))
-                if not title:
-                    continue
-
-                created_at = item.get("created_at")
-                parsed_dt = pd.to_datetime(created_at, utc=True, errors="coerce")
-                if pd.isna(parsed_dt):
-                    aligned_ts = self._align_timestamp_to_hour(None)
+            while next_url:
+                logger.info(f"Fetching CryptoPanic page: {next_url}")
+                
+                # For initial request, pass params; for paginated requests, use next_url as-is
+                if next_url == base_endpoint:
+                    response = requests.get(next_url, params=params, timeout=self.request_timeout)
                 else:
-                    aligned_ts = self._align_timestamp_to_hour(parsed_dt.tz_convert(None))
+                    response = requests.get(next_url, timeout=self.request_timeout)
 
-                currencies = item.get("currencies") or []
-                assets = []
-                for c in currencies:
-                    code = (c.get("code") or "").upper().strip()
-                    if code in {"BTC", "ETH"}:
-                        assets.append(code)
+                response.raise_for_status()
+                payload = response.json()
 
-                if not assets:
-                    assets = ["BTC", "ETH"]
+                # Iterate through results array per API V2 spec
+                results = payload.get("results", [])
+                logger.info(f"Processing {len(results)} items from current page")
 
-                for asset in assets:
-                    records.append(
-                        {
-                            "timestamp": aligned_ts,
-                            "source": "cryptopanic",
-                            "asset": asset,
-                            "text": title,
-                        }
-                    )
+                for item in results:
+                    # Extract title
+                    title = self._clean_text(item.get("title", ""))
+                    if not title:
+                        continue
+
+                    # Extract timestamp from published_at (ISO 8601 format per API V2)
+                    published_at = item.get("published_at")
+                    parsed_dt = pd.to_datetime(published_at, utc=True, errors="coerce")
+                    if pd.isna(parsed_dt):
+                        aligned_ts = self._align_timestamp_to_hour(None)
+                    else:
+                        aligned_ts = self._align_timestamp_to_hour(parsed_dt.tz_convert(None))
+
+                    # Map assets: extract from currencies array or infer from instruments
+                    assets = []
+
+                    # First priority: currencies array
+                    currencies = item.get("currencies") or []
+                    for c in currencies:
+                        code = (c.get("code") or "").upper().strip()
+                        if code in {"BTC", "ETH"}:
+                            assets.append(code)
+
+                    # Fallback: check instruments array for code field
+                    if not assets:
+                        instruments = item.get("instruments") or []
+                        for instrument in instruments:
+                            code = (instrument.get("code") or "").upper().strip()
+                            if code in {"BTC", "ETH"}:
+                                assets.append(code)
+
+                    # If still no assets found, skip this item
+                    if not assets:
+                        continue
+
+                    # Create one record per asset
+                    for asset in assets:
+                        records.append(
+                            {
+                                "timestamp": aligned_ts,
+                                "source": "cryptopanic",
+                                "asset": asset,
+                                "text": title,
+                                "user_sentiment": None,
+                            }
+                        )
+
+                # Get next page URL from response per API V2 pagination spec
+                next_url = payload.get("next")
+                
+                # Rate limiting: 1 second between requests per API V2 DEVELOPER tier guidelines
+                if next_url:
+                    time.sleep(1)
 
             logger.info(f"Fetched {len(records)} text rows from CryptoPanic")
         except Exception as exc:
             logger.error(f"CryptoPanic fetch failed: {exc}")
 
-        # Strict rate limiting.
-        time.sleep(2)
         return records
 
-    def fetch_reddit_posts(self, post_limit=50):
+    def _fetch_reddit(self, post_limit=50):
         """
-        Fetch hot and top posts from selected crypto subreddits.
+        Fetch posts from selected crypto subreddits using Reddit's public .json endpoint.
 
         Args:
-            post_limit: Number of posts to fetch per listing
+            post_limit: Maximum number of posts to fetch per subreddit
 
         Returns:
             List of dictionaries with text records.
         """
-        if self.reddit is None:
+        if not self.reddit_user_agent:
+            logger.warning(
+                "REDDIT_USER_AGENT missing. Skipping Reddit source. "
+                "Set REDDIT_USER_AGENT in .env to avoid Reddit blocking requests."
+            )
             return []
 
         records = []
-        subreddits = ["CryptoCurrency", "Bitcoin"]
+        subreddits = ["CryptoCurrency", "Bitcoin", "Ethereum"]
+        headers = {"User-Agent": self.reddit_user_agent or self._default_user_agent()}
 
         for subreddit_name in subreddits:
+            fetched_for_subreddit = 0
+            after = None
+
             try:
-                subreddit = self.reddit.subreddit(subreddit_name)
+                while fetched_for_subreddit < post_limit:
+                    page_size = min(100, post_limit - fetched_for_subreddit)
+                    endpoint = f"https://www.reddit.com/r/{subreddit_name}.json"
+                    params = {"limit": page_size}
+                    if after:
+                        params["after"] = after
 
-                for post in subreddit.hot(limit=post_limit):
-                    text = self._clean_text(post.title)
-                    if not text:
-                        continue
-
-                    asset = "BTC" if subreddit_name.lower() == "bitcoin" else "BTC,ETH"
-                    aligned_ts = self._align_timestamp_to_hour(
-                        datetime.utcfromtimestamp(post.created_utc)
+                    response = requests.get(
+                        endpoint,
+                        params=params,
+                        headers=headers,
+                        timeout=self.request_timeout,
                     )
-                    records.append(
-                        {
-                            "timestamp": aligned_ts,
-                            "source": f"reddit:{subreddit_name.lower()}:hot",
-                            "asset": asset,
-                            "text": text,
-                        }
-                    )
+                    response.raise_for_status()
 
-                # Strict rate limiting between listing calls.
-                time.sleep(2)
+                    payload = response.json()
+                    children = payload.get("data", {}).get("children", [])
+                    if not children:
+                        break
 
-                for post in subreddit.top(time_filter="day", limit=post_limit):
-                    text = self._clean_text(post.title)
-                    if not text:
-                        continue
+                    for post in children:
+                        post_data = post.get("data", {})
+                        title = post_data.get("title", "")
+                        selftext = post_data.get("selftext", "")
+                        combined_text = self._clean_text(f"{title} {selftext}".strip())
+                        if not combined_text:
+                            continue
 
-                    asset = "BTC" if subreddit_name.lower() == "bitcoin" else "BTC,ETH"
-                    aligned_ts = self._align_timestamp_to_hour(
-                        datetime.utcfromtimestamp(post.created_utc)
-                    )
-                    records.append(
-                        {
-                            "timestamp": aligned_ts,
-                            "source": f"reddit:{subreddit_name.lower()}:top",
-                            "asset": asset,
-                            "text": text,
-                        }
-                    )
+                        created_utc = post_data.get("created_utc")
+                        if created_utc is None:
+                            aligned_ts = self._align_timestamp_to_hour(None)
+                        else:
+                            aligned_ts = self._align_timestamp_to_hour(
+                                datetime.utcfromtimestamp(created_utc)
+                            )
 
-                # Strict rate limiting between subreddits.
-                time.sleep(2)
+                        if subreddit_name.lower() == "bitcoin":
+                            asset = "BTC"
+                        elif subreddit_name.lower() == "ethereum":
+                            asset = "ETH"
+                        else:
+                            asset = "BTC,ETH"
+
+                        records.append(
+                            {
+                                "timestamp": aligned_ts,
+                                "source": f"Reddit - r/{subreddit_name}",
+                                "asset": asset,
+                                "text": combined_text,
+                                "user_sentiment": None,
+                            }
+                        )
+
+                    fetched_for_subreddit += len(children)
+                    after = payload.get("data", {}).get("after")
+                    if not after:
+                        break
+
+                    # Aggressive Reddit throttling between pagination pages.
+                    time.sleep(3)
+
+                # Aggressive Reddit throttling between subreddit requests.
+                time.sleep(3)
 
             except Exception as exc:
                 logger.error(f"Reddit fetch failed for r/{subreddit_name}: {exc}")
-                time.sleep(2)
+                time.sleep(3)
 
         logger.info(f"Fetched {len(records)} text rows from Reddit")
+        return records
+
+    def _fetch_stocktwits(self):
+        """
+        Fetch social messages from StockTwits symbol streams.
+
+        Returns:
+            List of dictionaries with text records.
+        """
+        records = []
+        symbols = [("BTC.X", "BTC"), ("ETH.X", "ETH")]
+        headers = {"User-Agent": self.reddit_user_agent or self._default_user_agent()}
+
+        for symbol, asset in symbols:
+            endpoint = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
+            try:
+                response = requests.get(endpoint, headers=headers, timeout=self.request_timeout)
+                response.raise_for_status()
+                payload = response.json()
+
+                for message in payload.get("messages", []):
+                    body = self._clean_text(message.get("body", ""))
+                    if not body:
+                        continue
+
+                    created_at = message.get("created_at")
+                    parsed_dt = pd.to_datetime(created_at, utc=True, errors="coerce")
+                    if pd.isna(parsed_dt):
+                        aligned_ts = self._align_timestamp_to_hour(None)
+                    else:
+                        aligned_ts = self._align_timestamp_to_hour(parsed_dt.tz_convert(None))
+
+                    entities = message.get("entities") or {}
+                    sentiment = entities.get("sentiment") or {}
+                    user_sentiment = sentiment.get("basic")
+
+                    records.append(
+                        {
+                            "timestamp": aligned_ts,
+                            "source": "StockTwits",
+                            "asset": asset,
+                            "text": body,
+                            "user_sentiment": user_sentiment,
+                        }
+                    )
+
+                # Conservative pacing between symbols.
+                time.sleep(2)
+            except Exception as exc:
+                logger.error(f"StockTwits fetch failed for {symbol}: {exc}")
+                time.sleep(2)
+
+        logger.info(f"Fetched {len(records)} text rows from StockTwits")
         return records
 
     def _load_existing_hashes(self):
@@ -294,6 +391,7 @@ class TextCrawler:
                     "source": record["source"],
                     "asset": record["asset"],
                     "text": record["text"],
+                    "user_sentiment": record.get("user_sentiment"),
                     "text_hash": text_hash,
                 }
             )
@@ -302,11 +400,28 @@ class TextCrawler:
             logger.info("No new rows after deduplication")
             return 0
 
+        schema_cols = ["timestamp", "source", "asset", "text", "user_sentiment", "text_hash"]
         df_new = pd.DataFrame(new_rows)
-        df_new = df_new.sort_values("timestamp").reset_index(drop=True)
+        for col in schema_cols:
+            if col not in df_new.columns:
+                df_new[col] = pd.NA
+        df_new = df_new[schema_cols].sort_values("timestamp").reset_index(drop=True)
 
         if self.output_file.exists():
-            df_new.to_csv(self.output_file, mode="a", header=False, index=False)
+            try:
+                existing_df = pd.read_csv(self.output_file)
+                for col in schema_cols:
+                    if col not in existing_df.columns:
+                        existing_df[col] = pd.NA
+                existing_df = existing_df[schema_cols]
+                combined_df = pd.concat([existing_df, df_new], ignore_index=True)
+                combined_df = combined_df.sort_values("timestamp").reset_index(drop=True)
+                combined_df.to_csv(self.output_file, index=False)
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to merge with existing dataset schema, falling back to append mode: {exc}"
+                )
+                df_new.to_csv(self.output_file, mode="a", header=False, index=False)
         else:
             df_new.to_csv(self.output_file, index=False)
 
@@ -320,8 +435,20 @@ class TextCrawler:
         logger.info("=" * 80)
 
         records = []
-        records.extend(self.fetch_cryptopanic_news())
-        records.extend(self.fetch_reddit_posts(post_limit=50))
+        try:
+            records.extend(self._fetch_reddit(post_limit=50))
+        except Exception as exc:
+            logger.error(f"Reddit pipeline step failed: {exc}")
+
+        try:
+            records.extend(self._fetch_stocktwits())
+        except Exception as exc:
+            logger.error(f"StockTwits pipeline step failed: {exc}")
+
+        try:
+            records.extend(self._fetch_cryptopanic())
+        except Exception as exc:
+            logger.error(f"CryptoPanic pipeline step failed: {exc}")
 
         inserted = self.save_records(records)
 
@@ -332,5 +459,23 @@ class TextCrawler:
     def run(self):
         """Standardized run method for orchestrator compatibility."""
         logger.info("TextCrawler.run() started")
-        self.crawl_all()
+
+        records = []
+        try:
+            records.extend(self._fetch_reddit(post_limit=50))
+        except Exception as exc:
+            logger.error(f"Reddit pipeline step failed: {exc}")
+
+        try:
+            records.extend(self._fetch_stocktwits())
+        except Exception as exc:
+            logger.error(f"StockTwits pipeline step failed: {exc}")
+
+        try:
+            records.extend(self._fetch_cryptopanic())
+        except Exception as exc:
+            logger.error(f"CryptoPanic pipeline step failed: {exc}")
+
+        inserted = self.save_records(records)
+        logger.info(f"TextCrawler.run() inserted {inserted} new rows")
         logger.info("TextCrawler.run() completed successfully")
