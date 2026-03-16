@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'src'))
 from crawlers.binance_crawler import BinanceCrawler
 from crawlers.coingecko_crawler import CoinGeckoCrawler
 from crawlers.sentiment_crawler import SentimentCrawler
+from crawlers.text_crawler import TextCrawler
 
 
 # Centralized logging configuration
@@ -91,6 +92,11 @@ class CrawlerRegistry:
         
         # Register Sentiment crawler
         self.register('sentiment', SentimentCrawler, {
+            'base_path': str(self.data_path)
+        })
+
+        # Register Text crawler
+        self.register('text', TextCrawler, {
             'base_path': str(self.data_path)
         })
         
@@ -240,7 +246,7 @@ Examples:
         '--source',
         type=str,
         action='append',
-        choices=['binance', 'coingecko', 'sentiment', 'twitter', 'reddit', 'news'],
+        choices=['binance', 'coingecko', 'sentiment', 'text', 'twitter', 'reddit', 'news'],
         help='Specific crawler(s) to run. Can be specified multiple times. If not specified, runs all crawlers.'
     )
     

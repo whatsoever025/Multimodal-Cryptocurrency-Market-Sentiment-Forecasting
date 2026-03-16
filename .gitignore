@@ -1,0 +1,51 @@
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+
+# Logs and runtime files
+*.log
+
+# Generated data artifacts
+# Keep folder structure if using placeholder files
+data/processed/**
+!data/processed/.gitkeep
+!data/processed/**/.gitkeep
+
+data/raw/**
+!data/raw/.gitkeep
+!data/raw/**/.gitkeep
+
+# Generated charts/images
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.webp
+
+# Local test/coverage outputs
+.coverage
+htmlcov/
