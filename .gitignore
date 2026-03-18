@@ -49,3 +49,6 @@ data/raw/**
 # Local test/coverage outputs
 .coverage
 htmlcov/
+
+# Crawlers specific pycache
+src/crawlers/__pycache__/
