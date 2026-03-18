@@ -144,6 +144,72 @@ class CoinGeckoCrawler:
             logger.error(f"Error fetching derivatives tickers for {coin_id}: {str(e)}")
             raise
     
+    def fetch_historical_derivatives(self, coin_id='bitcoin', days=90, type_filter='open_interest'):
+        """
+        Fetch historical derivatives data from CoinGecko (OPTION 3 - Historical Exchange APIs).
+        Retrieves time-series derivatives metrics across all exchanges.
+        
+        Args:
+            coin_id: CoinGecko coin ID ('bitcoin', 'ethereum')
+            days: Number of days back to fetch (max ~365)
+            type_filter: Type of data ('open_interest', 'trading_volume', etc.)
+        
+        Returns:
+            DataFrame with historical derivatives data
+        """
+        import json
+        from datetime import datetime, timedelta
+        
+        logger.info(f"Fetching {days}-day historical {type_filter} for {coin_id}")
+        
+        try:
+            # CoinGecko historical derivatives endpoint
+            endpoint = f"{self.base_url}/derivatives/historical"
+            params = {
+                'coin_id': coin_id,
+                'days': days,
+                'type': type_filter  # open_interest or trading_volume
+            }
+            
+            response = requests.get(endpoint, params=params, headers=self.headers, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # Parse historical data
+            records = []
+            for entry in tqdm(data, desc=f"{coin_id} historical {type_filter}"):
+                timestamp = entry[0] if isinstance(entry, list) else entry.get('timestamp')
+                value = entry[1] if isinstance(entry, list) else entry.get('value')
+                
+                records.append({
+                    'timestamp': pd.to_datetime(timestamp, unit='ms') if isinstance(timestamp, (int, float)) else pd.to_datetime(timestamp),
+                    f'{type_filter}_total': float(value) if value else 0,
+                    'coin_id': coin_id,
+                    'datetime': pd.to_datetime(timestamp, unit='ms') if isinstance(timestamp, (int, float)) else pd.to_datetime(timestamp)
+                })
+            
+            df = pd.DataFrame(records)
+            if not df.empty:
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                logger.info(f"Successfully fetched {len(df)} historical {type_filter} records for {coin_id}")
+                logger.info(f"Date range: {df['datetime'].min()} to {df['datetime'].max()}")
+            else:
+                logger.warning(f"No historical data found for {coin_id}")
+            
+            return df
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Historical data endpoint not available for {coin_id} (404)")
+                return pd.DataFrame()
+            else:
+                logger.error(f"HTTP error fetching historical derivatives for {coin_id}: {str(e)}")
+                raise
+        except Exception as e:
+            logger.error(f"Error fetching historical derivatives for {coin_id}: {str(e)}")
+            raise
+    
     def save_to_raw(self, df, filename):
         """
         Save DataFrame to CSV file in the data/raw/ directory.
@@ -166,6 +232,7 @@ class CoinGeckoCrawler:
     def crawl_all(self, coin_ids=['bitcoin', 'ethereum']):
         """
         Comprehensive crawl: fetch derivatives data for specified coins.
+        Includes historical trading volume data.
         
         Args:
             coin_ids: List of CoinGecko coin IDs to fetch
@@ -177,14 +244,14 @@ class CoinGeckoCrawler:
         
         # Fetch global derivatives exchanges data (once)
         try:
-            logger.info("\n--- Fetching Global Derivatives Exchanges Data ---")
+            logger.info("\n--- Fetching Global Derivatives Exchanges Data (Current Snapshot) ---")
             derivatives_df = self.fetch_derivatives_data()
             self.save_to_raw(derivatives_df, "coingecko_derivatives_exchanges.csv")
             time.sleep(2)  # Rate limiting
         except Exception as e:
             logger.error(f"Failed to fetch derivatives exchanges data: {e}")
         
-        # Fetch derivatives tickers for each coin
+        # Fetch derivatives tickers and historical data for each coin
         for idx, coin_id in enumerate(coin_ids, 1):
             try:
                 logger.info(f"\n--- Fetching {coin_id.upper()} Derivatives Tickers ({idx}/{len(coin_ids)}) ---")
@@ -195,13 +262,33 @@ class CoinGeckoCrawler:
                 else:
                     logger.warning(f"No derivatives tickers found for {coin_id}")
                 
+                # Rate limiting between tickers
+                time.sleep(1)
+                
+                # Fetch historical trading volume
+                try:
+                    logger.info(f"\n--- Fetching {coin_id.upper()} Historical Trading Volume (90 days) ---")
+                    volume_history = self.fetch_historical_derivatives(
+                        coin_id=coin_id,
+                        days=90,
+                        type_filter='trading_volume'
+                    )
+                    
+                    if not volume_history.empty:
+                        self.save_to_raw(volume_history, f"{coin_id}_trading_volume_history.csv")
+                    else:
+                        logger.warning(f"No historical volume data for {coin_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to fetch historical volume for {coin_id}: {e}")
+                
                 # Rate limiting between coins
                 if idx < len(coin_ids):
-                    logger.info("Waiting 3 seconds (rate limit)...")
+                    logger.info(f"\nWaiting 3 seconds before next coin (rate limit)...")
                     time.sleep(3)
                     
             except Exception as e:
-                logger.error(f"Failed to fetch derivatives tickers for {coin_id}: {e}")
+                logger.error(f"Failed to fetch derivatives data for {coin_id}: {e}")
                 time.sleep(3)
         
         logger.info("\n" + "=" * 80)
