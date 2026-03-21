@@ -40,7 +40,6 @@ class TextCrawler:
         # Load .env from project root.
         load_dotenv(self.project_root / ".env")
 
-        self.cryptopanic_api_key = os.getenv("CRYPTOPANIC_API_KEY")
         self.reddit_user_agent = os.getenv("REDDIT_USER_AGENT")
 
         logger.info("TextCrawler initialized")
@@ -78,118 +77,6 @@ class TextCrawler:
         """Fallback User-Agent for public endpoints that reject default requests UA."""
         return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ThesisBot/1.0"
 
-    def _fetch_cryptopanic(self):
-        """
-        Fetch BTC/ETH news titles from CryptoPanic API V2 (DEVELOPER tier).
-
-        Strictly follows API V2 DEVELOPER tier documentation:
-        - Uses /api/developer/v2/posts/ endpoint
-        - Handles pagination via response['next'] URL (no size/last_pull parameters available)
-        - Extracts timestamp from published_at (ISO 8601 format)
-        - Extracts title from title field
-        - Maps assets from currencies or infers from instruments
-        - Applies 1-second rate limiting between paginated requests
-
-        Returns:
-            List of dictionaries with text records.
-        """
-        if not self.cryptopanic_api_key:
-            logger.warning(
-                "CRYPTOPANIC_API_KEY missing. Skipping CryptoPanic source. "
-                "Set CRYPTOPANIC_API_KEY in .env."
-            )
-            return []
-
-        # API V2 DEVELOPER tier endpoint as per documentation
-        base_endpoint = "https://cryptopanic.com/api/developer/v2/posts/"
-
-        # Initial request parameters per API V2 spec
-        params = {
-            "auth_token": self.cryptopanic_api_key,
-            "public": "true",  # Recommended for general data
-            "currencies": "BTC,ETH",
-        }
-
-        records = []
-        next_url = base_endpoint
-
-        try:
-            while next_url:
-                logger.info(f"Fetching CryptoPanic page: {next_url}")
-                
-                # For initial request, pass params; for paginated requests, use next_url as-is
-                if next_url == base_endpoint:
-                    response = requests.get(next_url, params=params, timeout=self.request_timeout)
-                else:
-                    response = requests.get(next_url, timeout=self.request_timeout)
-
-                response.raise_for_status()
-                payload = response.json()
-
-                # Iterate through results array per API V2 spec
-                results = payload.get("results", [])
-                logger.info(f"Processing {len(results)} items from current page")
-
-                for item in results:
-                    # Extract title
-                    title = self._clean_text(item.get("title", ""))
-                    if not title:
-                        continue
-
-                    # Extract timestamp from published_at (ISO 8601 format per API V2)
-                    published_at = item.get("published_at")
-                    parsed_dt = pd.to_datetime(published_at, utc=True, errors="coerce")
-                    if pd.isna(parsed_dt):
-                        aligned_ts = self._align_timestamp_to_hour(None)
-                    else:
-                        aligned_ts = self._align_timestamp_to_hour(parsed_dt.tz_convert(None))
-
-                    # Map assets: extract from currencies array or infer from instruments
-                    assets = []
-
-                    # First priority: currencies array
-                    currencies = item.get("currencies") or []
-                    for c in currencies:
-                        code = (c.get("code") or "").upper().strip()
-                        if code in {"BTC", "ETH"}:
-                            assets.append(code)
-
-                    # Fallback: check instruments array for code field
-                    if not assets:
-                        instruments = item.get("instruments") or []
-                        for instrument in instruments:
-                            code = (instrument.get("code") or "").upper().strip()
-                            if code in {"BTC", "ETH"}:
-                                assets.append(code)
-
-                    # If still no assets found, skip this item
-                    if not assets:
-                        continue
-
-                    # Create one record per asset
-                    for asset in assets:
-                        records.append(
-                            {
-                                "timestamp": aligned_ts,
-                                "source": "cryptopanic",
-                                "asset": asset,
-                                "text": title,
-                                "user_sentiment": None,
-                            }
-                        )
-
-                # Get next page URL from response per API V2 pagination spec
-                next_url = payload.get("next")
-                
-                # Rate limiting: 1 second between requests per API V2 DEVELOPER tier guidelines
-                if next_url:
-                    time.sleep(1)
-
-            logger.info(f"Fetched {len(records)} text rows from CryptoPanic")
-        except Exception as exc:
-            logger.error(f"CryptoPanic fetch failed: {exc}")
-
-        return records
 
     def _fetch_reddit(self, post_limit=50):
         """
@@ -445,11 +332,6 @@ class TextCrawler:
         except Exception as exc:
             logger.error(f"StockTwits pipeline step failed: {exc}")
 
-        try:
-            records.extend(self._fetch_cryptopanic())
-        except Exception as exc:
-            logger.error(f"CryptoPanic pipeline step failed: {exc}")
-
         inserted = self.save_records(records)
 
         logger.info("=" * 80)
@@ -470,11 +352,6 @@ class TextCrawler:
             records.extend(self._fetch_stocktwits())
         except Exception as exc:
             logger.error(f"StockTwits pipeline step failed: {exc}")
-
-        try:
-            records.extend(self._fetch_cryptopanic())
-        except Exception as exc:
-            logger.error(f"CryptoPanic pipeline step failed: {exc}")
 
         inserted = self.save_records(records)
         logger.info(f"TextCrawler.run() inserted {inserted} new rows")

@@ -2,46 +2,131 @@
 CoinGecko Crawler for Cryptocurrency Derivatives Data Collection
 Fetches historical Open Interest and Liquidation data from CoinGecko API.
 Uses public API endpoints (Demo API key optional).
+
+Refactored to use BaseCrawler inheritance for consistency.
 """
 
 import requests
 import pandas as pd
 import time
 from pathlib import Path
-import logging
+from typing import List, Dict, Any
 from tqdm import tqdm
 
-logger = logging.getLogger(__name__)
+from .base import BaseCrawler, CrawlerConfig
 
 
-class CoinGeckoCrawler:
+class CoinGeckoCrawler(BaseCrawler):
     """
     Crawler for fetching cryptocurrency derivatives data from CoinGecko API.
     Supports Open Interest and Liquidation data.
+    
+    Inherits from BaseCrawler for:
+    - Standardized initialization and logging
+    - Consistent error handling
+    - Unified configuration management
     """
     
-    def __init__(self, base_path='data/raw', api_key=None):
+    def __init__(self, base_path='data/raw', api_key=None, config: CrawlerConfig = None):
         """
         Initialize CoinGecko Crawler.
         
         Args:
             base_path: Directory path for saving raw data files
             api_key: Optional CoinGecko Demo API key
+            config: Optional CrawlerConfig for customization
         """
+        # Call parent init for standard setup
+        super().__init__(base_path=base_path, config=config)
+        
         self.base_url = "https://api.coingecko.com/api/v3"
         self.api_key = api_key
-        self.base_path = Path(base_path)
-        self.base_path.mkdir(parents=True, exist_ok=True)
         
         # Setup headers
         self.headers = {}
         if self.api_key:
             self.headers['x-cg-demo-api-key'] = self.api_key
-            logger.info("CoinGeckoCrawler initialized with API key")
+            self.logger.info("CoinGeckoCrawler initialized with API key")
         else:
-            logger.info("CoinGeckoCrawler initialized in PUBLIC mode (rate limited)")
+            self.logger.info("CoinGeckoCrawler initialized in PUBLIC mode (rate limited)")
+    
+    def fetch(self) -> List[Dict[str, Any]]:
+        """
+        Fetch derivatives data from CoinGecko API.
         
-        logger.info(f"Data will be saved to: {self.base_path.absolute()}")
+        Returns:
+            List of derivatives records as dictionaries
+        """
+        all_records = []
+        
+        try:
+            # Fetch derivatives exchanges data
+            derivatives_df = self.fetch_derivatives_data()
+            all_records.extend(derivatives_df.to_dict('records'))
+        except Exception as e:
+            self.logger.error(f"Failed to fetch derivatives data: {e}")
+        
+        return all_records
+    
+    def validate(self, records: List[Dict[str, Any]]) -> bool:
+        """
+        Validate derivatives data schema.
+        
+        Checks:
+        - Required fields present
+        - Numeric type validity
+        """
+        if not records:
+            self.logger.warning("No records to validate")
+            return True
+        
+        required_fields = {
+            'exchange', 'open_interest_btc', 'trade_volume_24h_btc'
+        }
+        
+        for i, record in enumerate(records):
+            if not all(field in record for field in required_fields):
+                missing = required_fields - set(record.keys())
+                self.logger.error(f"Record {i} missing fields: {missing}")
+                return False
+        
+        self.logger.info(f"Validated {len(records)} records successfully")
+        return True
+    
+    def save(self, records: List[Dict[str, Any]]) -> int:
+        """
+        Save derivatives records to CSV file.
+        
+        Args:
+            records: List of derivatives records
+            
+        Returns:
+            Number of rows saved
+        """
+        if not records:
+            self.logger.warning("No records to save")
+            return 0
+        
+        try:
+            df = pd.DataFrame(records)
+            
+            # Remove duplicates
+            original_len = len(df)
+            df = df.drop_duplicates(subset=['exchange'], keep='first')
+            deduped = original_len - len(df)
+            if deduped > 0:
+                self.logger.info(f"Removed {deduped} duplicate records")
+            
+            # Save to CSV
+            output_file = self.base_path / 'coingecko_derivatives_exchanges.csv'
+            df.to_csv(output_file, index=False)
+            
+            self.logger.info(f"Successfully saved {len(df)} records to {output_file}")
+            return len(df)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save records: {e}")
+            raise IOError(str(e))
     
     def fetch_derivatives_data(self, coin_id='bitcoin'):
         """
@@ -53,16 +138,16 @@ class CoinGeckoCrawler:
         Returns:
             DataFrame with derivatives data
         """
-        logger.info(f"Fetching derivatives data for {coin_id}")
+        self.logger.info(f"Fetching derivatives data for {coin_id}")
         
         try:
             # Fetch derivatives exchanges data
             endpoint = f"{self.base_url}/derivatives/exchanges"
-            response = requests.get(endpoint, headers=self.headers, timeout=30)
+            response = self.request_with_retry('GET', endpoint, headers=self.headers)
             response.raise_for_status()
             
             exchanges_data = response.json()
-            logger.info(f"Fetched data from {len(exchanges_data)} derivatives exchanges")
+            self.logger.info(f"Fetched data from {len(exchanges_data)} derivatives exchanges")
             
             # Extract relevant data
             derivatives_records = []
@@ -74,236 +159,28 @@ class CoinGeckoCrawler:
                     'trade_volume_24h_btc': exchange.get('trade_volume_24h_btc', 0),
                     'number_of_perpetual_pairs': exchange.get('number_of_perpetual_pairs', 0),
                     'number_of_futures_pairs': exchange.get('number_of_futures_pairs', 0),
-                    'year_established': exchange.get('year_established', None),
-                    'country': exchange.get('country', 'Unknown'),
                     'timestamp': pd.Timestamp.now()
                 }
                 derivatives_records.append(record)
             
             df = pd.DataFrame(derivatives_records)
-            df['datetime'] = df['timestamp']
-            
-            logger.info(f"Successfully fetched {len(df)} derivatives exchange records")
+            self.logger.info(f"Successfully fetched {len(df)} derivatives exchange records")
             return df
             
         except Exception as e:
-            logger.error(f"Error fetching derivatives data for {coin_id}: {str(e)}")
+            self.logger.error(f"Error fetching derivatives data: {str(e)}")
             raise
     
-    def fetch_coin_derivatives_tickers(self, coin_id='bitcoin'):
+    def run(self) -> int:
         """
-        Fetch derivatives tickers for a specific coin.
-        
-        Args:
-            coin_id: CoinGecko coin ID ('bitcoin', 'ethereum')
+        Standard orchestration flow for crawler. Uses parent's run() implementation.
         
         Returns:
-            DataFrame with derivatives tickers data
+            Number of records saved
         """
-        logger.info(f"Fetching derivatives tickers for {coin_id}")
-        
-        try:
-            # Map coin_id to symbol for filtering
-            coin_symbol_map = {'bitcoin': 'BTC', 'ethereum': 'ETH'}
-            symbol = coin_symbol_map.get(coin_id, coin_id.upper())
-            
-            endpoint = f"{self.base_url}/derivatives"
-            response = requests.get(endpoint, headers=self.headers, timeout=30)
-            response.raise_for_status()
-            
-            tickers_data = response.json()
-            logger.info(f"Fetched {len(tickers_data)} total derivatives tickers")
-            
-            # Filter for specific coin
-            filtered_tickers = []
-            for ticker in tqdm(tickers_data, desc=f"Filtering {coin_id} tickers"):
-                if symbol in ticker.get('symbol', '').upper():
-                    record = {
-                        'symbol': ticker.get('symbol', ''),
-                        'contract_type': ticker.get('contract_type', ''),
-                        'market': ticker.get('market', ''),
-                        'index': ticker.get('index', 0),
-                        'index_basis_percentage': ticker.get('index_basis_percentage', 0),
-                        'bid_ask_spread': ticker.get('bid_ask_spread', 0),
-                        'funding_rate': ticker.get('funding_rate', 0),
-                        'open_interest_usd': ticker.get('open_interest_usd', 0),
-                        'h24_volume': ticker.get('converted_volume', {}).get('usd', 0),
-                        'last_traded': ticker.get('last_traded', None),
-                        'timestamp': pd.Timestamp.now()
-                    }
-                    filtered_tickers.append(record)
-            
-            df = pd.DataFrame(filtered_tickers)
-            if not df.empty:
-                df['datetime'] = df['timestamp']
-            
-            logger.info(f"Successfully fetched {len(df)} derivatives tickers for {coin_id}")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error fetching derivatives tickers for {coin_id}: {str(e)}")
-            raise
-    
-    def fetch_historical_derivatives(self, coin_id='bitcoin', days=90, type_filter='open_interest'):
-        """
-        Fetch historical derivatives data from CoinGecko (OPTION 3 - Historical Exchange APIs).
-        Retrieves time-series derivatives metrics across all exchanges.
-        
-        Args:
-            coin_id: CoinGecko coin ID ('bitcoin', 'ethereum')
-            days: Number of days back to fetch (max ~365)
-            type_filter: Type of data ('open_interest', 'trading_volume', etc.)
-        
-        Returns:
-            DataFrame with historical derivatives data
-        """
-        import json
-        from datetime import datetime, timedelta
-        
-        logger.info(f"Fetching {days}-day historical {type_filter} for {coin_id}")
-        
-        try:
-            # CoinGecko historical derivatives endpoint
-            endpoint = f"{self.base_url}/derivatives/historical"
-            params = {
-                'coin_id': coin_id,
-                'days': days,
-                'type': type_filter  # open_interest or trading_volume
-            }
-            
-            response = requests.get(endpoint, params=params, headers=self.headers, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Parse historical data
-            records = []
-            for entry in tqdm(data, desc=f"{coin_id} historical {type_filter}"):
-                timestamp = entry[0] if isinstance(entry, list) else entry.get('timestamp')
-                value = entry[1] if isinstance(entry, list) else entry.get('value')
-                
-                records.append({
-                    'timestamp': pd.to_datetime(timestamp, unit='ms') if isinstance(timestamp, (int, float)) else pd.to_datetime(timestamp),
-                    f'{type_filter}_total': float(value) if value else 0,
-                    'coin_id': coin_id,
-                    'datetime': pd.to_datetime(timestamp, unit='ms') if isinstance(timestamp, (int, float)) else pd.to_datetime(timestamp)
-                })
-            
-            df = pd.DataFrame(records)
-            if not df.empty:
-                df = df.sort_values('timestamp').reset_index(drop=True)
-                logger.info(f"Successfully fetched {len(df)} historical {type_filter} records for {coin_id}")
-                logger.info(f"Date range: {df['datetime'].min()} to {df['datetime'].max()}")
-            else:
-                logger.warning(f"No historical data found for {coin_id}")
-            
-            return df
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                logger.warning(f"Historical data endpoint not available for {coin_id} (404)")
-                return pd.DataFrame()
-            else:
-                logger.error(f"HTTP error fetching historical derivatives for {coin_id}: {str(e)}")
-                raise
-        except Exception as e:
-            logger.error(f"Error fetching historical derivatives for {coin_id}: {str(e)}")
-            raise
-    
-    def save_to_raw(self, df, filename):
-        """
-        Save DataFrame to CSV file in the data/raw/ directory.
-        
-        Args:
-            df: DataFrame to save
-            filename: Output filename
-        """
-        filepath = self.base_path / filename
-        
-        try:
-            df.to_csv(filepath, index=False)
-            logger.info(f"Successfully saved data to {filepath.absolute()}")
-            logger.info(f"Saved {len(df)} rows, {len(df.columns)} columns")
-            
-        except Exception as e:
-            logger.error(f"Error saving data to {filepath}: {str(e)}")
-            raise
-    
-    def crawl_all(self, coin_ids=['bitcoin', 'ethereum']):
-        """
-        Comprehensive crawl: fetch derivatives data for specified coins.
-        Includes historical trading volume data.
-        
-        Args:
-            coin_ids: List of CoinGecko coin IDs to fetch
-        """
-        logger.info("=" * 80)
-        logger.info("Starting CoinGecko derivatives data crawl")
-        logger.info(f"Coins: {coin_ids}")
-        logger.info("=" * 80)
-        
-        # Fetch global derivatives exchanges data (once)
-        try:
-            logger.info("\n--- Fetching Global Derivatives Exchanges Data (Current Snapshot) ---")
-            derivatives_df = self.fetch_derivatives_data()
-            self.save_to_raw(derivatives_df, "coingecko_derivatives_exchanges.csv")
-            time.sleep(2)  # Rate limiting
-        except Exception as e:
-            logger.error(f"Failed to fetch derivatives exchanges data: {e}")
-        
-        # Fetch derivatives tickers and historical data for each coin
-        for idx, coin_id in enumerate(coin_ids, 1):
-            try:
-                logger.info(f"\n--- Fetching {coin_id.upper()} Derivatives Tickers ({idx}/{len(coin_ids)}) ---")
-                tickers_df = self.fetch_coin_derivatives_tickers(coin_id)
-                
-                if not tickers_df.empty:
-                    self.save_to_raw(tickers_df, f"{coin_id}_derivatives_tickers.csv")
-                else:
-                    logger.warning(f"No derivatives tickers found for {coin_id}")
-                
-                # Rate limiting between tickers
-                time.sleep(1)
-                
-                # Fetch historical trading volume
-                try:
-                    logger.info(f"\n--- Fetching {coin_id.upper()} Historical Trading Volume (90 days) ---")
-                    volume_history = self.fetch_historical_derivatives(
-                        coin_id=coin_id,
-                        days=90,
-                        type_filter='trading_volume'
-                    )
-                    
-                    if not volume_history.empty:
-                        self.save_to_raw(volume_history, f"{coin_id}_trading_volume_history.csv")
-                    else:
-                        logger.warning(f"No historical volume data for {coin_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to fetch historical volume for {coin_id}: {e}")
-                
-                # Rate limiting between coins
-                if idx < len(coin_ids):
-                    logger.info(f"\nWaiting 3 seconds before next coin (rate limit)...")
-                    time.sleep(3)
-                    
-            except Exception as e:
-                logger.error(f"Failed to fetch derivatives data for {coin_id}: {e}")
-                time.sleep(3)
-        
-        logger.info("\n" + "=" * 80)
-        logger.info("CoinGecko crawl completed!")
-        logger.info(f"All data saved to: {self.base_path.absolute()}")
-        logger.info("=" * 80)
-    
-    def run(self):
-        """
-        Standardized run method for orchestrator compatibility.
-        """
-        logger.info("CoinGeckoCrawler.run() started")
-        
-        # Default configuration
-        coin_ids = ['bitcoin', 'ethereum']
+        self.logger.info("CoinGeckoCrawler starting via run()")
+        # Use parent's orchestration: fetch() -> validate() -> save()
+        return super().run()
         
         # Execute the crawl
         self.crawl_all(coin_ids=coin_ids)

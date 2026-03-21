@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from crawlers.binance_crawler import BinanceCrawler
 from crawlers.coingecko_crawler import CoinGeckoCrawler
+from crawlers.gdelt_bq_crawler import GdeltBQCrawler
 from crawlers.sentiment_crawler import SentimentCrawler
 from crawlers.text_crawler import TextCrawler
 
@@ -97,6 +98,11 @@ class CrawlerRegistry:
 
         # Register Text crawler
         self.register('text', TextCrawler, {
+            'base_path': str(self.data_path)
+        })
+        
+        # Register GDELT BigQuery crawler
+        self.register('gdelt', GdeltBQCrawler, {
             'base_path': str(self.data_path)
         })
         
@@ -246,7 +252,7 @@ Examples:
         '--source',
         type=str,
         action='append',
-        choices=['binance', 'coingecko', 'sentiment', 'text', 'twitter', 'reddit', 'news'],
+        choices=['binance', 'coingecko', 'sentiment', 'text', 'gdelt', 'twitter', 'reddit', 'news'],
         help='Specific crawler(s) to run. Can be specified multiple times. If not specified, runs all crawlers.'
     )
     
