@@ -52,3 +52,7 @@ htmlcov/
 
 # Crawlers specific pycache
 src/crawlers/__pycache__/
+
+google_credentials.json
+src/crawlers/__pycache__/sentiment_crawler.cpython-311.pyc
+/src/crawlers/__pycache__
