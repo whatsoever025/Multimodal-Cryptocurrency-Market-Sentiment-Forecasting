@@ -1,11 +1,17 @@
 """
 Chart Generator for Converting OHLCV Data to Candlestick Chart Images
 Generates professional candlestick charts for deep learning (ViT/ResNet) training.
-Includes technical indicators and uses multiprocessing for optimization.
+Includes technical indicators (MA7, MA25, RSI, MACD) and uses multiprocessing for optimization.
+Pre-calculates indicators on full dataset to avoid redundant computations.
 """
 
 import pandas as pd
 import numpy as np
+
+# Set matplotlib backend BEFORE importing pyplot
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for headless environments
+
 import mplfinance as mpf
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -15,6 +21,7 @@ from multiprocessing import Pool, cpu_count
 from PIL import Image
 import io
 import warnings
+import ta  # Technical Analysis Library
 
 warnings.filterwarnings('ignore')
 
@@ -70,13 +77,14 @@ class ChartGenerator:
     
     def calculate_indicators(self, df):
         """
-        Calculate technical indicators (Moving Averages).
+        Calculate technical indicators on entire DataFrame.
+        Pre-calculation avoids redundant per-window computations.
         
         Args:
-            df: DataFrame with OHLCV data
+            df: DataFrame with OHLCV data (must have 'close', 'high', 'low', 'volume')
         
         Returns:
-            DataFrame with added indicator columns
+            DataFrame with added indicator columns (MA7, MA25, RSI, MACD)
         """
         df = df.copy()
         
@@ -84,15 +92,27 @@ class ChartGenerator:
         df['MA7'] = df['close'].rolling(window=7, min_periods=1).mean()
         df['MA25'] = df['close'].rolling(window=25, min_periods=1).mean()
         
+        # Calculate RSI (Relative Strength Index, window=14)
+        df['RSI'] = ta.momentum.rsi(df['close'], window=14)
+        
+        # Calculate MACD (Moving Average Convergence Divergence)
+        # The ta library returns a MACD object with methods: macd(), macd_signal(), macd_diff()
+        macd_obj = ta.trend.MACD(df['close'])
+        df['MACD'] = macd_obj.macd()
+        df['MACD_signal'] = macd_obj.macd_signal()
+        df['MACD_hist'] = macd_obj.macd_diff()
+        
+        logger.info(f"Indicators calculated: MA7, MA25, RSI(14), MACD")
+        
         return df
     
-    def create_chart_image(self, window_data, timestamp):
+    def create_chart_image(self, window_data):
         """
-        Create a candlestick chart image from window data.
+        Create a candlestick chart image from pre-calculated window data with indicators.
+        Assumes indicators (MA7, MA25, RSI, MACD, MACD_signal, MACD_hist) are already calculated.
         
         Args:
-            window_data: DataFrame containing window_size candles
-            timestamp: Unix timestamp for filename
+            window_data: DataFrame containing window_size candles with pre-calculated indicators
         
         Returns:
             PIL Image object
@@ -101,17 +121,29 @@ class ChartGenerator:
         chart_data = window_data.copy()
         chart_data.index = pd.to_datetime(chart_data.index)
         
-        # Calculate moving averages
-        chart_data['MA7'] = chart_data['close'].rolling(window=7, min_periods=1).mean()
-        chart_data['MA25'] = chart_data['close'].rolling(window=25, min_periods=1).mean()
-        
-        # Prepare additional plots (moving averages)
+        # Create additional plots for MA7, MA25 (on price panel)
         add_plots = [
-            mpf.make_addplot(chart_data['MA7'], color='#42a5f5', width=1.5),
-            mpf.make_addplot(chart_data['MA25'], color='#ffa726', width=1.5)
+            mpf.make_addplot(chart_data['MA7'], color='#42a5f5', width=1.5, 
+                           ylabel='Price'),
+            mpf.make_addplot(chart_data['MA25'], color='#ffa726', width=1.5),
+            # MACD (Panel 2)
+            mpf.make_addplot(chart_data['MACD'], panel=2, color='#2196F3', 
+                           width=1.5, ylabel='MACD'),
+            mpf.make_addplot(chart_data['MACD_signal'], panel=2, color='#FF9800', 
+                           width=1.5),
+            mpf.make_addplot(chart_data['MACD_hist'], panel=2, color='#4CAF50', 
+                           type='bar', alpha=0.3, ylabel='MACD Hist'),
+            # RSI (Panel 3)
+            mpf.make_addplot(chart_data['RSI'], panel=3, color='#9C27B0', 
+                           width=1.5, ylabel='RSI'),
+            # RSI Overbought/Oversold levels
+            mpf.make_addplot([70]*len(chart_data), panel=3, color='red', 
+                           type='line', alpha=0.3, width=0.5),
+            mpf.make_addplot([30]*len(chart_data), panel=3, color='green', 
+                           type='line', alpha=0.3, width=0.5),
         ]
         
-        # Create figure
+        # Create figure with 3 panels: Price/Volume, MACD, RSI
         fig, axes = mpf.plot(
             chart_data,
             type='candle',
@@ -119,15 +151,15 @@ class ChartGenerator:
             volume=True,
             addplot=add_plots,
             returnfig=True,
-            figsize=(6, 6),
-            panel_ratios=(3, 1),  # Price:Volume ratio
+            figsize=(6, 8),
+            panel_ratios=(3, 1, 1.5, 1.5),  # Price:Volume:MACD:RSI
             datetime_format='%H:%M',
             xrotation=0,
             axisoff=True,
             closefig=True
         )
         
-        # Remove all margins, axes, labels
+        # Clean up all axes
         for ax in axes:
             ax.set_xticks([])
             ax.set_yticks([])
@@ -143,7 +175,8 @@ class ChartGenerator:
         
         # Save to buffer
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', pad_inches=0, facecolor='#1e222d')
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', pad_inches=0, 
+                   facecolor='#1e222d')
         buf.seek(0)
         
         # Convert to PIL Image
@@ -160,43 +193,33 @@ class ChartGenerator:
     def generate_single_chart(self, args):
         """
         Generate a single chart (for multiprocessing).
+        Uses pre-calculated indicators from window_data.
         
         Args:
-            args: Tuple of (index, row, df, symbol, output_dir)
+            args: Tuple of (window_data, timestamp, filepath)
         
         Returns:
             Tuple of (success, timestamp, filepath)
         """
         try:
-            idx, row, df_subset, symbol, output_dir = args
+            window_data, timestamp, filepath = args
             
-            # Extract window data
-            start_idx = max(0, idx - self.window_size + 1)
-            window_data = df_subset.iloc[start_idx:idx + 1].copy()
-            
-            # Skip if not enough data
-            if len(window_data) < self.window_size // 2:
-                return (False, None, None)
-            
-            # Get timestamp
-            timestamp = int(row['timestamp'].timestamp())
-            
-            # Create chart image
-            img = self.create_chart_image(window_data, timestamp)
+            # Create chart image with pre-calculated indicators
+            img = self.create_chart_image(window_data)
             
             # Save image
-            filepath = output_dir / f"{timestamp}.png"
             img.save(filepath, optimize=True)
             
             return (True, timestamp, str(filepath))
             
         except Exception as e:
-            logger.error(f"Error generating chart at index {idx}: {str(e)}")
+            logger.error(f"Error generating chart at timestamp {args[1]}: {str(e)}")
             return (False, None, None)
     
     def generate_charts_from_csv(self, csv_path, symbol='btc', num_workers=None):
         """
         Generate chart images from CSV file using multiprocessing.
+        Pre-calculates all indicators on the full DataFrame before windowing.
         
         Args:
             csv_path: Path to OHLCV CSV file
@@ -229,16 +252,42 @@ class ChartGenerator:
         
         logger.info(f"Loaded {len(df)} records from {df.index.min()} to {df.index.max()}")
         
+        # **PRE-CALCULATE ALL INDICATORS ON FULL DATAFRAME**
+        logger.info("Pre-calculating indicators on full dataset...")
+        df = self.calculate_indicators(df)
+        
+        # **DROP NaN VALUES AFTER INDICATOR CALCULATION**
+        initial_len = len(df)
+        df = df.dropna()
+        logger.info(f"Dropped {initial_len - len(df)} rows with NaN values. Remaining: {len(df)}")
+        
+        logger.info(f"Final dataset: {len(df)} records from {df.index.min()} to {df.index.max()}")
+        
         # Create output directory
         output_dir = self.output_path / symbol
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Prepare arguments for multiprocessing
-        df_reset = df.reset_index()
-        args_list = [
-            (i, df_reset.iloc[i], df, symbol, output_dir)
-            for i in range(len(df_reset))
-        ]
+        # **PREPARE ARGUMENTS: ONLY (window_data, timestamp, filepath)**
+        # This prevents passing the entire DataFrame to each worker (memory leak fix)
+        args_list = []
+        for idx in range(len(df)):
+            # Extract window data
+            start_idx = max(0, idx - self.window_size + 1)
+            end_idx = idx + 1
+            window_data = df.iloc[start_idx:end_idx].copy()
+            
+            # Skip if not enough data for a full window
+            if len(window_data) < self.window_size // 2:
+                continue
+            
+            # Get timestamp and create filepath
+            timestamp = int(df.index[idx].timestamp())
+            filepath = output_dir / f"{timestamp}.png"
+            
+            # Add to args list (only 3 items, not entire df)
+            args_list.append((window_data, timestamp, str(filepath)))
+        
+        logger.info(f"Prepared {len(args_list)} chart arguments (from {len(df)} records)")
         
         # Determine number of workers
         if num_workers is None:
@@ -276,8 +325,8 @@ class ChartGenerator:
         """
         if symbols_config is None:
             symbols_config = {
-                'btc': 'data/raw/btcusdt_ohlcv_1h.csv',
-                'eth': 'data/raw/ethusdt_ohlcv_1h.csv'
+                'btc': 'data/raw/BTCUSDT_klines.csv',
+                'eth': 'data/raw/ETHUSDT_klines.csv'
             }
         
         logger.info("=" * 80)

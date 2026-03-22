@@ -12,11 +12,18 @@ from datetime import datetime
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
-from crawlers.binance_crawler import BinanceCrawler
+from crawlers.binance_vision_crawler import BinanceVisionCrawler
 from crawlers.coingecko_crawler import CoinGeckoCrawler
-from crawlers.gdelt_bq_crawler import GdeltBQCrawler
 from crawlers.sentiment_crawler import SentimentCrawler
 from crawlers.text_crawler import TextCrawler
+
+# Optional GDELT crawler (requires google-cloud-bigquery)
+try:
+    from crawlers.gdelt_bq_crawler import GdeltBQCrawler
+    GDELT_AVAILABLE = True
+except ImportError:
+    GDELT_AVAILABLE = False
+    GdeltBQCrawler = None
 
 
 # Centralized logging configuration
@@ -81,8 +88,8 @@ class CrawlerRegistry:
         """
         self.logger.info("Registering available crawlers...")
         
-        # Register Binance crawler
-        self.register('binance', BinanceCrawler, {
+        # Register Binance Vision crawler
+        self.register('binance_vision', BinanceVisionCrawler, {
             'base_path': str(self.data_path)
         })
         
@@ -101,10 +108,13 @@ class CrawlerRegistry:
             'base_path': str(self.data_path)
         })
         
-        # Register GDELT BigQuery crawler
-        self.register('gdelt', GdeltBQCrawler, {
-            'base_path': str(self.data_path)
-        })
+        # Register GDELT BigQuery crawler (optional - requires google-cloud-bigquery)
+        if GDELT_AVAILABLE:
+            self.register('gdelt', GdeltBQCrawler, {
+                'base_path': str(self.data_path)
+            })
+        else:
+            self.logger.warning("GDELT crawler not available - google-cloud-bigquery not installed")
         
         # Future crawlers can be added here:
         # self.register('twitter', TwitterCrawler, {'base_path': str(self.data_path)})

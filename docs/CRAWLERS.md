@@ -14,43 +14,46 @@ Main entry point: run_all_crawlers.py
   - python run_all_crawlers.py --list
 
 Current registered crawlers:
-- binance
+- binance_vision
 - coingecko
 - sentiment
 - text
 
-## 1) BinanceCrawler
+## 1) BinanceVisionCrawler
 
-Module: src/crawlers/binance_crawler.py
+Module: src/crawlers/binance_vision_crawler.py
 
 Purpose:
-- Collect market structure and derivatives context from Binance public APIs.
+- Download and process complete monthly historical data directly from Binance Vision archives.
+- Provides comprehensive futures market data: klines, funding rates, open interest, and liquidations.
 
 Data sources:
-- Binance Spot OHLCV
-- Binance Futures funding rate history
-- Binance Futures open interest
-- Binance Futures recent trades used as liquidation proxy
+- Binance Vision monthly futures data (https://data.binance.vision/data/futures/um/monthly)
+- Klines (1h candlestick OHLCV data)
+- Funding Rate history
+- Open Interest history
+- Liquidation snapshots
 
 Key assets:
-- BTC/USDT
-- ETH/USDT
+- BTC/USDT (BTCUSDT)
+- ETH/USDT (ETHUSDT)
 
 Typical outputs in data/raw:
-- btcusdt_ohlcv_1h.csv
-- btcusdt_ohlcv_4h.csv
-- btcusdt_funding_rate.csv
-- btcusdt_open_interest.csv
-- btcusdt_liquidations.csv
-- ethusdt_ohlcv_1h.csv
-- ethusdt_ohlcv_4h.csv
-- ethusdt_funding_rate.csv
-- ethusdt_open_interest.csv
-- ethusdt_liquidations.csv
+- BTCUSDT_klines.csv
+- BTCUSDT_fundingRate.csv
+- BTCUSDT_openInterestHist.csv
+- BTCUSDT_liquidationSnapshot.csv
+- ETHUSDT_klines.csv
+- ETHUSDT_fundingRate.csv
+- ETHUSDT_openInterestHist.csv
+- ETHUSDT_liquidationSnapshot.csv
 
 Notes:
-- Uses ccxt with built-in rate limiting plus extra sleep for safety.
-- Supports deep historical pagination from a start date.
+- Downloads monthly ZIP archives in-memory for efficiency
+- Automatically merges, deduplicates, and sorts by timestamp
+- Columns: timestamp (datetime), and data-type-specific fields
+- No API credentials required
+- Can span any date range with `run(start_date, end_date)` parameters
 
 ## 2) CoinGeckoCrawler
 
@@ -164,7 +167,7 @@ If you use a virtual environment on Windows:
 ## Suggested Run Order
 
 For full raw-data refresh:
-1. python run_all_crawlers.py --source binance
+1. python run_all_crawlers.py --source binance_vision
 2. python run_all_crawlers.py --source coingecko
 3. python run_all_crawlers.py --source sentiment
 4. python run_all_crawlers.py --source text
