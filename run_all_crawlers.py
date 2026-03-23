@@ -15,7 +15,9 @@ sys.path.insert(0, str(Path(__file__).parent / 'src'))
 from crawlers.binance_vision_crawler import BinanceVisionCrawler
 from crawlers.coingecko_crawler import CoinGeckoCrawler
 from crawlers.sentiment_crawler import SentimentCrawler
-from crawlers.text_crawler import TextCrawler
+from crawlers.reddit_crawler import RedditCrawler
+from crawlers.stocktwits_crawler import StockTwitsCrawler
+from crawlers.coinalyze_crawler import CoinalyzeCrawler
 
 # Optional GDELT crawler (requires google-cloud-bigquery)
 try:
@@ -84,42 +86,44 @@ class CrawlerRegistry:
     def _register_crawlers(self):
         """
         Register all available crawler classes.
-        Add new crawlers here as they are developed.
+        Current architecture: 7 focused crawlers (Reddit, StockTwits, Coinalyze, GDELT, Binance Vision, CoinGecko, Sentiment)
         """
         self.logger.info("Registering available crawlers...")
         
-        # Register Binance Vision crawler
+        # Social Media & Sentiment Crawlers (NEW)
+        self.register('reddit', RedditCrawler, {
+            'base_path': str(self.data_path)
+        })
+        
+        self.register('stocktwits', StockTwitsCrawler, {
+            'base_path': str(self.data_path)
+        })
+        
+        # Derivatives & Macro Crawlers (NEW)
+        self.register('coinalyze', CoinalyzeCrawler, {
+            'base_path': str(self.data_path)
+        })
+        
+        # Market Data Crawlers
         self.register('binance_vision', BinanceVisionCrawler, {
             'base_path': str(self.data_path)
         })
         
-        # Register CoinGecko crawler
         self.register('coingecko', CoinGeckoCrawler, {
             'base_path': str(self.data_path)
         })
         
-        # Register Sentiment crawler
         self.register('sentiment', SentimentCrawler, {
             'base_path': str(self.data_path)
         })
-
-        # Register Text crawler
-        self.register('text', TextCrawler, {
-            'base_path': str(self.data_path)
-        })
         
-        # Register GDELT BigQuery crawler (optional - requires google-cloud-bigquery)
+        # Macroeconomic Sentiment (Optional - requires google-cloud-bigquery)
         if GDELT_AVAILABLE:
             self.register('gdelt', GdeltBQCrawler, {
                 'base_path': str(self.data_path)
             })
         else:
             self.logger.warning("GDELT crawler not available - google-cloud-bigquery not installed")
-        
-        # Future crawlers can be added here:
-        # self.register('twitter', TwitterCrawler, {'base_path': str(self.data_path)})
-        # self.register('reddit', RedditCrawler, {'base_path': str(self.data_path)})
-        # self.register('news', NewsCrawler, {'base_path': str(self.data_path)})
         
         self.logger.info(f"Registered {len(self.crawlers)} crawler(s): {list(self.crawlers.keys())}")
     
@@ -262,7 +266,7 @@ Examples:
         '--source',
         type=str,
         action='append',
-        choices=['binance', 'coingecko', 'sentiment', 'text', 'gdelt', 'twitter', 'reddit', 'news'],
+        choices=['reddit', 'stocktwits', 'coinalyze', 'binance_vision', 'coingecko', 'sentiment', 'gdelt'],
         help='Specific crawler(s) to run. Can be specified multiple times. If not specified, runs all crawlers.'
     )
     
