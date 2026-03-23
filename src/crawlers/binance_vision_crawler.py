@@ -30,7 +30,7 @@ class BinanceVisionCrawler(BaseCrawler):
     Crawler for downloading and processing monthly historical data from Binance Vision.
     
     Supports:
-    - Multiple data types: klines, fundingRate, openInterestHist, liquidationSnapshot
+    - Data types: klines (OHLCV), fundingRate (futures)
     - Multiple symbols: BTCUSDT, ETHUSDT
     - In-memory ZIP extraction for efficiency
     - Automatic data formatting and validation
@@ -39,9 +39,9 @@ class BinanceVisionCrawler(BaseCrawler):
     # Base URL for Binance Vision data
     BASE_URL = "https://data.binance.vision/data/futures/um/monthly"
     
-    # Target symbols and data types
+    # Target symbols and data types (klines and funding rates only)
     TARGET_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
-    TARGET_TYPES = ['klines', 'fundingRate', 'openInterestHist', 'liquidationSnapshot']
+    TARGET_TYPES = ['klines', 'fundingRate']
     
     def __init__(
         self,
