@@ -43,17 +43,28 @@ class BinanceVisionCrawler(BaseCrawler):
     TARGET_SYMBOLS = ['BTCUSDT', 'ETHUSDT']
     TARGET_TYPES = ['klines', 'fundingRate', 'openInterestHist', 'liquidationSnapshot']
     
-    def __init__(self, base_path: str = 'data/raw', config: CrawlerConfig = None):
+    def __init__(
+        self,
+        base_path: str = 'data/raw',
+        config: Optional[CrawlerConfig] = None,
+        start_date: str = '2023-01-01',
+        end_date: str = '2026-03-01',
+    ):
         """
         Initialize Binance Vision Crawler.
         
         Args:
             base_path: Directory path for saving raw data files
             config: Optional CrawlerConfig for advanced customization
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
         """
         super().__init__(base_path=base_path, config=config)
-        self.logger = logging.getLogger(__name__)
-        self.logger.info("BinanceVisionCrawler initialized")
+        self.start_date = start_date
+        self.end_date = end_date
+        self.logger.info(
+            f"BinanceVisionCrawler initialized: {start_date} to {end_date}"
+        )
     
     def _generate_monthly_dates(self, start_date: str, end_date: str) -> List[str]:
         """
@@ -267,10 +278,39 @@ class BinanceVisionCrawler(BaseCrawler):
         """
         Fetch method for BaseCrawler compatibility.
         
+        Downloads and processes Binance Vision data, saving CSVs directly.
+        Returns empty list as saving is handled internally.
+        
         Returns:
-            List of records (empty, as data is saved directly to CSV)
+            Empty list (not used in standard pipeline)
         """
-        self.run()
+        total_saved = 0
+        
+        for symbol in self.TARGET_SYMBOLS:
+            for data_type in self.TARGET_TYPES:
+                try:
+                    df = self._process_symbol_data_type(
+                        symbol,
+                        data_type,
+                        start_date=self.start_date,
+                        end_date=self.end_date
+                    )
+                    
+                    if df is not None and not df.empty:
+                        output_file = self.base_path / f"{symbol}_{data_type}.csv"
+                        df.to_csv(output_file, index=False)
+                        self.logger.info(
+                            f"Saved {symbol}_{data_type} to {output_file} ({len(df)} rows)"
+                        )
+                        total_saved += len(df)
+                    else:
+                        self.logger.warning(f"No data for {symbol}_{data_type}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Failed to process {symbol}_{data_type}: {e}")
+        
+        # Store the count for later retrieval in validate/save chain
+        self._total_records = total_saved
         return []
     
     def validate(self, records: List[Dict[str, Any]]) -> bool:
@@ -278,79 +318,70 @@ class BinanceVisionCrawler(BaseCrawler):
         Validate method for BaseCrawler compatibility.
         
         Args:
-            records: Records to validate
+            records: Records to validate (unused for Binance Vision)
         
         Returns:
-            True if validation passes
+            Always True (validation happens during download/format)
         """
         return True
     
-    def save(self, records: List[Dict[str, Any]]) -> int:
+    def save(self, records: List[Dict[str, Any]], filename: Optional[str] = None) -> int:
         """
         Save method for BaseCrawler compatibility.
-        Note: BinanceVisionCrawler saves data directly in run() method.
+        
+        Note: BinanceVisionCrawler saves data directly in fetch() method.
+        This returns the count of records already saved.
         
         Args:
-            records: Records to save (unused - data saved during run)
+            records: Records to save (unused)
+            filename: Optional filename (unused)
         
         Returns:
-            0 (not used in pipeline)
+            Total number of records saved during fetch()
         """
-        return 0
+        return getattr(self, '_total_records', 0)
     
-    def run(
-        self,
-        start_date: str = '2023-01-01',
-        end_date: str = '2026-03-01'
-    ) -> None:
+    def run(self) -> int:
         """
-        Main pipeline: download, process, and save monthly data for all symbols and data types.
+        Standard orchestration flow with error handling.
         
-        Args:
-            start_date: Start date in YYYY-MM-DD format
-            end_date: End date in YYYY-MM-DD format
+        Returns:
+            Number of records saved
         """
         self.logger.info("Starting BinanceVisionCrawler pipeline")
+        try:
+            self.fetch()  # This downloads and saves all data
+            return getattr(self, '_total_records', 0)
+        except Exception as e:
+            self.logger.error(f"Pipeline failed: {e}", exc_info=True)
+            return 0
+
+
+if __name__ == "__main__":
+    """
+    Standalone execution: python binance_vision_crawler.py
+    Downloads and saves historical market data to data/raw/
+    """
+    import sys
+
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    try:
+        crawler = BinanceVisionCrawler()
+        saved_count = crawler.run()
         
-        # Ensure raw data directory exists
-        raw_dir = Path(self.base_path)
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        
-        processed_count = 0
-        failed_count = 0
-        
-        for symbol in self.TARGET_SYMBOLS:
-            for data_type in self.TARGET_TYPES:
-                try:
-                    df = self._process_symbol_data_type(
-                        symbol, 
-                        data_type,
-                        start_date=start_date,
-                        end_date=end_date
-                    )
-                    
-                    if df is not None and not df.empty:
-                        # Save to CSV
-                        output_file = raw_dir / f"{symbol}_{data_type}.csv"
-                        df.to_csv(output_file, index=False)
-                        self.logger.info(
-                            f"Saved {symbol} - {data_type} to {output_file} "
-                            f"({len(df)} rows)"
-                        )
-                        processed_count += 1
-                    else:
-                        self.logger.warning(
-                            f"No data to save for {symbol} - {data_type}"
-                        )
-                        failed_count += 1
-                
-                except Exception as e:
-                    self.logger.error(
-                        f"Pipeline failed for {symbol} - {data_type}: {e}"
-                    )
-                    failed_count += 1
-        
-        self.logger.info(
-            f"BinanceVisionCrawler pipeline completed: "
-            f"{processed_count} succeeded, {failed_count} failed"
-        )
+        if saved_count > 0:
+            print(f"✓ Binance Vision crawler completed successfully: {saved_count} records saved")
+            sys.exit(0)
+        else:
+            print("✗ Binance Vision crawler failed or returned no data")
+            sys.exit(0)  # Exit 0 for graceful degradation
+            
+    except Exception as e:
+        print(f"✗ Binance Vision crawler encountered fatal error: {e}")
+        logging.exception(e)
+        sys.exit(0)  # Exit 0 for graceful degradation

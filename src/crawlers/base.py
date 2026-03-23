@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 import time
+import os
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from dotenv import load_dotenv
 
 
 @dataclass
@@ -73,11 +75,17 @@ class BaseCrawler(ABC):
             base_path: Directory for saving raw data files
             config: Crawler configuration (uses defaults if None)
         """
+        # Load environment variables from .env file in project root
+        self._load_environment()
+
+        # Ensure output directory exists
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
 
         self.config = config or CrawlerConfig()
-        self.logger = logging.getLogger(self.__class__.__name__)
+        
+        # Setup logging for this crawler
+        self.logger = self._setup_logger()
 
         # HTTP session with connection pooling
         self.session = self._init_session()
@@ -93,6 +101,68 @@ class BaseCrawler(ABC):
             f"timeout={self.config.timeout_seconds}s, "
             f"max_retries={self.config.max_retries}"
         )
+
+    def _load_environment(self) -> None:
+        """
+        Load environment variables from .env file in project root.
+        
+        Searches for .env in:
+        1. Project root (parent of src/)
+        2. Current working directory
+        
+        Uses python-dotenv to load variables into os.environ.
+        Missing .env file is not fatal (credentials will be None).
+        """
+        # Try to find project root (contains src/ directory)
+        project_root = Path(__file__).resolve().parent
+        for _ in range(5):  # Search up to 5 levels
+            if (project_root / "src").exists():
+                break
+            project_root = project_root.parent
+        
+        env_file = project_root / ".env"
+        if env_file.exists():
+            load_dotenv(str(env_file))
+        else:
+            # Also try current working directory
+            load_dotenv()
+
+    def _setup_logger(self) -> logging.Logger:
+        """
+        Setup logger for this crawler with consistent formatting.
+        
+        Returns:
+            Configured logger instance
+        """
+        logger = logging.getLogger(self.__class__.__name__)
+        
+        # Only add handler if logger doesn't already have one (avoid duplicates)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            
+            # Set level based on DEBUG_LOGGING env var
+            debug_mode = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
+            logger.setLevel(logging.DEBUG if debug_mode else logging.INFO)
+        
+        return logger
+
+    def get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """
+        Safely get environment variable.
+        
+        Args:
+            key: Environment variable name
+            default: Default value if not found
+            
+        Returns:
+            Environment variable value or default
+        """
+        return os.getenv(key, default)
 
     def _init_session(self) -> requests.Session:
         """
@@ -155,12 +225,15 @@ class BaseCrawler(ABC):
         pass
 
     @abstractmethod
-    def save(self, records: List[Dict[str, Any]]) -> int:
+    def save(self, records: List[Dict[str, Any]], filename: Optional[str] = None) -> int:
         """
         Save records to persistent storage.
 
         Args:
             records: List of validated records
+            filename: Optional filename (without path). If provided, file will be
+                     saved to self.base_path / filename. If None, subclass should
+                     use a default filename.
 
         Returns:
             Number of rows successfully saved (may be less than input
@@ -186,6 +259,7 @@ class BaseCrawler(ABC):
 
         Note:
             Exceptions are caught and logged. Caller receives count only.
+            Graceful degradation: continues even on errors, exits with 0.
         """
         self.logger.info(f"Starting {self.__class__.__name__}")
 
@@ -210,6 +284,7 @@ class BaseCrawler(ABC):
                 f"Failed with exception: {e}",
                 exc_info=True,
             )
+            # Graceful degradation: exit with 0 to allow other crawlers to continue
             return 0
 
     def request_with_retry(
