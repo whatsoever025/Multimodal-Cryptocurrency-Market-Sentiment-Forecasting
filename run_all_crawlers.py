@@ -18,6 +18,7 @@ from crawlers.sentiment_crawler import SentimentCrawler
 from crawlers.reddit_crawler import RedditCrawler
 from crawlers.stocktwits_crawler import StockTwitsCrawler
 from crawlers.coinalyze_crawler import CoinalyzeCrawler
+from crawlers.huggingface_crawler import HuggingFaceCrawler
 
 # Optional GDELT crawler (requires google-cloud-bigquery)
 try:
@@ -114,6 +115,11 @@ class CrawlerRegistry:
         })
         
         self.register('sentiment', SentimentCrawler, {
+            'base_path': str(self.data_path)
+        })
+        
+        # Hugging Face Datasets
+        self.register('huggingface', HuggingFaceCrawler, {
             'base_path': str(self.data_path)
         })
         

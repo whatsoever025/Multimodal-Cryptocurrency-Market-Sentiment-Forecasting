@@ -36,6 +36,8 @@ class SentimentCrawler(BaseCrawler):
         base_path: str = 'data/raw',
         config: Optional[CrawlerConfig] = None,
         limit: int = 0,
+        start_date: str = '2019-10-29',
+        end_date: str = '2025-02-01',
     ):
         """
         Initialize Sentiment Crawler.
@@ -44,13 +46,18 @@ class SentimentCrawler(BaseCrawler):
             base_path: Directory path for saving raw data files
             config: Optional CrawlerConfig for customization
             limit: Number of records to fetch (0 = all available history)
+            start_date: Start date for filtering (YYYY-MM-DD)
+            end_date: End date for filtering (YYYY-MM-DD)
         """
         # Call parent init for standard setup (env loading, logging, etc.)
         super().__init__(base_path=base_path, config=config)
         
         self.limit = limit
+        self.start_date = pd.Timestamp(start_date, tz='UTC')
+        self.end_date = pd.Timestamp(end_date, tz='UTC')
         self.output_file = self.base_path / 'fear_greed_index.csv'
         self.logger.info(f"SentimentCrawler initialized. Output: {self.output_file}")
+        self.logger.info(f"Date range: {start_date} to {end_date}")
     
     def fetch(self) -> List[Dict[str, Any]]:
         """
@@ -194,9 +201,18 @@ class SentimentCrawler(BaseCrawler):
             # Sort by timestamp (oldest first)
             if not df.empty:
                 df = df.sort_values('timestamp').reset_index(drop=True)
+                
+                # Filter by date range if datetime column exists
+                if 'datetime' in df.columns:
+                    df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+                    df = df[(df['datetime'] >= self.start_date) & (df['datetime'] <= self.end_date)]
+                    self.logger.info(
+                        f"Filtered to date range {self.start_date.date()} to {self.end_date.date()}: {len(df)} records"
+                    )
+                
                 self.logger.info(
                     f"Successfully fetched {len(df)} Fear & Greed Index records. "
-                    f"Range: {df['datetime'].min()} to {df['datetime'].max()}"
+                    f"Range: {df['datetime'].min() if 'datetime' in df.columns else 'N/A'} to {df['datetime'].max() if 'datetime' in df.columns else 'N/A'}"
                 )
             
             return df

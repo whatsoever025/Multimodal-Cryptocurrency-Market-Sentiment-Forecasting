@@ -2,15 +2,61 @@
 
 ## Overview
 
-This document summarizes all raw data files collected by the cryptocurrency market sentiment forecasting system. The data spans from **January 2023 to March 2026** and includes market data, funding rates, liquidations, sentiment indices, macroeconomic news sentiment, and cryptocurrency sentiment.
+This document summarizes all raw data files collected by the cryptocurrency market sentiment forecasting system. The data spans from **October 2019 to March 2026** and includes historical crypto news, market data, funding rates, liquidations, sentiment indices, macroeconomic news sentiment, and cryptocurrency discussion sentiment.
 
-**Total Records Across All Files: ~285,000+**
-- Market & On-Chain Data: 105,487 records
-- Sentiment Data: 179,524 records (shared reddit_posts.csv: 176k crypto news + 2.9k Reddit discussions)
+**Total Records Across All Files: ~515,000+**
+- Crypto News Articles: 229,172 records (HuggingFace dataset, 2019-2025)
+- Market & On-Chain Data: 105,487 records (2023-2026)
+- Sentiment Data: 179,524 records (Reddit + crypto news, 2023-2026)
+- Generated Chart Images: 89,048 candlestick charts with technical indicators (BTC: 44,524 + ETH: 44,524)
 
 ---
 
 ## Data Files
+
+### 0. **huggingface_crypto_news.csv** - Cryptocurrency News Dataset (HuggingFace)
+- **Purpose:** Comprehensive crypto news sentiment dataset from Coindesk
+- **Rows:** 229,172 news articles
+- **Date Range:** 2019-10-29 to 2025-02-01 (5.3 years)
+- **Source:** HuggingFace Hub - `maryamfakhari/crypto-news-coindesk-2020-2025`
+- **Granularity:** Individual articles (timestamps at publication time)
+
+#### Fields:
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | Unique article identifier |
+| `guid` | string | Global unique identifier |
+| `published_on` | datetime | Publication timestamp (ISO 8601 with microseconds) |
+| `title` | string | Article headline (cleaned) |
+| `body` | string | Article body text (cleaned) |
+| `url` | string | Source URL to original article |
+| `imageurl` | string | URL to associated image/thumbnail |
+| `tags` | string | Article tags/keywords |
+| `categories` | string | Article categories (News, Analysis, etc.) |
+| `source` | string | News source (Coindesk, etc.) |
+| `upvotes` | int | Engagement metric (upvotes/reactions) |
+| `downvotes` | int | Downvotes or negative reactions |
+| `last_update` | datetime | Last modification timestamp |
+
+#### Data Quality:
+- **Total records:** 229,172 (100% unique by publication date + title)
+- **Date coverage:** Full 5.3-year span 2019-10-29 to 2025-02-01 (no major gaps)
+- **Missing values:** <0.1% (mostly in optional fields like tags/categories)
+- **Time-aligned:** Can be merged with price data on hourly basis
+
+#### Key Statistics:
+- **Average articles per day:** ~120
+- **Peak coverage:** 2021-2022 (bull market period)
+- **Assets mentioned:** Primary focus on BTC/ETH market movements
+- **Topics:** Market news, regulation, technology updates, price analysis
+
+#### Use Cases:
+- Long-term sentiment analysis (5+ year history)
+- Training language models for crypto sentiment classification
+- Identifying major news cycles and market catalysts
+- Backtesting sentiment-based trading strategies
+
+---
 
 ### 1. **reddit_posts.csv** - Reddit + Crypto News Sentiment (Combined)
 - **Purpose:** Combined sentiment data from Reddit discussions and Coindesk crypto news articles
@@ -69,8 +115,8 @@ Reddit Record:
 
 ### 2. **BTCUSDT_klines.csv** - Bitcoin OHLCV Candles
 - **Purpose:** Bitcoin hourly price data (OHLC) and trading volume
-- **Rows:** 27,720
-- **Date Range:** 2023-01-01 to 2026-02-28 (37 months)
+- **Rows:** 44,568
+- **Date Range:** 2020-01-01 to 2025-01-31 (5 years)
 - **Source:** Binance Vision API
 - **Granularity:** Hourly
 
@@ -123,8 +169,8 @@ calc_time,funding_interval_hours,last_funding_rate
 
 ### 4. **ETHUSDT_klines.csv** - Ethereum OHLCV Candles
 - **Purpose:** Ethereum hourly price data (OHLC) and trading volume
-- **Rows:** 27,720
-- **Date Range:** 2023-01-01 to 2026-02-28 (37 months)
+- **Rows:** 44,568
+- **Date Range:** 2020-01-01 to 2025-01-31 (5 years)
 - **Source:** Binance Vision API
 - **Granularity:** Hourly
 
@@ -338,19 +384,54 @@ timestamp,news_volume,avg_sentiment_tone
 
 ---
 
-## Data Quality & Reliability
+## Generated Assets
+
+### Candlestick Chart Images
+
+**Location:** `data/processed/images/{btc,eth}/`
+
+#### Specifications:
+- **BTC Charts:** 44,524 images
+- **ETH Charts:** 44,524 images
+- **Total:** 89,048 chart images
+- **Image Size:** 224×224 pixels (standard for deep learning)
+- **Format:** PNG
+- **Date Range:** 2020-01-02 to 2025-01-31
+
+#### Chart Contents:
+1. **Candlestick Pattern:** OHLC bars with wicks
+2. **Technical Indicators:**
+   - **MA7:** 7-hour moving average (blue line)
+   - **MA25:** 25-hour moving average (red line)
+   - **RSI(14):** 14-period Relative Strength Index (oscillator at bottom)
+   - **MACD:** Moving Average Convergence Divergence with signal line
+
+#### Use Cases:
+- Training computer vision models (ResNet, ViT, CNN)
+- Multimodal prediction model input (combined with text sentiment)
+- Pattern recognition and technical analysis
+- Visualization of price action with indicators
+
+#### Generation Stats:
+- **Processing time:** ~25 minutes (12.25 min BTC + 12.19 min ETH)
+- **Parallel workers:** 21
+- **Generation rate:** ~60 images/second
+- **Preprocessing:** Automatic indicator calculation on full dataset
+
+---
 
 ### Coverage Summary:
 
 | Data Source | Asset(s) | Coverage | Records | Reliability |
 |------------|----------|----------|---------|-------------|
-| Binance Vision (klines) | BTC, ETH | 2023-2026 | 55,440 | ⭐⭐⭐⭐⭐ - Official exchange data |
-| Binance Vision (funding) | BTC, ETH | 2023-2026 | 6,930 | ⭐⭐⭐⭐⭐ - Official exchange data |
+| **HuggingFace Crypto News** | **BTC, ETH** | **2019-2025** | **229,172** | **⭐⭐⭐⭐⭐ - Comprehensive historical dataset** |
+| Binance Vision (klines) | BTC, ETH | 2020-2025 | 89,136 | ⭐⭐⭐⭐⭐ - Official exchange data |
+| Binance Vision (funding) | BTC, ETH | 2023-2026 | 11,148 | ⭐⭐⭐⭐⭐ - Official exchange data |
 | Coinalyze (OI, liquidations, L/S) | BTC, ETH | Recent (2-3 mo) | 11,238 | ⭐⭐⭐⭐ - Aggregator, good coverage |
 | Fear & Greed Index | Crypto market | 2018-2026 | 2,970 | ⭐⭐⭐⭐⭐ - Well-established index |
 | GDELT Macro Sentiment | Global macro | 2023-2026 | 27,829 | ⭐⭐⭐⭐ - News-based, real-time |
-| **Crypto News Sentiment** | **BTC, ETH** | **2023-2026** | **176,543** | **⭐⭐⭐⭐⭐ - HF dataset, 229k+ articles** |
-| **Reddit Discussion** | **BTC, ETH** | **2025-2026** | **2,981** | **⭐⭐⭐⭐ - Real-time Reddit data** |
+| Reddit Discussion | BTC, ETH | 2025-2026 | 2,981 | ⭐⭐⭐⭐ - Real-time Reddit data |
+| **Generated Chart Images** | **BTC, ETH** | **2020-2025** | **89,048** | **✓ 224×224 px with technical indicators** |
 
 ---
 
@@ -426,13 +507,17 @@ timestamp,news_volume,avg_sentiment_tone
 ---
 
 **Generated:** 2026-03-25  
-**Total Data Points:** 285,000+ records (105,487 market/on-chain + 179,524 sentiment)  
-**Market Data Time Span:** 2023-01-01 to 2026-03-24 (3+ years)  
-**Sentiment Data Time Span:** 2023-01-01 to 2026-03-24 (3+ years combined Reddit + crypto news)  
-**Macro Index Time Span:** 2018-02-01 to 2026-03-24 (8+ years, fear & greed index)
+**Total Data Points:** 515,000+ records (229,172 HF news + 105,487 market/on-chain + 179,524 sentiment)  
+**Total Chart Images:** 89,048 candlestick charts (BTC: 44,524 + ETH: 44,524) with technical indicators  
+**Historical Data Time Span:** 2019-10-29 to 2025-02-01 (HuggingFace news articles)  
+**Market Data Time Span:** 2020-01-01 to 2025-01-31 (Price + funding data)  
+**Sentiment Data Time Span:** 2023-01-01 to 2026-03-24 (combined Reddit + macro analysis)  
+**Fear & Greed Index Span:** 2018-02-01 to 2026-03-24 (8+ years)  
 
 #### Recent Updates:
-- **2026-03-25:** Added 179,524 combined reddit_posts (crypto news sentiment + Reddit discussions)
-  - Crypto News: 176,543 records from 2023-2026 via `maryamfakhari/crypto-news-coindesk-2020-2025` dataset
-  - Reddit: 2,981 records from 2025-2026 via r/CryptoCurrency, r/Bitcoin, r/Ethereum
-  - Created: [CryptoNewsSentimentCrawler](../src/crawlers/crypto_news_sentiment_crawler.py) for data extraction
+- **2026-03-25:** Complete data pipeline overhaul
+  - Added HuggingFace `crypto-news-coindesk-2020-2025` dataset: 229,172 articles (2019-2025)
+  - Extended crawler time ranges to match HuggingFace historical data
+  - Generated 89,048 chart images (224×224 px) with MA7, MA25, RSI(14), MACD indicators
+  - Updated BTC/ETH klines to 5-year span: 44,568 records each (2020-1-1 to 2025-01-31)
+  - Sentiment crawler: 1,922 Fear & Greed records (filtered to 2019-2025 range)

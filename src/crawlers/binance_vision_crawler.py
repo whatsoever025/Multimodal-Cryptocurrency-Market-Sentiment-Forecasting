@@ -47,8 +47,8 @@ class BinanceVisionCrawler(BaseCrawler):
         self,
         base_path: str = 'data/raw',
         config: Optional[CrawlerConfig] = None,
-        start_date: str = '2023-01-01',
-        end_date: str = '2026-03-01',
+        start_date: str = '2019-10-29',
+        end_date: str = '2025-02-01',
     ):
         """
         Initialize Binance Vision Crawler.

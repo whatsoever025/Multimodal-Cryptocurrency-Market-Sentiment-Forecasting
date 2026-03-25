@@ -35,8 +35,8 @@ def main():
     
     # Define symbols to process
     symbols_config = {
-        'btc': 'data/raw/btcusdt_ohlcv_1h.csv',
-        'eth': 'data/raw/ethusdt_ohlcv_1h.csv'
+        'btc': 'data/raw/BTCUSDT_klines.csv',
+        'eth': 'data/raw/ETHUSDT_klines.csv'
     }
     
     # Generate all charts
