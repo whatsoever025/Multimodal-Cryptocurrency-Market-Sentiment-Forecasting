@@ -49,7 +49,7 @@ class RedditCrawler(BaseCrawler):
         self,
         base_path: str = "data/raw",
         config: Optional[CrawlerConfig] = None,
-        posts_per_subreddit: int = 100,
+        posts_per_subreddit: int = 10000,
     ):
         """
         Initialize Reddit Crawler.
