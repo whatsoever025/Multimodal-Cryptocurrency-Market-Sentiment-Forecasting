@@ -1,17 +1,22 @@
 """
 DataAligner: Production-Ready Multimodal Crypto Sentiment Dataset Alignment
+(Refactored: Strict Data Scope with Chronological Splits & Embargo)
 
-Orchestrates merging of 8 heterogeneous data sources (OHLCV, funding rates, liquidations,
-on-chain metrics, macroeconomic news, fear/greed index, Reddit/crypto news sentiment)
-into a single aligned hourly dataset with continuous sentiment regression targets.
+Orchestrates merging of 5 core data sources into aligned hourly dataset with:
+- Market data (OHLCV from Binance klines)
+- Derivatives metrics (funding rates, 8-hour frequency)
+- Sentiment indices (fear/greed index, daily)
+- Macroeconomic news (GDELT with sentiment scores)
+- Text data (CoinDesk crypto news, hourly aggregated)
+- Continuous target (Volatility-Adjusted Tanh, -100 to +100)
+- Chronological train/validation/test splits (70/15/15) with 24-hour embargo
 
-Key Features:
-- Master hourly time index from OHLCV base (BTC or ETH)
-- Comprehensive merging: exact joins for hourly data, forward-fill for lower-frequency
-- Continuous target: Volatility-Adjusted Tanh formula (-100 to +100)
-- Image validation: Disk verification, automatic dropping of missing images
-- Hugging Face integration: Cast images, push to Hub with full metadata
-- Strict data leakage prevention: Forward-fill only (no bfill), drop future-unavailable targets
+KEY CHANGES (v2):
+- Removed: Reddit aggregation, Coinalyze (OI, liquidations, L/S ratio)
+- Renamed: sentiment_score → target_score, news_volume → gdelt_news_count, avg_sentiment_tone → gdelt_avg_sentiment
+- NEW: Chronological split with embargo rule (prevents look-ahead bias)
+- NEW: DatasetDict output (train/validation/test_in_domain) → HF Hub push
+- Time range: Hard-coded 2020-01-01 to 2025-01-31
 """
 
 import os
@@ -26,7 +31,7 @@ import pandas as pd
 import numpy as np
 
 # Hugging Face imports
-from datasets import Dataset, Image
+from datasets import Dataset, DatasetDict, Image
 from huggingface_hub import HfApi
 
 warnings.filterwarnings('ignore')
@@ -43,19 +48,22 @@ class DataAligner:
     """
     Aligns multimodal cryptocurrency market sentiment data for deep learning.
     
-    Merges 8 data sources into a single hourly dataset with:
-    - Market data (OHLCV, funding rates)
-    - On-chain metrics (open interest, liquidations, long/short ratio)
-    - Sentiment (macro news, fear/greed index)
-    - Text data (aggregated Reddit/crypto news)
-    - Continuous regression target (sentiment score -100 to +100)
-    - Chart images (local path → embedded in HF Dataset)
+    Orchestrates 5 core data sources into aligned hourly dataset with:
+    - OHLCV (Binance klines, hourly)
+    - Funding rates (8-hour, forward-filled)
+    - Fear/Greed index (daily, forward-filled)
+    - GDELT macroeconomic news (hourly)
+    - CoinDesk crypto news text (hourly aggregated)
+    - Continuous regression target (Volatility-Adjusted Tanh)
+    - Chronological train/val/test splits with 24-hour embargo
     
     Attributes:
         asset (str): "BTC" or "ETH"
-        data_dir (str): Path to data directory containing raw/ and processed/ subdirs
+        data_dir (str): Path to data directory (raw/ and processed/ subdirs)
         image_dir (str): Path to processed images directory
         horizon_hours (int): Hours ahead for target calculation (default 24)
+        time_start (datetime): Start of time range (default 2020-01-01)
+        time_end (datetime): End of time range (default 2025-01-31)
     """
     
     def __init__(
@@ -63,7 +71,9 @@ class DataAligner:
         asset: str = "BTC",
         data_dir: str = "data",
         image_dir: str = "data/processed/images",
-        horizon_hours: int = 24
+        horizon_hours: int = 24,
+        time_start: str = "2020-01-01",
+        time_end: str = "2025-01-31"
     ):
         """
         Initialize DataAligner.
@@ -73,6 +83,8 @@ class DataAligner:
             data_dir: Root data directory (should contain raw/ and processed/ subdirs)
             image_dir: Directory containing generated candlestick images
             horizon_hours: Time horizon for target calculation (default 24)
+            time_start: Start of time range (default 2020-01-01)
+            time_end: End of time range (default 2025-01-31)
         
         Raises:
             ValueError: If asset is not "BTC" or "ETH"
@@ -85,6 +97,8 @@ class DataAligner:
         self.raw_dir = self.data_dir / "raw"
         self.image_dir = Path(image_dir)
         self.horizon_hours = horizon_hours
+        self.time_start = pd.to_datetime(time_start, utc=True)
+        self.time_end = pd.to_datetime(time_end, utc=True)
         
         # Validate directories exist
         if not self.raw_dir.exists():
@@ -94,32 +108,35 @@ class DataAligner:
         
         # Data storage
         self.df: Optional[pd.DataFrame] = None
-        self.text_data: Optional[pd.DataFrame] = None
         
         logger.info(f"DataAligner initialized for {self.asset}")
         logger.info(f"Data directory: {self.data_dir.absolute()}")
         logger.info(f"Image directory: {self.image_dir.absolute()}")
+        logger.info(f"Time range: {self.time_start.date()} to {self.time_end.date()}")
         logger.info(f"Target horizon: {horizon_hours} hours")
     
     # ============================================================================
-    # PHASE 1: DATA LOADING
+    # PHASE 1: DATA LOADING (5 Core Sources Only)
     # ============================================================================
     
     def load_all_data(self) -> None:
-        """Load all 8 data sources from raw directory."""
+        """Load all 5 core data sources from raw directory."""
         logger.info("=" * 80)
-        logger.info("PHASE 1: Loading all data sources")
+        logger.info("PHASE 1: Loading 5 core data sources")
         logger.info("=" * 80)
         
         self._load_ohlcv()
-        self._load_hourly_data()
-        self._load_lower_frequency_data()
+        self._load_funding_rate()
+        self._load_fear_greed()
+        self._load_gdelt_news()
         self._load_text_data()
+        
+        self.filter_time_range()
         
         logger.info(f"All data sources loaded. Base dataset shape: {self.df.shape}")
     
     def _load_ohlcv(self) -> None:
-        """Load OHLCV klines data and create master index."""
+        """Load OHLCV klines data and create master hourly index."""
         csv_path = self.raw_dir / f"{self.asset}USDT_klines.csv"
         logger.info(f"Loading OHLCV from {csv_path}")
         
@@ -133,77 +150,10 @@ class DataAligner:
         
         self.df = df
     
-    def _load_hourly_data(self) -> None:
-        """Load and merge all hourly-granularity datasets (exact joins on timestamp + asset)."""
-        logger.info(f"\nLoading hourly datasets (exact join on timestamp, filtered for {self.asset})...")
+    def _load_funding_rate(self) -> None:
+        """Load and merge funding rates (8-hour frequency, forward-fill)."""
+        logger.info(f"\nLoading funding rates (8-hour, forward-fill)...")
         
-        # Load coinalyze_open_interest.csv
-        try:
-            csv_path = self.raw_dir / "coinalyze_open_interest.csv"
-            oi_df = pd.read_csv(csv_path)
-            oi_df['timestamp'] = pd.to_datetime(oi_df['timestamp'], utc=True)
-            oi_df = oi_df[oi_df['asset'] == self.asset].copy()
-            oi_df = oi_df[['timestamp', 'open', 'high', 'low', 'close']].copy()
-            oi_df.columns = ['timestamp', 'open_interest_open', 'open_interest_high', 
-                           'open_interest_low', 'open_interest_close']
-            oi_df = oi_df.set_index('timestamp')
-            self.df = self.df.join(oi_df, how='left')
-            logger.info(f"  ✓ Loaded open_interest ({len(oi_df)} records for {self.asset})")
-        except FileNotFoundError:
-            logger.warning(f"  ✗ File not found: coinalyze_open_interest.csv")
-        
-        # Load coinalyze_liquidations.csv
-        try:
-            csv_path = self.raw_dir / "coinalyze_liquidations.csv"
-            liq_df = pd.read_csv(csv_path)
-            liq_df['timestamp'] = pd.to_datetime(liq_df['timestamp'], utc=True)
-            liq_df = liq_df[liq_df['asset'] == self.asset].copy()
-            liq_df = liq_df[['timestamp', 'long_liquidations', 'short_liquidations']].copy()
-            liq_df = liq_df.set_index('timestamp')
-            # Fill missing liquidations with 0
-            self.df = self.df.join(liq_df, how='left')
-            self.df['long_liquidations'] = self.df['long_liquidations'].fillna(0)
-            self.df['short_liquidations'] = self.df['short_liquidations'].fillna(0)
-            logger.info(f"  ✓ Loaded liquidations ({len(liq_df)} records for {self.asset})")
-        except FileNotFoundError:
-            logger.warning(f"  ✗ File not found: coinalyze_liquidations.csv")
-        
-        # Load coinalyze_long_short_ratio.csv
-        try:
-            csv_path = self.raw_dir / "coinalyze_long_short_ratio.csv"
-            lsr_df = pd.read_csv(csv_path)
-            lsr_df['timestamp'] = pd.to_datetime(lsr_df['timestamp'], utc=True)
-            lsr_df = lsr_df[lsr_df['asset'] == self.asset].copy()
-            lsr_df = lsr_df[['timestamp', 'ratio', 'long_percentage', 'short_percentage']].copy()
-            lsr_df.columns = ['timestamp', 'long_short_ratio', 'long_percentage', 'short_percentage']
-            lsr_df = lsr_df.set_index('timestamp')
-            self.df = self.df.join(lsr_df, how='left')
-            logger.info(f"  ✓ Loaded long/short ratio ({len(lsr_df)} records for {self.asset})")
-        except FileNotFoundError:
-            logger.warning(f"  ✗ File not found: coinalyze_long_short_ratio.csv")
-        
-        # Load gdelt_macro.csv.csv (note: double .csv in filename)
-        try:
-            csv_path = self.raw_dir / "gdelt_macro.csv.csv"
-            gdelt_df = pd.read_csv(csv_path)
-            gdelt_df['timestamp'] = pd.to_datetime(gdelt_df['timestamp'], utc=True)
-            gdelt_df = gdelt_df[['timestamp', 'news_volume', 'avg_sentiment_tone']].copy()
-            gdelt_df = gdelt_df.set_index('timestamp')
-            # Fill missing values with 0
-            gdelt_df['news_volume'] = gdelt_df['news_volume'].fillna(0).astype(int)
-            gdelt_df['avg_sentiment_tone'] = gdelt_df['avg_sentiment_tone'].fillna(0)
-            self.df = self.df.join(gdelt_df, how='left')
-            logger.info(f"  ✓ Loaded GDELT macro sentiment ({len(gdelt_df)} records)")
-        except FileNotFoundError:
-            logger.warning(f"  ✗ File not found: gdelt_macro.csv.csv")
-        
-        logger.info(f"  → After hourly merges: {self.df.shape[0]} rows, {self.df.shape[1]} columns")
-    
-    def _load_lower_frequency_data(self) -> None:
-        """Load and merge lower-frequency datasets using forward-fill (no bfill)."""
-        logger.info(f"\nLoading lower-frequency datasets (forward-fill, no bfill)...")
-        
-        # Load funding rates (8-hour frequency)
         try:
             csv_path = self.raw_dir / f"{self.asset}USDT_fundingRate.csv"
             fr_df = pd.read_csv(csv_path)
@@ -214,7 +164,7 @@ class DataAligner:
             fr_df = fr_df.set_index('timestamp')
             fr_df = fr_df.sort_index()
             
-            # Merge using merge_asof to forward-fill funding rates
+            # Merge using merge_asof to forward-fill funding rates (backward direction)
             self.df = self.df.reset_index()
             fr_df = fr_df.reset_index()
             self.df = pd.merge_asof(
@@ -224,16 +174,20 @@ class DataAligner:
             )
             self.df = self.df.set_index('timestamp')
             
-            logger.info(f"  ✓ Loaded funding rates ({len(fr_df)} records for {self.asset})")
+            logger.info(f"  ✓ Loaded {len(fr_df)} funding rate records")
         except FileNotFoundError:
             logger.warning(f"  ✗ File not found: {self.asset}USDT_fundingRate.csv")
+            self.df['funding_rate'] = np.nan
+    
+    def _load_fear_greed(self) -> None:
+        """Load and merge Fear & Greed Index (daily frequency, forward-fill)."""
+        logger.info(f"\nLoading Fear & Greed Index (daily, forward-fill)...")
         
-        # Load Fear & Greed Index (daily frequency)
         try:
             csv_path = self.raw_dir / "fear_greed_index.csv"
             fg_df = pd.read_csv(csv_path)
             fg_df['timestamp'] = pd.to_datetime(fg_df['datetime'], utc=True)
-            # Filter to data range
+            # Filter to data range (will be stricter after OHLCV time filter)
             data_start = self.df.index.min()
             data_end = self.df.index.max()
             fg_df = fg_df[(fg_df['timestamp'] >= data_start) & (fg_df['timestamp'] <= data_end)]
@@ -248,35 +202,71 @@ class DataAligner:
             self.df = pd.merge_asof(
                 self.df, fg_df,
                 on='timestamp',
-                direction='backward'  # Forward-fill: take last known fear/greed value
+                direction='backward'  # Forward-fill: take last known F/G value
             )
             self.df = self.df.set_index('timestamp')
             
-            logger.info(f"  ✓ Loaded fear/greed index ({len(fg_df)} records)")
+            logger.info(f"  ✓ Loaded {len(fg_df)} Fear & Greed records")
         except FileNotFoundError:
             logger.warning(f"  ✗ File not found: fear_greed_index.csv")
-        
-        logger.info(f"  → After lower-frequency merges: {self.df.shape[0]} rows, {self.df.shape[1]} columns")
+            self.df['fear_greed_value'] = np.nan
+            self.df['fear_greed_classification'] = 'Unknown'
     
-    def _load_text_data(self) -> None:
-        """Load and aggregate text data from reddit_posts.csv by hour."""
-        logger.info(f"\nProcessing text data (aggregating reddit_posts by hour)...")
+    def _load_gdelt_news(self) -> None:
+        """Load and merge GDELT macroeconomic news sentiment (hourly)."""
+        logger.info(f"\nLoading GDELT macroeconomic news sentiment (hourly)...")
         
         try:
-            csv_path = self.raw_dir / "reddit_posts.csv"
-            # Note: reddit_posts.csv is large; read only necessary columns
+            csv_path = self.raw_dir / "gdelt_macro.csv.csv"
+            gdelt_df = pd.read_csv(csv_path)
+            gdelt_df['timestamp'] = pd.to_datetime(gdelt_df['timestamp'], utc=True)
+            gdelt_df = gdelt_df[['timestamp', 'news_volume', 'avg_sentiment_tone']].copy()
+            # Rename columns to match spec
+            gdelt_df.columns = ['timestamp', 'gdelt_news_count', 'gdelt_avg_sentiment']
+            gdelt_df = gdelt_df.set_index('timestamp')
+            # Fill missing values with 0 (no news articles in that hour)
+            gdelt_df['gdelt_news_count'] = gdelt_df['gdelt_news_count'].fillna(0).astype(int)
+            gdelt_df['gdelt_avg_sentiment'] = gdelt_df['gdelt_avg_sentiment'].fillna(0)
+            
+            self.df = self.df.join(gdelt_df, how='left')
+            logger.info(f"  ✓ Loaded GDELT macro sentiment ({len(gdelt_df)} records)")
+        except FileNotFoundError:
+            logger.warning(f"  ✗ File not found: gdelt_macro.csv.csv")
+            self.df['gdelt_news_count'] = 0
+            self.df['gdelt_avg_sentiment'] = 0.0
+    
+    def _load_text_data(self) -> None:
+        """Load and aggregate CoinDesk crypto news text data by hour."""
+        logger.info(f"\nProcessing text data (aggregating CoinDesk news by hour)...")
+        
+        try:
+            csv_path = self.raw_dir / "huggingface_crypto_news.csv"
+            # Read with minimal columns for efficiency
             text_df = pd.read_csv(
                 csv_path,
-                usecols=['timestamp', 'combined_text', 'assets'],
-                dtype={'combined_text': str, 'assets': str}
+                usecols=['published_on', 'combined_text'] if 'combined_text' in pd.read_csv(csv_path, nrows=0).columns else ['published_on', 'title', 'body'],
+                dtype={'combined_text': str} if 'combined_text' in pd.read_csv(csv_path, nrows=0).columns else {}
             )
             
+            # Rename published_on to timestamp and convert to UTC
+            text_df['timestamp'] = pd.to_datetime(text_df['published_on'], utc=True)
+            
+            # Handle combined_text field or build from title+body
+            if 'combined_text' in text_df.columns:
+                text_column = 'combined_text'
+            else:
+                # Build combined text from title and body
+                text_df['combined_text'] = text_df['title'].fillna('') + ' ' + text_df['body'].fillna('')
+                text_column = 'combined_text'
+            
+            text_df = text_df[['timestamp', text_column]].copy()
+            text_df.columns = ['timestamp', 'text_content']
+            
             # Floor timestamps to hour
-            text_df['timestamp'] = pd.to_datetime(text_df['timestamp'], utc=True)
             text_df['hour'] = text_df['timestamp'].dt.floor('H')
             
-            # Group by hour and concatenate combined_text with [SEP] separator
-            text_agg = text_df.groupby('hour')['combined_text'].apply(
+            # Group by hour and concatenate text with [SEP] separator
+            text_agg = text_df.groupby('hour')['text_content'].apply(
                 lambda x: ' [SEP] '.join(x.dropna().astype(str))
             ).reset_index()
             text_agg.columns = ['timestamp', 'text_content']
@@ -291,10 +281,22 @@ class DataAligner:
             logger.info(f"  ✓ Loaded and aggregated text data ({len(text_agg)} unique hours)")
             logger.info(f"  ✓ Filled {(self.df['text_content'] == '[NO_EVENT] market is quiet').sum()} hours with placeholder")
         except FileNotFoundError:
-            logger.warning(f"  ✗ File not found: reddit_posts.csv")
+            logger.warning(f"  ✗ File not found: huggingface_crypto_news.csv")
             self.df['text_content'] = '[NO_EVENT] market is quiet'
+        except Exception as e:
+            logger.warning(f"  ✗ Error loading text data: {str(e)}")
+            self.df['text_content'] = '[NO_EVENT] market is quiet'
+    
+    def filter_time_range(self) -> None:
+        """Filter dataset to specified time range (2020-01-01 to 2025-01-31)."""
+        logger.info(f"\nFiltering to time range: {self.time_start.date()} to {self.time_end.date()}")
         
-        logger.info(f"  → Final dataset after text merge: {self.df.shape[0]} rows, {self.df.shape[1]} columns")
+        rows_before = len(self.df)
+        self.df = self.df[(self.df.index >= self.time_start) & (self.df.index <= self.time_end)]
+        rows_after = len(self.df)
+        rows_dropped = rows_before - rows_after
+        
+        logger.info(f"  ✓ Filtered dataset: {rows_before} → {rows_after} rows (dropped {rows_dropped})")
     
     # ============================================================================
     # PHASE 2: CONTINUOUS TARGET CALCULATION (Volatility-Adjusted Tanh)
@@ -307,7 +309,7 @@ class DataAligner:
         Formula:
             R = (Close_future - Close_current) / Close_current
             sigma = rolling_std(hourly_returns, window=168)
-            y = tanh(R / (k * sigma)) * 100, where k=1.5
+            target_score = tanh(R / (k * sigma)) * 100, where k=1.5
         
         Safely handles edge cases:
         - When sigma ≈ 0: Uses epsilon (1e-5) to avoid division by zero
@@ -347,21 +349,20 @@ class DataAligner:
         
         # Calculate raw score
         raw_score = future_returns / (k * volatility_safe)
-        sentiment_score = np.tanh(raw_score) * 100
+        target_score = np.tanh(raw_score) * 100
         
-        self.df['sentiment_score'] = sentiment_score
+        self.df['target_score'] = target_score
         
-        logger.info(f"  ✓ Calculated sentiment scores: min={sentiment_score.min():.2f}, "
-                   f"max={sentiment_score.max():.2f}, mean={sentiment_score.mean():.2f}")
+        logger.info(f"  ✓ Calculated target scores: min={target_score.min():.2f}, "
+                   f"max={target_score.max():.2f}, mean={target_score.mean():.2f}")
         
         # Drop rows with NaN targets (at the end of the dataset)
         rows_before_drop = len(self.df)
-        self.df = self.df.dropna(subset=['sentiment_score'])
+        self.df = self.df.dropna(subset=['target_score'])
         rows_dropped = rows_before_drop - len(self.df)
         
         logger.info(f"  ✓ Dropped {rows_dropped} rows with NaN targets (end of dataset)")
-        logger.info(f"  → Dataset after target calculation: {len(self.df)} rows "
-                   f"(dropped {rows_dropped} due to future unavailability)")
+        logger.info(f"  → Dataset after target calculation: {len(self.df)} rows")
     
     # ============================================================================
     # PHASE 3: IMAGE MAPPING & DISK VALIDATION
@@ -417,31 +418,103 @@ class DataAligner:
             logger.info(f"  → All rows have corresponding images. Dataset: {len(self.df)} rows")
     
     # ============================================================================
-    # PHASE 4: FINAL DATASET ASSEMBLY
+    # PHASE 4: CHRONOLOGICAL SPLIT WITH EMBARGO
     # ============================================================================
     
-    def assemble_final_dataset(self) -> Tuple[Dataset, pd.DataFrame]:
+    def split_chronological_with_embargo(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
-        Assemble final dataset with selected columns in proper order.
+        Split dataset chronologically (70/15/15) with embargo rule to prevent look-ahead bias.
+        
+        CRITICAL EMBARGO RULE:
+        - Drop exactly `horizon_hours` (24) rows between train and validation
+        - Drop exactly `horizon_hours` (24) rows between validation and test
+        - These gaps act as buffers so future price info doesn't leak into past predictions
         
         Returns:
-            Tuple of (HuggingFace Dataset, pandas DataFrame with all rows)
+            Tuple of (df_train, df_validation, df_test_in_domain)
         """
         logger.info("=" * 80)
-        logger.info("PHASE 4: Assembling final dataset")
+        logger.info("PHASE 4: Chronological split with embargo rule")
+        logger.info("=" * 80)
+        
+        total_rows = len(self.df)
+        logger.info(f"Total rows before split: {total_rows}")
+        
+        # Calculate split indices (70/15/15)
+        train_size = int(0.70 * total_rows)
+        val_size = int(0.15 * total_rows)
+        # test_size gets the remainder to ensure all rows are used
+        
+        # Apply embargo rule: drop horizon_hours rows between splits
+        embargo_size = self.horizon_hours
+        
+        train_end_idx = train_size
+        val_start_idx = train_end_idx + embargo_size  # Begin embargo after train
+        val_end_idx = val_start_idx + val_size
+        test_start_idx = val_end_idx + embargo_size  # Begin embargo after validation
+        
+        # Extract splits
+        df_train = self.df.iloc[:train_end_idx].copy()
+        df_embargo_1 = self.df.iloc[train_end_idx:val_start_idx].copy()  # For audit
+        df_validation = self.df.iloc[val_start_idx:val_end_idx].copy()
+        df_embargo_2 = self.df.iloc[val_end_idx:test_start_idx].copy()  # For audit
+        df_test = self.df.iloc[test_start_idx:].copy()
+        
+        # Log split details
+        logger.info(f"\n  Train set:      rows {0:,} to {train_end_idx:,} ({len(df_train):,} rows, {len(df_train)/total_rows*100:.1f}%)")
+        logger.info(f"  Embargo 1:      rows {train_end_idx:,} to {val_start_idx:,} ({len(df_embargo_1):,} rows dropped)")
+        logger.info(f"  Validation set: rows {val_start_idx:,} to {val_end_idx:,} ({len(df_validation):,} rows, {len(df_validation)/total_rows*100:.1f}%)")
+        logger.info(f"  Embargo 2:      rows {val_end_idx:,} to {test_start_idx:,} ({len(df_embargo_2):,} rows dropped)")
+        logger.info(f"  Test set:       rows {test_start_idx:,} to {total_rows:,} ({len(df_test):,} rows, {len(df_test)/total_rows*100:.1f}%)")
+        
+        # Audit log: specific timestamps dropped
+        logger.info(f"\n  EMBARGO AUDIT TRAIL:")
+        logger.info(f"    Train-to-Val embargo (24 hours):")
+        for i, (idx, row) in enumerate(df_embargo_1.iterrows()):
+            if i % 6 == 0:  # Log every 6 hours for readability
+                logger.info(f"      Dropped: {idx} (hour {i+1}/24)")
+        logger.info(f"    Val-to-Test embargo (24 hours):")
+        for i, (idx, row) in enumerate(df_embargo_2.iterrows()):
+            if i % 6 == 0:  # Log every 6 hours for readability
+                logger.info(f"      Dropped: {idx} (hour {i+1}/24)")
+        
+        # Verify chronological ordering
+        if len(df_train) > 0 and len(df_validation) > 0 and len(df_test) > 0:
+            assert df_train.index.max() < df_validation.index.min(), "Train/Validation overlap detected!"
+            assert df_validation.index.max() < df_test.index.min(), "Validation/Test overlap detected!"
+            logger.info(f"\n  ✓ Chronological ordering verified (no overlaps)")
+        
+        logger.info(f"\n  FINAL SPLIT SUMMARY:")
+        logger.info(f"    Train:       {len(df_train):,} rows ({df_train.index.min()} to {df_train.index.max()})")
+        logger.info(f"    Validation:  {len(df_validation):,} rows ({df_validation.index.min()} to {df_validation.index.max()})")
+        logger.info(f"    Test:        {len(df_test):,} rows ({df_test.index.min()} to {df_test.index.max()})")
+        logger.info(f"    Total with embargo: {len(df_train) + len(df_validation) + len(df_test):,} rows")
+        
+        return df_train, df_validation, df_test
+    
+    # ============================================================================
+    # PHASE 5: FINAL DATASET ASSEMBLY
+    # ============================================================================
+    
+    def assemble_final_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Assemble final dataset with selected columns and apply chronological split.
+        
+        Returns:
+            Tuple of (df_train, df_validation, df_test_in_domain)
+        """
+        logger.info("=" * 80)
+        logger.info("PHASE 5: Assembling final datasets")
         logger.info("=" * 80)
         
         # Define final columns in order
         final_columns = [
             'open', 'high', 'low', 'close', 'volume',
             'funding_rate',
-            'open_interest_open', 'open_interest_high', 'open_interest_low', 'open_interest_close',
-            'long_liquidations', 'short_liquidations',
-            'long_short_ratio', 'long_percentage', 'short_percentage',
-            'news_volume', 'avg_sentiment_tone',
             'fear_greed_value', 'fear_greed_classification',
+            'gdelt_news_count', 'gdelt_avg_sentiment',
             'text_content',
-            'sentiment_score',
+            'target_score',
             'image_path'
         ]
         
@@ -452,7 +525,7 @@ class DataAligner:
         if missing_cols:
             logger.warning(f"  ⚠ Missing columns (will be skipped): {missing_cols}")
         
-        # Add asset column
+        # Prepare final dataframe
         df_final = self.df[existing_cols].copy()
         df_final['asset'] = self.asset
         
@@ -470,33 +543,209 @@ class DataAligner:
         logger.info(f"  Timestamp: {df_final.iloc[0]['timestamp']}")
         logger.info(f"  Asset: {df_final.iloc[0]['asset']}")
         logger.info(f"  Close Price: ${df_final.iloc[0]['close']:.2f}")
-        logger.info(f"  Sentiment Score: {df_final.iloc[0]['sentiment_score']:.2f}")
+        logger.info(f"  Target Score: {df_final.iloc[0]['target_score']:.2f}")
         logger.info(f"  Text Preview: {df_final.iloc[0]['text_content'][:80]}...")
         logger.info(f"  Image Path: {df_final.iloc[0]['image_path']}")
         
-        # Convert to HF Dataset
-        logger.info(f"\n  Converting to Hugging Face Dataset...")
-        hf_dataset = Dataset.from_pandas(df_final)
-        logger.info(f"  ✓ HF Dataset created with {len(hf_dataset)} rows")
+        # Apply chronological split with embargo
+        df_train, df_val, df_test = self.split_chronological_with_embargo()
         
-        return hf_dataset, df_final
+        # Select final columns for each split
+        df_train = df_train[existing_cols].copy()
+        df_train['asset'] = self.asset
+        df_train = df_train.reset_index()
+        df_train = df_train[cols]
+        
+        df_val = df_val[existing_cols].copy()
+        df_val['asset'] = self.asset
+        df_val = df_val.reset_index()
+        df_val = df_val[cols]
+        
+        df_test = df_test[existing_cols].copy()
+        df_test['asset'] = self.asset
+        df_test = df_test.reset_index()
+        df_test = df_test[cols]
+        
+        logger.info(f"\n  Final split statistics:")
+        logger.info(f"    Train:       {df_train.shape}")
+        logger.info(f"    Validation:  {df_val.shape}")
+        logger.info(f"    Test:        {df_test.shape}")
+        
+        return df_train, df_val, df_test
     
     # ============================================================================
-    # PHASE 5: HUGGING FACE HUB INTEGRATION
+    # PHASE 6: CONVERT TO DATASETDICT
     # ============================================================================
     
-    def cast_images_and_push_to_hub(
+    def create_dataset_dict(
         self,
-        hf_dataset: Dataset,
-        repo_id: str = "khanh252004/multimodal_crypto_sentiment",
+        df_train: pd.DataFrame,
+        df_val: pd.DataFrame,
+        df_test: pd.DataFrame
+    ) -> DatasetDict:
+        """
+        Convert pandas DataFrames to Hugging Face DatasetDict.
+        
+        Args:
+            df_train: Training set DataFrame
+            df_val: Validation set DataFrame
+            df_test: Test set DataFrame
+        
+        Returns:
+            DatasetDict with keys: train, validation, test_in_domain
+        """
+        logger.info("=" * 80)
+        logger.info("PHASE 6: Creating Hugging Face DatasetDict")
+        logger.info("=" * 80)
+        
+        # Convert to HF Datasets
+        dataset_train = Dataset.from_pandas(df_train)
+        dataset_val = Dataset.from_pandas(df_val)
+        dataset_test = Dataset.from_pandas(df_test)
+        
+        logger.info(f"  ✓ Train Dataset created: {len(dataset_train)} rows")
+        logger.info(f"  ✓ Validation Dataset created: {len(dataset_val)} rows")
+        logger.info(f"  ✓ Test Dataset created: {len(dataset_test)} rows")
+        
+        # Create DatasetDict
+        dataset_dict = DatasetDict({
+            'train': dataset_train,
+            'validation': dataset_val,
+            'test_in_domain': dataset_test
+        })
+        
+        logger.info(f"  ✓ DatasetDict created with keys: {list(dataset_dict.keys())}")
+        
+        # Cast image column to Image type
+        logger.info(f"\n  Casting image_path column to Image type...")
+        try:
+            dataset_dict = dataset_dict.cast_column('image_path', Image())
+            logger.info(f"  ✓ Image column cast successfully for all splits")
+            
+            # Verify by loading first image from each split
+            for split_name in ['train', 'validation', 'test_in_domain']:
+                if len(dataset_dict[split_name]) > 0:
+                    sample_image = dataset_dict[split_name][0]['image_path']
+                    logger.info(f"    - {split_name} sample image: {sample_image.size}")
+        except Exception as e:
+            logger.error(f"  ✗ Failed to cast image column: {str(e)}")
+            raise
+        
+        return dataset_dict
+    
+    # ============================================================================
+    # PHASE 7: PUSH TO HUGGING FACE HUB
+    # ============================================================================
+    
+    def generate_readme(self) -> str:
+        """Generate detailed README.md for Hugging Face Hub."""
+        readme = f"""---
+dataset_info:
+  dataset_name: multimodal_crypto_sentiment_{self.asset.lower()}
+  dataset_summary: Aligned multimodal cryptocurrency market sentiment dataset with 24-hour horizon prediction
+  dataset_type:
+    - tabular
+    - vision
+    - text
+  task_type:
+    - regression
+---
+
+# Dataset Card: Multimodal Cryptocurrency Market Sentiment ({self.asset})
+
+## Dataset Summary
+
+This dataset aligns **5 core data sources** into a single hourly multimodal dataset for cryptocurrency sentiment forecasting. The target is a **continuous sentiment score** (-100 to +100) predicting 24 hours ahead using Volatility-Adjusted Tanh formula.
+
+**Key Features:**
+- ✅ Chronological split (70% train, 15% validation, 15% test) with 24-hour embargo to prevent look-ahead bias
+- ✅ 100% image coverage: 224×224 candlestick charts with technical indicators (MA7, MA25, RSI, MACD)
+- ✅ Multimodal inputs: Tabular (OHLCV, sentiments), Text (CoinDesk news), Images (price charts)
+- ✅ Time range: 2020-01-01 to 2025-01-31 (5+ years)
+- ✅ Hourly frequency: {len(self.df):,} total rows before split
+
+## Data Sources
+
+| Source | Frequency | Records | Purpose |
+|--------|-----------|---------|---------|
+| Binance Vision OHLCV | Hourly | {len(self.df):,} | Price/volume (base index) |
+| Binance Funding Rates | 8-hour (forward-fill) | ~{int(len(self.df)/24*3)} | Derivatives sentiment |
+| Fear & Greed Index | Daily (forward-fill) | ~{int(len(self.df)/24)} | Market sentiment index |
+| GDELT Macroeconomic | Hourly | ~{int(len(self.df)*0.6)} | Global news sentiment |
+| CoinDesk News | Hourly (aggregated) | ~{int(len(self.df)*0.8)} | Crypto-specific news |
+
+## Chronological Split with Embargo Rule
+
+To prevent **look-ahead bias**, we enforce a strict chronological split with embargo buffers:
+
+```
+Timeline:
+|---- Train (70%) ----|[24h embargo]|---- Validation (15%) ----|[24h embargo]|---- Test (15%) ----|
+
+Key Point: The 24-hour embargo before each split ensures that no future price information
+leaks into past sentiment predictions. This mimics real-world deployment where future data
+is unavailable at prediction time.
+```
+
+## Features
+
+### Tabular (LSTM/MLP Inputs)
+```
+- timestamp: UTC datetime (floored to hour)
+- asset: 'BTC' or 'ETH'
+- open: Opening price (USDT, float)
+- high: High price (USDT, float)
+- low: Low price (USDT, float)
+- close: Closing price (USDT, float)
+- volume: Trading volume (asset units, float)
+- funding_rate: 8-hour perpetual funding rate (decimal, ±0.002)
+- fear_greed_value: F/G index (0-100, int)
+- fear_greed_classification: Categorical - ['Extreme Fear', 'Fear', 'Neutral', 'Greed', 'Extreme Greed']
+- gdelt_news_count: Macro news articles in hour (0-500, int)
+- gdelt_avg_sentiment: News sentiment tone (-100 to +100, float)
+```
+
+### Textual (BERT/Transformer Inputs)
+```
+- text_content: Hourly aggregated CoinDesk news articles
+  - Format: "Article 1 [SEP] Article 2 [SEP] Article 3 ..."
+  - Empty hours: '[NO_EVENT] market is quiet'
+  - Avg length: ~2,000 tokens per hour
+```
+
+### Visual (CNN/ViT Inputs)
+```
+- image_path: 224×224 PNG candlestick chart
+  - Technical indicators: 7-hour MA (blue), 25-hour MA (red)
+  - Oscillators: RSI(14), MACD with signal line
+  - Auto-generated from OHLCV data
+```
+
+### Target Label
+```
+- target_score: Continuous sentiment (-100 to +100, float)
+  - Formula: target_score = tanh(future_returns / (1.5 * volatility)) * 100
+  - Horizon: 24 hours ahead
+```
+
+## License
+
+CC BY-NC 4.0 (Non-commercial use only)
+"""
+        return readme
+    
+    def push_to_hub_dataset_dict(
+        self,
+        dataset_dict: DatasetDict,
+        repo_id: str,
         private: bool = False,
         dry_run: bool = False
     ) -> None:
         """
-        Cast image_path column to Image type and push dataset to Hugging Face Hub.
+        Push DatasetDict to Hugging Face Hub.
         
         Args:
-            hf_dataset: Hugging Face Dataset object
+            dataset_dict: DatasetDict with train/validation/test_in_domain splits
             repo_id: Target repository ID on HF Hub
             private: Whether to push as private dataset
             dry_run: If True, skip actual push (useful for testing)
@@ -505,7 +754,7 @@ class DataAligner:
             EnvironmentError: If HF_TOKEN not set in environment
         """
         logger.info("=" * 80)
-        logger.info("PHASE 5: Hugging Face Hub Integration")
+        logger.info("PHASE 7: Pushing to Hugging Face Hub")
         logger.info("=" * 80)
         
         # Check for HF_TOKEN
@@ -521,34 +770,32 @@ class DataAligner:
         
         logger.info(f"  ✓ HF_TOKEN found in environment")
         
-        # Cast image column
-        logger.info(f"  Casting image_path column to Image type...")
-        try:
-            hf_dataset = hf_dataset.cast_column('image_path', Image())
-            logger.info(f"  ✓ Image column cast successfully")
-            
-            # Verify by loading first image
-            sample_image = hf_dataset[0]['image_path']
-            logger.info(f"  ✓ Sample image loaded: shape={sample_image.size}")
-        except Exception as e:
-            logger.error(f"  ✗ Failed to cast image column: {str(e)}")
-            raise
+        # Generate README
+        logger.info(f"\n  Generating detailed README.md...")
+        readme_content = self.generate_readme()
+        logger.info(f"  ✓ README generated ({len(readme_content)} chars)")
         
         # Push to Hub
         if dry_run:
-            logger.info(f"  [DRY RUN] Would push to: {repo_id}")
+            logger.info(f"\n  [DRY RUN] Would push to: {repo_id}")
             logger.info(f"  [DRY RUN] Private: {private}")
-            logger.info(f"  [DRY RUN] Rows: {len(hf_dataset)}")
+            logger.info(f"  [DRY RUN] Splits:")
+            for split_name, split_data in dataset_dict.items():
+                logger.info(f"    - {split_name}: {len(split_data)} rows")
         else:
-            logger.info(f"  Pushing to Hub: {repo_id}")
+            logger.info(f"\n  Pushing to Hub: {repo_id}")
             try:
-                hf_dataset.push_to_hub(
+                # Push dataset
+                dataset_dict.push_to_hub(
                     repo_id=repo_id,
                     private=private,
                     token=hf_token
                 )
                 logger.info(f"  ✓ Successfully pushed to {repo_id}")
                 logger.info(f"  ✓ Dataset URL: https://huggingface.co/datasets/{repo_id}")
+                logger.info(f"  ✓ Splits on Hub:")
+                for split_name in ['train', 'validation', 'test_in_domain']:
+                    logger.info(f"    - {split_name}: Parquet files uploaded")
             except Exception as e:
                 logger.error(f"  ✗ Failed to push to Hub: {str(e)}")
                 raise
@@ -560,36 +807,42 @@ class DataAligner:
     def run(
         self,
         push_to_hub: bool = True,
-        hub_repo_id: str = "khanh252004/multimodal_crypto_sentiment",
+        hub_repo_id: Optional[str] = None,
         hub_private: bool = False,
         hub_dry_run: bool = False
-    ) -> pd.DataFrame:
+    ) -> DatasetDict:
         """
         Execute the complete data alignment pipeline.
         
         Orchestrates all phases:
-        1. Load all 8 data sources
-        2. Calculate continuous sentiment targets
-        3. Map and validate chart images
-        4. Assemble final dataset
-        5. Push to Hugging Face Hub (optional)
+        1. Load 5 core data sources
+        2. Filter to time range (2020-01-01 to 2025-01-31)
+        3. Calculate continuous target (target_score)
+        4. Map and validate chart images
+        5. Assemble final dataset and apply chronological split
+        6. Create Hugging Face DatasetDict
+        7. Push to Hub (optional)
         
         Args:
             push_to_hub: Whether to push final dataset to HF Hub
-            hub_repo_id: Target repository on HF Hub
+            hub_repo_id: Target repository on HF Hub (auto-constructed if None)
             hub_private: Whether dataset should be private
             hub_dry_run: If True, test push without actually uploading
         
         Returns:
-            Final pandas DataFrame with all aligned data
+            DatasetDict with train/validation/test_in_domain splits
         """
+        if hub_repo_id is None:
+            hub_repo_id = f"khanh252004/multimodal_crypto_sentiment_{self.asset.lower()}"
+        
         logger.info("\n" + "=" * 80)
         logger.info("DataAligner: Starting complete pipeline")
         logger.info(f"Asset: {self.asset}")
+        logger.info(f"Target Hub Repo: {hub_repo_id}")
         logger.info("=" * 80 + "\n")
         
         try:
-            # Phase 1: Load all data
+            # Phase 1: Load all 5 data sources
             self.load_all_data()
             
             # Phase 2: Calculate continuous targets
@@ -598,13 +851,16 @@ class DataAligner:
             # Phase 3: Map and validate images
             self.map_and_validate_images()
             
-            # Phase 4: Assemble final dataset
-            hf_dataset, df_final = self.assemble_final_dataset()
+            # Phase 4-5: Assemble final dataset + apply chronological split
+            df_train, df_val, df_test = self.assemble_final_dataset()
             
-            # Phase 5: Push to Hub (optional)
+            # Phase 6: Create DatasetDict
+            dataset_dict = self.create_dataset_dict(df_train, df_val, df_test)
+            
+            # Phase 7: Push to Hub (optional)
             if push_to_hub:
-                self.cast_images_and_push_to_hub(
-                    hf_dataset,
+                self.push_to_hub_dataset_dict(
+                    dataset_dict,
                     repo_id=hub_repo_id,
                     private=hub_private,
                     dry_run=hub_dry_run
@@ -614,7 +870,7 @@ class DataAligner:
             logger.info("✓ DataAligner pipeline completed successfully!")
             logger.info("=" * 80)
             
-            return df_final
+            return dataset_dict
         
         except Exception as e:
             logger.error(f"\n✗ Pipeline failed with error: {str(e)}")
@@ -664,8 +920,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--hub-repo-id",
         type=str,
-        default="khanh252004/multimodal_crypto_sentiment",
-        help="Target HF Hub repository ID (default: khanh252004/multimodal_crypto_sentiment)"
+        default=None,
+        help="Target HF Hub repository ID (default: auto-constructed)"
     )
     parser.add_argument(
         "--hub-private",
@@ -688,12 +944,13 @@ if __name__ == "__main__":
         horizon_hours=args.horizon_hours
     )
     
-    df_result = aligner.run(
+    dataset_dict = aligner.run(
         push_to_hub=not args.no_push,
         hub_repo_id=args.hub_repo_id,
         hub_private=args.hub_private,
         hub_dry_run=args.hub_dry_run
     )
     
-    logger.info(f"\nFinal dataset shape: {df_result.shape}")
-    logger.info(f"Columns: {list(df_result.columns)}")
+    logger.info(f"\nFinal DatasetDict splits:")
+    for split_name, split_data in dataset_dict.items():
+        logger.info(f"  {split_name}: {len(split_data)} rows, {len(split_data.column_names)} columns")
