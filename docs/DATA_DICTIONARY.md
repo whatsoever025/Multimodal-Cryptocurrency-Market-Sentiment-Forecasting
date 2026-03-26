@@ -343,20 +343,21 @@ timestamp,datetime,value,value_classification,time_until_update,source
 
 ---
 
-### 9. **gdelt_macro.csv.csv** - Macroeconomic News Sentiment
-- **Purpose:** Sentiment analysis of global macroeconomic news (GDELT)
-- **Rows:** 27,829
-- **Date Range:** 2023-01-01 to 2026-03-24 (3+ years)
+### 9. **gdelt_exogenous_data.csv** - GDELT Exogenous Data (Economy + Conflict)
+- **Purpose:** Global macroeconomic and geopolitical news sentiment (v3 feature set)
+- **Rows:** 43,909
+- **Date Range:** 2020-01-01 to 2025-01-31 (5+ years)
 - **Source:** GDELT v2.1 BigQuery Dataset
 - **Granularity:** Hourly (aggregated)
-- **Filter:** Macro-economic themes only (ECON_INFLATION, US_FEDERAL_RESERVE, CRISIS, ARMEDCONFLICT, ECON_UNEMPLOYMENT)
+- **Themes:** Economy/inflation + Conflict/politics (dual focus)
 
-#### Fields:
+#### Fields (3 exogenous macro indicators):
 | Field | Type | Description |
 |-------|------|-------------|
 | `timestamp` | datetime | UTC timestamp in ISO 8601 format |
-| `news_volume` | int | Number of news articles processed in this hour with macro themes |
-| `avg_sentiment_tone` | float | Average sentiment tone (-100 to +100); negative = negative sentiment, positive = positive |
+| `gdelt_econ_volume` | int | # articles on economy/inflation (ECON_INFLATION theme) |
+| `gdelt_econ_tone` | float | Average sentiment tone of economic articles (-100 to +100) |
+| `gdelt_conflict_volume` | int | # articles on conflict/politics (ARMEDCONFLICT theme) |
 
 #### Sentiment Tone Scale:
 - **-100 to -50:** Very negative news (crises, conflicts, unemployment)
@@ -365,22 +366,90 @@ timestamp,datetime,value,value_classification,time_until_update,source
 - **+10 to +50:** Positive news (growth, stability)
 - **+50 to +100:** Very positive news (booming, prosperity)
 
-#### Purpose:
-Macroeconomic sentiment provides context for cryptocurrency market movements. Negative macro news often correlates with crypto sell-offs; positive macro sentiment supports risk-on sentiment.
+#### Purpose (v3 Integration):
+Exogenous macro data provides **exogenous shock signals** for crypto markets:
+- **Economic articles** capture inflation/policy changes affecting risk sentiment
+- **Conflict articles** capture geopolitical risk and flight-to-safety dynamics
+- Used alongside endogenous signals (funding rates, returns) for comprehensive sentiment
 
 #### Themes Tracked:
-- `ECON_INFLATION` - Inflation related news
-- `US_FEDERAL_RESERVE` - Federal Reserve policy
-- `CRISIS` - Global economic crises
-- `ARMEDCONFLICT` - Geopolitical conflicts
-- `ECON_UNEMPLOYMENT` - Employment data/trends
+- `ECON_INFLATION` - Inflation, economic policy, interest rates
+- `ARMEDCONFLICT` - Geopolitical conflicts, political instability
 
 #### Sample Data:
 ```
-timestamp,news_volume,avg_sentiment_tone
-2023-01-01T00:00:00+00:00,45,-12.3
-2023-01-01T01:00:00+00:00,32,5.1
+timestamp,gdelt_econ_volume,gdelt_econ_tone,gdelt_conflict_volume
+2023-01-01T00:00:00+00:00,45,-12.3,8
+2023-01-01T01:00:00+00:00,32,5.1,3
 ```
+
+---
+
+## v3 Implementation: 10-Field Multimodal Structure
+
+### Final Dataset Fields (After Alignment & Processing)
+
+The **data_aligner.py** pipeline produces a **10-field multimodal dataset** with chronological train/val/test splits:
+
+#### 1. Meta Group (1 field)
+| Field | Type | Source | Purpose |
+|-------|------|--------|----------|
+| `timestamp` | datetime | All sources (hourly index) | Time identifier (UTC) |
+
+#### 2. Tabular Data Group (7 fields) - For LSTM/MLP
+| Field | Type | Source | Purpose |
+|-------|------|--------|----------|
+| `return_1h` | float (%) | OHLCV | Endogenous: hourly % price change |
+| `volume` | float | OHLCV | Trading activity (asset units) |
+| `funding_rate` | float | Binance funding rates | Derivatives sentiment (8-hour ffill) |
+| `fear_greed_value` | int (0-100) | Fear & Greed Index | Crypto market sentiment (daily ffill) |
+| `gdelt_econ_volume` | int | GDELT exogenous | # macro news articles (economy) |
+| `gdelt_econ_tone` | float (-100 to +100) | GDELT exogenous | Sentiment tone of economic news |
+| `gdelt_conflict_volume` | int | GDELT exogenous | # geopolitical/conflict articles |
+
+#### 3. Textual Data Group (1 field) - For BERT/LLM
+| Field | Type | Source | Purpose |
+|-------|------|--------|----------|
+| `text_content` | string | CoinDesk news (aggregated) | Hourly crypto news articles [SEP] joined |
+
+#### 4. Visual Data Group (1 field) - For CNN/ViT
+| Field | Type | Source | Purpose |
+|-------|------|--------|----------|
+| `image_path` | image (224×224 PNG) | chart_generator.py | Candlestick + MA7/MA25/RSI/MACD |
+
+#### 5. Target Label (1 field)
+| Field | Type | Formula | Purpose |
+|-------|------|---------|----------|
+| `target_score` | float (-100 to +100) | tanh(R/(1.5*σ)) * 100 | 24-hour sentiment target (continuous) |
+
+**Total: 10 features + 1 target = 11 columns per row**
+
+### Data Alignment Process (Phases 1-7)
+
+| Phase | Operation | Input | Output |
+|-------|-----------|-------|--------|
+| **1** | Load 5 sources | CSV files | 44,545 rows × 12 cols (raw merged) |
+| **2** | Calculate target | Close prices + volatility | +target_score col |
+| **3** | Map & validate images | Image directory | Drop 44 rows (missing images) |
+| **4-5** | Assemble + split | 44,477 rows | Train: 31,133 / Val: 6,671 / Test: 6,625 |
+| **6** | Create DatasetDict | DataFrames → HF Datasets | Image casting (224×224) |
+| **7** | Push to Hub | DatasetDict | Public repos on HF Hub |
+
+### Chronological Split with Embargo
+
+**Key Feature:** 24-hour embargo buffers prevent look-ahead bias
+
+```
+Timeline (Chronological):
+|------------- Train (70%) --------------|[24h embargo]|-- Val (15%) --|[24h embargo]|-- Test (15%) --|
+│                                       │                                │                             │
+🕐 2020-01-02 21:00 UTC               2023-07-24 00:00              2024-04-28 00:00        2025-01-30 00:00
+│ ← 31,133 rows                       24 rows dropped              24 rows dropped           6,625 rows →
+```
+
+- **Train boundary:** 2023-07-24 (drop 24 hours)
+- **Val boundary:** 2024-04-28 (drop 24 hours)
+- **Total usable:** 44,429 rows after embargo
 
 ---
 
@@ -429,7 +498,7 @@ timestamp,news_volume,avg_sentiment_tone
 | Binance Vision (funding) | BTC, ETH | 2023-2026 | 11,148 | ⭐⭐⭐⭐⭐ - Official exchange data |
 | Coinalyze (OI, liquidations, L/S) | BTC, ETH | Recent (2-3 mo) | 11,238 | ⭐⭐⭐⭐ - Aggregator, good coverage |
 | Fear & Greed Index | Crypto market | 2018-2026 | 2,970 | ⭐⭐⭐⭐⭐ - Well-established index |
-| GDELT Macro Sentiment | Global macro | 2023-2026 | 27,829 | ⭐⭐⭐⭐ - News-based, real-time |
+| **GDELT Exogenous Data** | Global macro (economy + conflict) | 2020-2026 | 43,909 | ⭐⭐⭐⭐ - Dual-focus macro indicators |
 | Reddit Discussion | BTC, ETH | 2025-2026 | 2,981 | ⭐⭐⭐⭐ - Real-time Reddit data |
 | **Generated Chart Images** | **BTC, ETH** | **2020-2025** | **89,048** | **✓ 224×224 px with technical indicators** |
 
@@ -452,10 +521,10 @@ timestamp,news_volume,avg_sentiment_tone
    - Join on `timestamp` and `asset` (BTC or ETH)
    - Files: `coinalyze_*.csv`
 
-4. **Macro Sentiment:**
+4. **Macro Sentiment (GDELT Exogenous):**
    - Hourly timestamp
    - Join with price data on `timestamp`
-   - File: `gdelt_macro.csv.csv`
+   - File: `gdelt_exogenous_data.csv`
 
 ---
 
@@ -466,21 +535,28 @@ timestamp,news_volume,avg_sentiment_tone
 - Target: Next 1-24 hour price movement
 - Files: BTC/ETH klines, funding rates, fear_greed, GDELT
 
-### 2. **Liquidation Cascade Detection**
+### 2. **Multimodal Sentiment Forecasting (v3)**
+- Input: OHLCV (return_1h, volume) + funding_rate + fear_greed_value + GDELT exogenous (3 fields) + text_content + image_path
+- Target: target_score (24-hour ahead sentiment, continuous -100 to +100)
+- Architecture: LSTM/MLP + BERT + CNN/ViT (multi-branch fusion)
+- Files: Hugging Face Hub (BTC/ETH datasets v3)
+- Training: 31,133 rows per asset (70% train split)
+
+### 3. **Liquidation Cascade Detection**
 - Input: Liquidation volume + OI changes + L/S ratio extreme values
 - Target: Detect potential price reversals
 - Files: coinalyze_liquidations, coinalyze_open_interest, coinalyze_long_short_ratio
 
-### 3. **Sentiment Features**
-- Input: Fear/Greed classification + macro sentiment tone + news volume
+### 4. **Sentiment Features**
+- Input: Fear/Greed classification + GDELT exogenous (econ volume/tone + conflict) + news volume
 - Use as: Feature for machine learning models
-- Files: fear_greed_index, gdelt_macro
+- Files: fear_greed_index, gdelt_exogenous_data
 
-### 4. **Risk Management**
+### 5. **Risk Management**
 - Monitor funding rates for leverage extremes
 - Track liquidation volumes for capitulation signals
 - Check macro sentiment for systemic risk
-- Files: Funding rates + liquidations + GDELT
+- Files: Funding rates + liquidations + GDELT exogenous
 
 ---
 
@@ -515,6 +591,14 @@ timestamp,news_volume,avg_sentiment_tone
 **Fear & Greed Index Span:** 2018-02-01 to 2026-03-24 (8+ years)  
 
 #### Recent Updates:
+- **2026-03-26:** v3 Implementation Complete - Multimodal Datasets Pushed to Hub
+  - **BTC Dataset:** `khanh252004/multimodal_crypto_sentiment_btc` (31,133/6,671/6,625 splits, 11 cols)
+  - **ETH Dataset:** `khanh252004/multimodal_crypto_sentiment_eth` (31,133/6,671/6,625 splits, 11 cols)
+  - Replaced GDELT macro with gdelt_exogenous_data.csv (dual-focus: economy + conflict)
+  - Implemented return_1h (% price change) replacing raw OHLCV
+  - 10-field structure: 1 meta + 7 tabular + 1 text + 1 visual + 1 target
+  - Chronological splits with 24-hour embargo to prevent look-ahead bias
+  - 100% image coverage: 44,477 valid images per asset (224×224 candlestick charts)
 - **2026-03-25:** Complete data pipeline overhaul
   - Added HuggingFace `crypto-news-coindesk-2020-2025` dataset: 229,172 articles (2019-2025)
   - Extended crawler time ranges to match HuggingFace historical data
