@@ -1,22 +1,37 @@
 """
-DataAligner: Production-Ready Multimodal Crypto Sentiment Dataset Alignment
-(Refactored: Strict Data Scope with Chronological Splits & Embargo)
+DataAligner: Production-Ready Multimodal Cryptocurrency Sentiment Dataset (v3)
 
-Orchestrates merging of 5 core data sources into aligned hourly dataset with:
-- Market data (OHLCV from Binance klines)
-- Derivatives metrics (funding rates, 8-hour frequency)
-- Sentiment indices (fear/greed index, daily)
-- Macroeconomic news (GDELT with sentiment scores)
-- Text data (CoinDesk crypto news, hourly aggregated)
-- Continuous target (Volatility-Adjusted Tanh, -100 to +100)
-- Chronological train/validation/test splits (70/15/15) with 24-hour embargo
+DATASET STRUCTURE: 10-field multimodal hourly dataset with continuous sentiment target
 
-KEY CHANGES (v2):
-- Removed: Reddit aggregation, Coinalyze (OI, liquidations, L/S ratio)
-- Renamed: sentiment_score → target_score, news_volume → gdelt_news_count, avg_sentiment_tone → gdelt_avg_sentiment
-- NEW: Chronological split with embargo rule (prevents look-ahead bias)
-- NEW: DatasetDict output (train/validation/test_in_domain) → HF Hub push
-- Time range: Hard-coded 2020-01-01 to 2025-01-31
+5 CORE DATA SOURCES:
+  1. Binance OHLCV (hourly): return_1h, volume
+  2. Binance funding rates (8h, forward-filled): funding_rate
+  3. Fear & Greed Index (daily, forward-filled): fear_greed_value
+  4. GDELT exogenous (economy + conflict, hourly): gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume
+  5. CoinDesk news (hourly aggregated): text_content + image_path
+
+FINAL OUTPUT (10 Features + 1 Target):
+  META (1):          timestamp
+  TABULAR (7):       return_1h, volume, funding_rate, fear_greed_value, gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume
+  TEXT (1):          text_content (CoinDesk news with [SEP] separator)
+  VISION (1):        image_path (224x224 PNG candlestick + MA7/MA25/RSI/MACD)
+  TARGET (1):        target_score (continuous -100 to +100, 24-hour horizon, Volatility-Adjusted Tanh)
+
+KEY FEATURES (v3):
+  - Hourly alignment: 5.25 years (2020-01-02 21:00 UTC to 2025-01-30 00:00 UTC)
+  - Chronological splits: 70% train (31,133) / 15% val (6,671) / 15% test (6,625) with 24-hour embargo
+  - Embargo rule: 48 rows dropped at split boundaries to prevent look-ahead bias
+  - Complete coverage: 44,429 rows per asset (after image validation, embargo removal)
+  - 100% image validity: 44,477 valid candlestick charts per asset (224x224 PNG)
+  - Dual exogenous factors: Economy (inflation/policy) + geopolitical conflict signals
+  - Multimodal-ready: Compatible with LSTM/MLP (tabular) + BERT (text) + CNN/ViT (images)
+  - HF Hub ready: Direct push to public repositories (khanh252004/multimodal_crypto_sentiment_btc/eth)
+
+AVAILABLE DATASETS:
+  - BTC: https://huggingface.co/datasets/khanh252004/multimodal_crypto_sentiment_btc
+  - ETH: https://huggingface.co/datasets/khanh252004/multimodal_crypto_sentiment_eth
+
+SEE: docs/HF_DATASET_GUIDE.md for usage examples, architecture blueprints, and model implementations
 """
 
 import os
@@ -128,7 +143,7 @@ class DataAligner:
         self._load_ohlcv()
         self._load_funding_rate()
         self._load_fear_greed()
-        self._load_gdelt_news()
+        self._load_gdelt_exogenous()
         self._load_text_data()
         
         self.filter_time_range()
@@ -212,28 +227,35 @@ class DataAligner:
             self.df['fear_greed_value'] = np.nan
             self.df['fear_greed_classification'] = 'Unknown'
     
-    def _load_gdelt_news(self) -> None:
-        """Load and merge GDELT macroeconomic news sentiment (hourly)."""
-        logger.info(f"\nLoading GDELT macroeconomic news sentiment (hourly)...")
+    def _load_gdelt_exogenous(self) -> None:
+        """Load and merge GDELT exogenous data (economy, conflict).
+        
+        Provides 3 macro indicators (hourly):
+        - gdelt_econ_volume: # articles on economy/inflation
+        - gdelt_econ_tone: Average tone of economic articles
+        - gdelt_conflict_volume: # articles on conflict/politics
+        """
+        logger.info(f"\nLoading GDELT exogenous data (economy, conflict)...")
         
         try:
-            csv_path = self.raw_dir / "gdelt_macro.csv.csv"
+            csv_path = self.raw_dir / "gdelt_exogenous_data.csv"
             gdelt_df = pd.read_csv(csv_path)
             gdelt_df['timestamp'] = pd.to_datetime(gdelt_df['timestamp'], utc=True)
-            gdelt_df = gdelt_df[['timestamp', 'news_volume', 'avg_sentiment_tone']].copy()
-            # Rename columns to match spec
-            gdelt_df.columns = ['timestamp', 'gdelt_news_count', 'gdelt_avg_sentiment']
+            gdelt_df = gdelt_df[['timestamp', 'gdelt_econ_volume', 'gdelt_econ_tone', 'gdelt_conflict_volume']].copy()
             gdelt_df = gdelt_df.set_index('timestamp')
-            # Fill missing values with 0 (no news articles in that hour)
-            gdelt_df['gdelt_news_count'] = gdelt_df['gdelt_news_count'].fillna(0).astype(int)
-            gdelt_df['gdelt_avg_sentiment'] = gdelt_df['gdelt_avg_sentiment'].fillna(0)
+            
+            # Fill missing values with 0 for volumes, 0 for tones
+            gdelt_df['gdelt_econ_volume'] = gdelt_df['gdelt_econ_volume'].fillna(0).astype(int)
+            gdelt_df['gdelt_conflict_volume'] = gdelt_df['gdelt_conflict_volume'].fillna(0).astype(int)
+            gdelt_df['gdelt_econ_tone'] = gdelt_df['gdelt_econ_tone'].fillna(0)
             
             self.df = self.df.join(gdelt_df, how='left')
-            logger.info(f"  ✓ Loaded GDELT macro sentiment ({len(gdelt_df)} records)")
+            logger.info(f"  ✓ Loaded GDELT exogenous data ({len(gdelt_df)} records)")
         except FileNotFoundError:
-            logger.warning(f"  ✗ File not found: gdelt_macro.csv.csv")
-            self.df['gdelt_news_count'] = 0
-            self.df['gdelt_avg_sentiment'] = 0.0
+            logger.warning(f"  ✗ File not found: gdelt_exogenous_data.csv")
+            self.df['gdelt_econ_volume'] = 0
+            self.df['gdelt_econ_tone'] = 0.0
+            self.df['gdelt_conflict_volume'] = 0
     
     def _load_text_data(self) -> None:
         """Load and aggregate CoinDesk crypto news text data by hour."""
@@ -498,7 +520,20 @@ class DataAligner:
     
     def assemble_final_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
-        Assemble final dataset with selected columns and apply chronological split.
+        Assemble final 10-field dataset and apply chronological split.
+        
+        Final fields (10 features + target):
+        1. timestamp (Meta)
+        2. return_1h (Tabular - price momentum)
+        3. volume (Tabular - trading activity)
+        4. funding_rate (Tabular - derivative sentiment)
+        5. fear_greed_index (Tabular - crypto sentiment)
+        6. gdelt_econ_volume (Tabular - macro news volume)
+        7. gdelt_econ_tone (Tabular - macro sentiment)
+        8. gdelt_conflict_volume (Tabular - geopolitical risk)
+        9. text_content (Textual - news content)
+        10. image_path (Visual - technical charts)
+        11. target_score (Target - prediction label)
         
         Returns:
             Tuple of (df_train, df_validation, df_test_in_domain)
@@ -507,15 +542,21 @@ class DataAligner:
         logger.info("PHASE 5: Assembling final datasets")
         logger.info("=" * 80)
         
-        # Define final columns in order
+        # Calculate return_1h (% change from 1 hour ago)
+        self.df['return_1h'] = self.df['close'].pct_change() * 100  # Convert to percentage
+        
+        # Define final columns in order (10 features + target)
         final_columns = [
-            'open', 'high', 'low', 'close', 'volume',
+            'return_1h',
+            'volume',
             'funding_rate',
-            'fear_greed_value', 'fear_greed_classification',
-            'gdelt_news_count', 'gdelt_avg_sentiment',
+            'fear_greed_value',
+            'gdelt_econ_volume',
+            'gdelt_econ_tone',
+            'gdelt_conflict_volume',
             'text_content',
-            'target_score',
-            'image_path'
+            'image_path',
+            'target_score'
         ]
         
         # Check which columns exist
@@ -525,24 +566,20 @@ class DataAligner:
         if missing_cols:
             logger.warning(f"  ⚠ Missing columns (will be skipped): {missing_cols}")
         
-        # Prepare final dataframe
+        # Prepare final dataframe (include timestamp)
         df_final = self.df[existing_cols].copy()
-        df_final['asset'] = self.asset
+        df_final = df_final.reset_index()  # timestamp becomes a column
         
-        # Reset index to make timestamp a column
-        df_final = df_final.reset_index()
-        
-        # Reorder columns: timestamp and asset first
-        cols = ['timestamp', 'asset'] + [col for col in df_final.columns 
-                                         if col not in ['timestamp', 'asset']]
+        # Reorder: timestamp first, then features, then target
+        cols = ['timestamp'] + existing_cols
         df_final = df_final[cols]
         
         logger.info(f"  ✓ Final dataset shape: {df_final.shape}")
         logger.info(f"  ✓ Columns ({len(cols)}): {cols}")
         logger.info(f"\nSample row:")
         logger.info(f"  Timestamp: {df_final.iloc[0]['timestamp']}")
-        logger.info(f"  Asset: {df_final.iloc[0]['asset']}")
-        logger.info(f"  Close Price: ${df_final.iloc[0]['close']:.2f}")
+        logger.info(f"  Return (1h): {df_final.iloc[0]['return_1h']:.4f}%")
+        logger.info(f"  Volume: {df_final.iloc[0]['volume']:.0f}")
         logger.info(f"  Target Score: {df_final.iloc[0]['target_score']:.2f}")
         logger.info(f"  Text Preview: {df_final.iloc[0]['text_content'][:80]}...")
         logger.info(f"  Image Path: {df_final.iloc[0]['image_path']}")
@@ -550,19 +587,16 @@ class DataAligner:
         # Apply chronological split with embargo
         df_train, df_val, df_test = self.split_chronological_with_embargo()
         
-        # Select final columns for each split
+        # Apply same column selection to each split
         df_train = df_train[existing_cols].copy()
-        df_train['asset'] = self.asset
         df_train = df_train.reset_index()
         df_train = df_train[cols]
         
         df_val = df_val[existing_cols].copy()
-        df_val['asset'] = self.asset
         df_val = df_val.reset_index()
         df_val = df_val[cols]
         
         df_test = df_test[existing_cols].copy()
-        df_test['asset'] = self.asset
         df_test = df_test.reset_index()
         df_test = df_test[cols]
         
