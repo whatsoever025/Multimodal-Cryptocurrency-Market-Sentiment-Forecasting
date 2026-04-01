@@ -1,0 +1,458 @@
+"""
+Production training loop with VRAM management, W&B integration, and best model checkpointing.
+
+Key Features:
+- Trainer class with full state management (save/load/train/validate)
+- AMP (Automatic Mixed Precision) with float16 for VRAM reduction
+- Gradient accumulation (batch_size=8, accumulate_steps=2 → effective BS=16)
+- W&B integration per-branch via wandb_run_name
+- Best model checkpointing with experiment naming
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+import logging
+import json
+import argparse
+from datetime import datetime
+import sys
+
+# Suppress transformers warnings
+import warnings
+warnings.filterwarnings("ignore")
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+from config import ExperimentConfig, create_config
+from dataset import CryptoMultimodalDataset, multimodal_collate_fn, create_dataloaders
+from model import MultimodalFusionNet
+
+
+logger = logging.getLogger(__name__)
+
+
+class Trainer:
+    """
+    Training orchestrator with state management, checkpointing, and MLOps integration.
+    """
+    
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        model: nn.Module,
+        device: str = "cuda",
+    ):
+        """
+        Initialize trainer.
+        
+        Args:
+            config: ExperimentConfig instance
+            model: MultimodalFusionNet or similar
+            device: "cuda" or "cpu"
+        """
+        self.config = config
+        self.model = model.to(device)
+        self.device = device
+        
+        # Optimizer & scheduler
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
+        
+        # State tracking
+        self.epoch = 0
+        self.global_step = 0
+        self.best_val_loss = float("inf")
+        self.best_epoch = 0
+        self.train_losses = []
+        self.val_losses = []
+        
+        logger.info(f"Trainer initialized (device={device})")
+    
+    def setup_optimizer(self) -> None:
+        """Initialize optimizer and learning rate scheduler."""
+        # AdamW optimizer
+        self.optimizer = optim.AdamW(
+            self.model.get_trainable_params(),
+            lr=self.config.training.learning_rate,
+            weight_decay=self.config.training.weight_decay,
+        )
+        logger.info(f"Optimizer: AdamW (lr={self.config.training.learning_rate:.2e})")
+        
+        # Learning rate scheduler
+        if self.config.training.use_warmup:
+            # Warmup + cosine anneal
+            from transformers import get_cosine_schedule_with_warmup
+            
+            total_steps = self.config.training.num_training_steps
+            if total_steps is None:
+                total_steps = 1000  # Fallback
+            
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.config.training.warmup_steps,
+                num_training_steps=total_steps,
+            )
+            logger.info(f"Scheduler: Cosine with warmup ({self.config.training.warmup_steps} steps)")
+        else:
+            self.scheduler = None
+            logger.info("Scheduler: None (constant LR)")
+        
+        # AMP GradScaler
+        if self.config.optimization.mixed_precision:
+            self.scaler = GradScaler(
+                init_scale=self.config.optimization.init_scale,
+                growth_factor=self.config.optimization.growth_factor,
+                backoff_factor=self.config.optimization.backoff_factor,
+                growth_interval=self.config.optimization.growth_interval,
+            )
+            logger.info("AMP GradScaler initialized")
+    
+    def train_epoch(self, train_loader: DataLoader) -> float:
+        """
+        Run one training epoch with gradient accumulation and AMP.
+        
+        CRITICAL VRAM Management:
+        - Batch size 8 (seq_len 24 = 192 effective samples)
+        - Gradient accumulation: accumulate_steps=2 (emulates BS=16)
+        - Mixed precision: float16 for forward/backward
+        - Gradient clipping: grad_norm <= 1.0
+        
+        Args:
+            train_loader: Training DataLoader
+        
+        Returns:
+            Average training loss
+        """
+        self.model.train()
+        total_loss = 0.0
+        num_steps = 0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            # Move batch to device
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            
+            # Forward pass with AMP
+            with autocast(
+                device_type="cuda" if self.device == "cuda" else "cpu",
+                dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.bfloat16,
+                enabled=self.config.optimization.mixed_precision,
+            ):
+                predictions = self.model(batch)  # (batch, 1)
+                targets = batch["target"].unsqueeze(1)  # (batch, 1)
+                
+                # MSE loss
+                loss = nn.MSELoss()(predictions, targets)
+                
+                # Scale loss for gradient accumulation
+                loss = loss / self.config.training.accumulate_steps
+            
+            # Backward pass with scaled loss
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Accumulation step
+            if (batch_idx + 1) % self.config.training.accumulate_steps == 0:
+                # Unscale gradients before clipping
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                
+                # Gradient clipping
+                if self.config.model.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.model.grad_clip,
+                    )
+                
+                # Optimizer step
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                # Scheduler step
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                
+                # Reset gradients
+                self.optimizer.zero_grad()
+                
+                self.global_step += 1
+                
+                # Log if needed
+                if self.global_step % self.config.mlops.log_frequency == 0:
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    logger.info(
+                        f"Epoch {self.epoch+1} | Step {self.global_step} | Loss {loss.item():.6f} | LR {current_lr:.2e}"
+                    )
+                    
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log({
+                            "train_loss": loss.item(),
+                            "learning_rate": current_lr,
+                            "global_step": self.global_step,
+                        })
+            
+            total_loss += loss.item() * self.config.training.accumulate_steps
+            num_steps += 1
+        
+        avg_loss = total_loss / num_steps
+        self.train_losses.append(avg_loss)
+        
+        return avg_loss
+    
+    def validate(self, val_loader: DataLoader) -> Tuple[float, float]:
+        """
+        Run validation.
+        
+        Args:
+            val_loader: Validation DataLoader
+        
+        Returns:
+            (mse_loss, mae_loss)
+        """
+        self.model.eval()
+        total_mse = 0.0
+        total_mae = 0.0
+        num_steps = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                # Move to device
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                
+                # Forward with AMP
+                with autocast(
+                    device_type="cuda" if self.device == "cuda" else "cpu",
+                    dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.bfloat16,
+                    enabled=self.config.optimization.mixed_precision,
+                ):
+                    predictions = self.model(batch)  # (batch, 1)
+                    targets = batch["target"].unsqueeze(1)  # (batch, 1)
+                    
+                    mse = nn.MSELoss()(predictions, targets)
+                    mae = nn.L1Loss()(predictions, targets)
+                
+                total_mse += mse.item()
+                total_mae += mae.item()
+                num_steps += 1
+        
+        avg_mse = total_mse / num_steps
+        avg_mae = total_mae / num_steps
+        self.val_losses.append(avg_mse)
+        
+        return avg_mse, avg_mae
+    
+    def save_checkpoint(self, path: Path, is_best: bool = False) -> None:
+        """
+        Save training checkpoint.
+        
+        Args:
+            path: Path to save checkpoint
+            is_best: If True, mark as best model
+        """
+        checkpoint = {
+            "epoch": self.epoch,
+            "global_step": self.global_step,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+            "best_val_loss": self.best_val_loss,
+            "best_epoch": self.best_epoch,
+            "train_losses": self.train_losses,
+            "val_losses": self.val_losses,
+            "config": self.config.to_dict(),
+        }
+        
+        torch.save(checkpoint, path)
+        
+        status = "BEST" if is_best else "checkpoint"
+        logger.info(f"✓ Saved {status} model to {path}")
+        
+        # Log to W&B
+        if wandb is not None and wandb.run is not None:
+            wandb.save(str(path))
+    
+    def load_checkpoint(self, path: Path) -> None:
+        """
+        Load training checkpoint and restore state.
+        
+        Args:
+            path: Path to checkpoint
+        """
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
+        if self.scheduler and checkpoint.get("scheduler_state_dict"):
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        
+        if self.scaler and checkpoint.get("scaler_state_dict"):
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        
+        self.epoch = checkpoint["epoch"]
+        self.global_step = checkpoint["global_step"]
+        self.best_val_loss = checkpoint["best_val_loss"]
+        self.best_epoch = checkpoint["best_epoch"]
+        self.train_losses = checkpoint["train_losses"]
+        self.val_losses = checkpoint["val_losses"]
+        
+        logger.info(f"✓ Loaded checkpoint from {path}")
+
+
+def setup_logging(level=logging.INFO) -> None:
+    """Configure logging."""
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def main(args):
+    """
+    Main training script.
+    
+    Args:
+        args: Parsed command-line arguments
+    """
+    # Setup
+    setup_logging()
+    logger.info("=" * 80)
+    logger.info("Training Multimodal Crypto Sentiment Model")
+    logger.info("=" * 80)
+    
+    # Set seed for reproducibility
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        logger.info(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
+    
+    device = "cuda" if torch.cuda.is_available() and not args.debug else "cpu"
+    logger.info(f"Device: {device}")
+    
+    # Load or create config
+    if args.config:
+        logger.info(f"Loading config from {args.config}...")
+        # For now, use default config (could load from YAML in future)
+        config = ExperimentConfig()
+    else:
+        config = create_config(
+            asset=args.asset,
+            wandb_run_name=args.run_name,
+        )
+        config.debug = args.debug
+    
+    logger.info(f"Config: asset={config.data.asset}, seq_len={config.data.seq_len}, batch_size={config.data.batch_size}")
+    logger.info(f"Model: hidden_dim={config.model.hidden_dim}, frozen_backbones={config.model.frozen_backbones}")
+    logger.info(f"Training: lr={config.training.learning_rate:.2e}, epochs={config.training.max_epochs}")
+    logger.info(f"MLOps: wandb_run={config.mlops.wandb_run_name}")
+    
+    # Create dataloaders
+    logger.info("\n" + "-" * 80)
+    logger.info("Loading datasets...")
+    dataloaders = create_dataloaders(config, num_workers=0 if args.debug else 4)
+    train_loader = dataloaders["train"]
+    val_loader = dataloaders["validation"]
+    
+    # Set total steps for scheduler
+    config.training.num_training_steps = len(train_loader) * config.training.max_epochs // config.training.accumulate_steps
+    
+    # Initialize model
+    logger.info("\n" + "-" * 80)
+    logger.info("Initializing model...")
+    model = MultimodalFusionNet(config)
+    logger.info(f"Model device: {next(model.parameters()).device}")
+    
+    # Initialize trainer
+    trainer = Trainer(config, model, device=device)
+    trainer.setup_optimizer()
+    
+    # W&B initialization
+    if config.mlops.use_wandb and wandb is not None:
+        logger.info("\n" + "-" * 80)
+        logger.info("Initializing W&B...")
+        wandb.init(
+            project=config.mlops.wandb_project,
+            name=config.mlops.wandb_run_name,
+            entity=config.mlops.wandb_entity,
+            config=config.to_dict(),
+            tags=config.mlops.wandb_tags,
+            notes=config.mlops.wandb_notes,
+        )
+        logger.info(f"✓ W&B initialized: {config.mlops.wandb_project}/{config.mlops.wandb_run_name}")
+    
+    # Training loop
+    logger.info("\n" + "-" * 80)
+    logger.info("Starting training...")
+    logger.info("-" * 80 + "\n")
+    
+    for epoch in range(config.training.max_epochs):
+        trainer.epoch = epoch
+        
+        # Train
+        train_loss = trainer.train_epoch(train_loader)
+        logger.info(f"Epoch {epoch+1:3d} | Train Loss {train_loss:.6f}")
+        
+        # Validate
+        if (epoch + 1) % config.mlops.eval_frequency == 0:
+            val_mse, val_mae = trainer.validate(val_loader)
+            logger.info(f"Epoch {epoch+1:3d} | Val MSE {val_mse:.6f} | Val MAE {val_mae:.6f}")
+            
+            # Log to W&B
+            if wandb is not None and wandb.run is not None:
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "train_loss": train_loss,
+                    "val_mse": val_mse,
+                    "val_mae": val_mae,
+                })
+            
+            # Save best model
+            if val_mse < trainer.best_val_loss:
+                trainer.best_val_loss = val_mse
+                trainer.best_epoch = epoch + 1
+                
+                checkpoint_path = config.mlops.checkpoint_dir / f"{config.mlops.wandb_run_name}_best.pt"
+                trainer.save_checkpoint(checkpoint_path, is_best=True)
+    
+    # Final summary
+    logger.info("\n" + "=" * 80)
+    logger.info("Training Complete!")
+    logger.info(f"Best Val Loss: {trainer.best_val_loss:.6f} (Epoch {trainer.best_epoch})")
+    logger.info(f"Checkpoint: {config.mlops.checkpoint_dir / f'{config.mlops.wandb_run_name}_best.pt'}")
+    logger.info("=" * 80)
+    
+    # Finish W&B
+    if wandb is not None and wandb.run is not None:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train multimodal crypto sentiment model")
+    parser.add_argument("--asset", choices=["BTC", "ETH"], default="BTC", help="Cryptocurrency asset")
+    parser.add_argument("--run-name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--config", type=str, default=None, help="Config file path (YAML)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--debug", action="store_true", help="Debug mode (small dataset)")
+    
+    args = parser.parse_args()
+    
+    # Auto-generate run name if not provided
+    if args.run_name is None:
+        args.run_name = f"{args.asset.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    main(args)
