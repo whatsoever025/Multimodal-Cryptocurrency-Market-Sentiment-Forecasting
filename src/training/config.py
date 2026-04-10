@@ -39,7 +39,7 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     """Architecture configuration."""
-    hidden_dim: int = 256  # Hidden dimension in encoders/LSTM
+    hidden_dim: int = 512  # Hidden dimension in encoders/LSTM (increased from 256)
     lstm_layers: int = 2
     lstm_dropout: float = 0.2
     attention_heads: int = 4
@@ -68,11 +68,11 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    max_epochs: int = 50
-    learning_rate: float = 1e-4
+    max_epochs: int = 60  # Increased from 50 (more capacity needs more training)
+    learning_rate: float = 5e-5  # Reduced from 1e-4 for stability with larger model
     weight_decay: float = 1e-5
     accumulate_steps: int = 2  # Gradient accumulation for 16GB VRAM
-    warmup_steps: int = 500
+    warmup_steps: int = 800  # Increased warmup for larger model (was 500)
     warmup_proportion: float = 0.1  # Alternate: warmup as % of total steps
     use_warmup: bool = True
     scheduler_type: str = "cosine"  # "cosine" or "constant"

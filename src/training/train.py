@@ -311,6 +311,25 @@ class Trainer:
         self.val_losses = checkpoint["val_losses"]
         
         logger.info(f"✓ Loaded checkpoint from {path}")
+    
+    def cleanup_old_checkpoints(self) -> None:
+        """
+        Delete old checkpoints, keeping only the last N periodic checkpoints.
+        Preserves best model checkpoint always.
+        """
+        checkpoint_dir = self.config.mlops.checkpoint_dir
+        keep_last_n = self.config.mlops.keep_last_n
+        
+        # Find all periodic checkpoints (not best)
+        periodic_checkpoints = sorted([
+            p for p in checkpoint_dir.glob(f"{self.config.mlops.wandb_run_name}_epoch_*.pt")
+        ])
+        
+        # Delete old ones
+        if len(periodic_checkpoints) > keep_last_n:
+            for old_ckpt in periodic_checkpoints[:-keep_last_n]:
+                old_ckpt.unlink()
+                logger.info(f"  Deleted old checkpoint: {old_ckpt.name}")
 
 
 def setup_logging(level=logging.INFO) -> None:
@@ -395,12 +414,31 @@ def main(args):
         )
         logger.info(f"✓ W&B initialized: {config.mlops.wandb_project}/{config.mlops.wandb_run_name}")
     
+    # Resume from checkpoint if requested
+    start_epoch = 0
+    if args.resume:
+        logger.info("\n" + "-" * 80)
+        logger.info("Resuming from checkpoint...")
+        
+        # Find latest checkpoint
+        checkpoint_files = sorted([
+            p for p in config.mlops.checkpoint_dir.glob(f"{config.mlops.wandb_run_name}_epoch_*.pt")
+        ])
+        
+        if checkpoint_files:
+            latest_ckpt = checkpoint_files[-1]
+            trainer.load_checkpoint(latest_ckpt)
+            start_epoch = trainer.epoch + 1
+            logger.info(f"Resuming from epoch {start_epoch}")
+        else:
+            logger.warning("No checkpoint found, starting from scratch")
+    
     # Training loop
     logger.info("\n" + "-" * 80)
     logger.info("Starting training...")
     logger.info("-" * 80 + "\n")
     
-    for epoch in range(config.training.max_epochs):
+    for epoch in range(start_epoch, config.training.max_epochs):
         trainer.epoch = epoch
         
         # Train
@@ -428,12 +466,18 @@ def main(args):
                 
                 checkpoint_path = config.mlops.checkpoint_dir / f"{config.mlops.wandb_run_name}_best.pt"
                 trainer.save_checkpoint(checkpoint_path, is_best=True)
+        
+        # Save periodic checkpoint
+        if (epoch + 1) % config.mlops.save_frequency == 0:
+            periodic_ckpt_path = config.mlops.checkpoint_dir / f"{config.mlops.wandb_run_name}_epoch_{epoch+1:03d}.pt"
+            trainer.save_checkpoint(periodic_ckpt_path, is_best=False)
+            trainer.cleanup_old_checkpoints()
     
     # Final summary
     logger.info("\n" + "=" * 80)
     logger.info("Training Complete!")
     logger.info(f"Best Val Loss: {trainer.best_val_loss:.6f} (Epoch {trainer.best_epoch})")
-    logger.info(f"Checkpoint: {config.mlops.checkpoint_dir / f'{config.mlops.wandb_run_name}_best.pt'}")
+    logger.info(f"Best Model Checkpoint: {config.mlops.checkpoint_dir / f'{config.mlops.wandb_run_name}_best.pt'}")
     logger.info("=" * 80)
     
     # Finish W&B
@@ -447,6 +491,7 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", type=str, default=None, help="W&B run name")
     parser.add_argument("--config", type=str, default=None, help="Config file path (YAML)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--debug", action="store_true", help="Debug mode (small dataset)")
     
     args = parser.parse_args()
