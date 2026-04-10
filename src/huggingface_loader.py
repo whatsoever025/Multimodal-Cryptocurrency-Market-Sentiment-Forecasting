@@ -67,7 +67,6 @@ def download_hf_dataset(
         dataset = load_dataset(
             dataset_repo,
             token=hf_token,
-            trust_remote_code=True,
         )
         
         logger.info(f"  → Dataset loaded successfully")
@@ -171,7 +170,6 @@ def download_hf_dataset_multi_asset(
             dataset = load_dataset(
                 dataset_repo,
                 token=hf_token,
-                trust_remote_code=True,
             )
             
             # Handle different dataset structures
