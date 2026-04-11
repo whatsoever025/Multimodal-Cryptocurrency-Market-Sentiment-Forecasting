@@ -14,6 +14,8 @@ from pathlib import Path
 from PIL import Image
 import logging
 import sys
+import time
+from tqdm import tqdm
 
 try:
     from datasets import load_dataset, concatenate_datasets
@@ -27,6 +29,16 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
 
 
 class CryptoMultimodalDataset(Dataset):
@@ -83,10 +95,39 @@ class CryptoMultimodalDataset(Dataset):
         
         # Load both BTC and ETH, then concatenate
         try:
-            btc_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_btc", split=split)
-            eth_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_eth", split=split)
+            start_time = time.time()
+            
+            print(f"[PROGRESS] Downloading BTC dataset ({split})...")
+            btc_start = time.time()
+            with tqdm(desc=f"BTC {split}", unit="B", unit_scale=True, unit_divisor=1024) as pbar:
+                btc_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_btc", split=split)
+                pbar.update(1)  # Mark as complete
+            btc_time = time.time() - btc_start
+            
+            print(f"[PROGRESS] Downloading ETH dataset ({split})...")
+            eth_start = time.time()
+            with tqdm(desc=f"ETH {split}", unit="B", unit_scale=True, unit_divisor=1024) as pbar:
+                eth_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_eth", split=split)
+                pbar.update(1)  # Mark as complete
+            eth_time = time.time() - eth_start
+            
+            total_time = time.time() - start_time
+            
             self.dataset = concatenate_datasets([btc_dataset, eth_dataset])
-            logger.info(f"Loaded multi-asset dataset: {len(btc_dataset)} BTC + {len(eth_dataset)} ETH")
+            
+            btc_samples = len(btc_dataset)
+            eth_samples = len(eth_dataset)
+            total_samples = len(self.dataset)
+            
+            logger.info(f"✓ Dataset downloaded successfully!")
+            logger.info(f"  BTC: {btc_samples} samples in {format_duration(btc_time)}")
+            logger.info(f"  ETH: {eth_samples} samples in {format_duration(eth_time)}")
+            logger.info(f"  Total: {total_samples} samples in {format_duration(total_time)}")
+            
+            print(f"[PROGRESS] ✓ BTC: {btc_samples} samples ({format_duration(btc_time)})")
+            print(f"[PROGRESS] ✓ ETH: {eth_samples} samples ({format_duration(eth_time)})")
+            print(f"[PROGRESS] ✓ Total: {total_samples} samples ({format_duration(total_time)})")
+            sys.stdout.flush()
         except Exception as e:
             logger.error(f"Failed to load multi-asset dataset: {e}")
             raise
@@ -132,9 +173,15 @@ class CryptoMultimodalDataset(Dataset):
         logger.info("Loading FinBERT tokenizer (first time may take 30-60s)...")
         print("[PROGRESS] Downloading FinBERT tokenizer from HuggingFace...")
         sys.stdout.flush()
-        self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        logger.info("✓ FinBERT tokenizer loaded successfully")
-        print("[PROGRESS] ✓ FinBERT tokenizer ready")
+        
+        tokenizer_start = time.time()
+        with tqdm(desc="FinBERT tokenizer", total=100, unit="%") as pbar:
+            self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+            pbar.update(100)
+        tokenizer_time = time.time() - tokenizer_start
+        
+        logger.info(f"✓ FinBERT tokenizer loaded successfully in {format_duration(tokenizer_time)}")
+        print(f"[PROGRESS] ✓ FinBERT tokenizer ready ({format_duration(tokenizer_time)})")
         sys.stdout.flush()
         
         # Pre-cache tokenized text if requested
@@ -366,7 +413,7 @@ def create_dataloaders(
     pin_memory: bool = True,
 ) -> Dict[str, DataLoader]:
     """
-    Create DataLoaders for all splits.
+    Create DataLoaders for all splits with progress tracking.
     
     Args:
         config: ExperimentConfig instance
@@ -379,41 +426,56 @@ def create_dataloaders(
     """
     dataloaders = {}
     
-    for split_name in splits:
-        print(f"[PROGRESS] Loading {split_name} dataset...")
-        sys.stdout.flush()
-        dataset = CryptoMultimodalDataset(
-            asset=config.data.asset,
-            split=split_name,
-            seq_len=config.data.seq_len,
-            max_text_length=config.data.max_text_length,
-            image_size=config.data.image_size,
-            cache_images=False,  # Don't cache images by default (VRAM constraint)
-            cache_text=True,  # Cache text (small footprint)
-            debug=config.debug,
-        )
-        print(f"[PROGRESS] ✓ {split_name} dataset loaded, creating DataLoader...")
-        sys.stdout.flush()
-        
-        shuffle = (split_name == "train") and config.data.shuffle_train
-        batch_size = config.data.batch_size if split_name == "train" else config.inference.inference_batch_size
-        workers = num_workers if split_name == "train" else 0
-        
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=multimodal_collate_fn,
-            num_workers=workers,
-            pin_memory=pin_memory,
-            prefetch_factor=config.data.prefetch_factor if workers > 0 else None,
-            persistent_workers=False if workers == 0 else True,
-        )
-        print(f"[PROGRESS] ✓ {split_name} DataLoader ready ({len(dataset)} sequences)")
-        sys.stdout.flush()
-        
-        dataloaders[split_name] = loader
-        logger.info(f"Created DataLoader for {split_name}: {len(loader)} batches")
+    overall_start = time.time()
+    
+    with tqdm(total=len(splits), desc="Creating DataLoaders", unit="split") as progress:
+        for split_idx, split_name in enumerate(splits, 1):
+            print(f"\n[PROGRESS] ({split_idx}/{len(splits)}) Loading {split_name} dataset...")
+            sys.stdout.flush()
+            
+            split_start = time.time()
+            dataset = CryptoMultimodalDataset(
+                asset=config.data.asset,
+                split=split_name,
+                seq_len=config.data.seq_len,
+                max_text_length=config.data.max_text_length,
+                image_size=config.data.image_size,
+                cache_images=False,
+                cache_text=True,
+                debug=config.debug,
+            )
+            split_time = time.time() - split_start
+            
+            print(f"[PROGRESS] ✓ {split_name} dataset loaded ({format_duration(split_time)}), creating DataLoader...")
+            sys.stdout.flush()
+            
+            shuffle = (split_name == "train") and config.data.shuffle_train
+            batch_size = config.data.batch_size if split_name == "train" else config.inference.inference_batch_size
+            workers = num_workers if split_name == "train" else 0
+            
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                collate_fn=multimodal_collate_fn,
+                num_workers=workers,
+                pin_memory=pin_memory,
+                prefetch_factor=config.data.prefetch_factor if workers > 0 else None,
+                persistent_workers=False if workers == 0 else True,
+            )
+            print(f"[PROGRESS] ✓ {split_name} DataLoader ready: {len(dataset)} sequences, {len(loader)} batches")
+            sys.stdout.flush()
+            
+            dataloaders[split_name] = loader
+            logger.info(f"Created DataLoader for {split_name}: {len(loader)} batches ({format_duration(split_time)})")
+            
+            # Update progress bar
+            progress.update(1)
+            progress.set_postfix({"last_split": split_name, "sequences": len(dataset)})
+    
+    total_time = time.time() - overall_start
+    print(f"\n[PROGRESS] ✓ All dataloaders created! Total time: {format_duration(total_time)}")
+    sys.stdout.flush()
     
     return dataloaders
 
