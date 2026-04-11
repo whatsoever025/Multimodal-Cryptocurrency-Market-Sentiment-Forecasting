@@ -204,10 +204,16 @@ class CryptoMultimodalDataset(Dataset):
             
             image_tensor = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1)
             image_tensor = image_tensor / 255.0  # [0, 1]
+            
+            if self.cache_images:
+                self._image_cache[idx] = image_tensor
+            
             return image_tensor
         except Exception as e:
             logger.warning(f"Failed to load image at idx {idx}: {e}")
-            return torch.zeros(3, self.image_size, self.image_size)
+            fallback = torch.zeros(3, self.image_size, self.image_size)
+            logger.debug(f"  Returning fallback zeros with shape {fallback.shape}")
+            return fallback
     
     def __len__(self) -> int:
         """
@@ -307,7 +313,15 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
             - targets: (batch_size,)
             - timestamps: (batch_size,)
     """
-    return {
+    # DEBUG: Log individual sample shapes
+    if len(batch) > 0:
+        logger.info(f"collate_fn: batch_size={len(batch)}, first sample shapes:")
+        first = batch[0]
+        logger.info(f"  tabular: {first['tabular'].shape}")
+        logger.info(f"  images: {first['images'].shape}")
+        logger.info(f"  text_ids: {first['text_ids'].shape}")
+    
+    stacked = {
         "tabular": torch.stack([sample["tabular"] for sample in batch]),  # (B, seq_len, 7)
         "text_ids": torch.stack([sample["text_ids"] for sample in batch]),  # (B, seq_len, max_len)
         "text_mask": torch.stack([sample["text_mask"] for sample in batch]),  # (B, seq_len, max_len)
@@ -315,6 +329,11 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
         "target": torch.stack([sample["target"] for sample in batch]),  # (B,)
         "timestamp": torch.stack([sample["timestamp"] for sample in batch]),  # (B,)
     }
+    
+    logger.info(f"collate_fn: output shapes - tabular: {stacked['tabular'].shape}, "
+               f"images: {stacked['images'].shape}, text_ids: {stacked['text_ids'].shape}")
+    
+    return stacked
 
 
 def create_dataloaders(

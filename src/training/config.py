@@ -14,7 +14,7 @@ from datetime import datetime
 @dataclass
 class DataConfig:
     """Data loading and preprocessing configuration."""
-    asset: str = "BTC"  # "BTC" or "ETH"
+    asset: str = "MULTI"  # "MULTI" for BTC+ETH combined, or single "BTC"/"ETH"
     seq_len: int = 24  # Sliding window length in hours
     batch_size: int = 8  # Per-GPU batch size
     max_text_length: int = 512  # Token sequence length for BERT
@@ -26,14 +26,16 @@ class DataConfig:
 
     def __post_init__(self):
         """Validate data config."""
-        if self.asset not in ("BTC", "ETH"):
-            raise ValueError(f"asset must be 'BTC' or 'ETH', got {self.asset}")
+        if self.asset not in ("BTC", "ETH", "MULTI"):
+            raise ValueError(f"asset must be 'BTC', 'ETH', or 'MULTI', got {self.asset}")
         if self.seq_len <= 0:
             raise ValueError(f"seq_len must be > 0, got {self.seq_len}")
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
         if self.max_text_length <= 0:
             raise ValueError(f"max_text_length must be > 0, got {self.max_text_length}")
+        if self.image_size <= 0:
+            raise ValueError(f"image_size must be > 0, got {self.image_size}")
 
 
 @dataclass
