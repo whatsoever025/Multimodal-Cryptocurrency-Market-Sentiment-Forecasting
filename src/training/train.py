@@ -154,6 +154,11 @@ class Trainer:
                 # Scale loss for gradient accumulation
                 loss = loss / self.config.training.accumulate_steps
             
+            # Log loss at every batch
+            if (batch_idx + 1) % 10 == 0:
+                print(f"[TRAINING] Epoch step {batch_idx+1:4d}: Loss = {loss.item():.6f}")
+                sys.stdout.flush()
+            
             # Backward pass with scaled loss
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
