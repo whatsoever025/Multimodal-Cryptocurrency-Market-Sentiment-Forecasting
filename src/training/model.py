@@ -62,13 +62,11 @@ class TimeDistributedTextEncoder(nn.Module):
         for param in self.bert.parameters():
             param.requires_grad = False
         
-        # Optional gradient checkpointing
-        if use_gradient_checkpointing:
-            self.bert.gradient_checkpointing_enable()
-            logger.info("✓ FinBERT gradient checkpointing enabled")
+        # Note: gradient checkpointing disabled since backbone is frozen
         
         # Project [CLS] token (768) to hidden_dim
         self.projection = nn.Linear(self.bert.config.hidden_size, hidden_dim)
+        nn.init.xavier_uniform_(self.projection.weight)
         self.dropout = nn.Dropout(0.2)
     
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -80,8 +78,8 @@ class TimeDistributedTextEncoder(nn.Module):
         Returns:
             (batch*seq_len, hidden_dim)
         """
-        with torch.no_grad():  # Frozen backbone
-            outputs = self.bert(input_ids, attention_mask=attention_mask)
+        # Forward pass without gradients (backbone is frozen)
+        outputs = self.bert(input_ids, attention_mask=attention_mask)
         
         # [CLS] token (index 0) → project → dropout
         cls_token = outputs.last_hidden_state[:, 0, :]  # (batch*seq_len, 768)
@@ -112,19 +110,14 @@ class TimeDistributedImageEncoder(nn.Module):
         for param in resnet.parameters():
             param.requires_grad = False
         
-        # Optional gradient checkpointing
-        if use_gradient_checkpointing and hasattr(resnet, "apply"):
-            # Apply gradient checkpointing to residual blocks
-            for module in resnet.modules():
-                if isinstance(module, models.resnet.Bottleneck):
-                    module.gradient_checkpointing = True
-            logger.info("✓ ResNet50 gradient checkpointing enabled")
+        # Note: gradient checkpointing disabled since backbone is frozen
         
         # Remove classification head, keep backbone + avgpool
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # Up to avgpool
         
         # Project avgpool output (2048) to hidden_dim
         self.projection = nn.Linear(2048, hidden_dim)
+        nn.init.xavier_uniform_(self.projection.weight)
         self.dropout = nn.Dropout(0.2)
     
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -135,9 +128,9 @@ class TimeDistributedImageEncoder(nn.Module):
         Returns:
             (batch*seq_len, hidden_dim)
         """
-        with torch.no_grad():  # Frozen backbone
-            # Backbone output: (batch*seq_len, 2048, 1, 1)
-            features = self.backbone(images)
+        # Forward pass (backbone is frozen via requires_grad=False)
+        # Backbone output: (batch*seq_len, 2048, 1, 1)
+        features = self.backbone(images)
         
         # Squeeze spatial dims: (batch*seq_len, 2048)
         features = features.squeeze(-1).squeeze(-1)
@@ -165,6 +158,10 @@ class TabularEncoder(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2),
         )
+        # Initialize weights
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
     
     def forward(self, tabular: torch.Tensor) -> torch.Tensor:
         """
@@ -298,6 +295,10 @@ class PredictionHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
+        # Initialize weights
+        for layer in self.head:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

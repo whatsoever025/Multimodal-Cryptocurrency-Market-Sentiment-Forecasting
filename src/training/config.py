@@ -71,7 +71,7 @@ class ModelConfig:
 class TrainingConfig:
     """Training loop configuration."""
     max_epochs: int = 60  # Increased from 50 (more capacity needs more training)
-    learning_rate: float = 5e-5  # Reduced from 1e-4 for stability with larger model
+    learning_rate: float = 1e-5  # Reduced for stability with mixed precision
     weight_decay: float = 1e-5
     accumulate_steps: int = 2  # Gradient accumulation for 16GB VRAM
     warmup_steps: int = 800  # Increased warmup for larger model (was 500)
