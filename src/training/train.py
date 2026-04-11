@@ -381,7 +381,9 @@ def main(args):
     # Create dataloaders
     logger.info("\n" + "-" * 80)
     logger.info("Loading datasets...")
+    print("[PROGRESS] Starting to load datasets (this may take 1-5 minutes)...")
     dataloaders = create_dataloaders(config, num_workers=0 if args.debug else 4)
+    print("[PROGRESS] ✓ All datasets loaded successfully!")
     train_loader = dataloaders["train"]
     val_loader = dataloaders["validation"]
     
@@ -435,6 +437,7 @@ def main(args):
     logger.info("\n" + "-" * 80)
     logger.info("Starting training...")
     logger.info("-" * 80 + "\n")
+    print("[PROGRESS] ✓ Setup complete, training begins now...")
     
     for epoch in range(start_epoch, config.training.max_epochs):
         trainer.epoch = epoch

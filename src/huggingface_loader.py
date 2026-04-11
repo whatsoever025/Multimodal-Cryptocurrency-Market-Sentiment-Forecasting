@@ -56,12 +56,15 @@ def download_hf_dataset_multi_asset(
     for asset in assets:
         asset_upper = asset.upper()
         logger.info(f"  Loading {asset_upper}...")
+        print(f"[PROGRESS] Starting {asset_upper} download from HuggingFace...")
         
         try:
             dataset_repo = HF_DATASET_REPOS[asset_upper]
+            print(f"[PROGRESS] Fetching from {dataset_repo}...")
             dataset = load_dataset(
                 dataset_repo,
                 token=hf_token,
+                download_mode="force_redownload",  # Ensure fresh download
             )
             
             # Handle different dataset structures

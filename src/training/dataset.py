@@ -97,6 +97,16 @@ class CryptoMultimodalDataset(Dataset):
         total_samples = len(self.dataset)
         logger.info(f"Loaded {total_samples} samples for {asset}/{split}")
         
+        # Quick validation: test dataset accessibility
+        try:
+            print("[PROGRESS] Validating dataset accessibility...")
+            _ = self.dataset[0]  # Try accessing first sample
+            logger.info("✓ Dataset is accessible")
+            print("[PROGRESS] ✓ Dataset accessible")
+        except Exception as e:
+            logger.warning(f"Dataset validation warning: {e}")
+            print(f"[WARNING] Dataset validation issue: {e}")
+        
         # CRITICAL: Safe sliding window math
         # max_idx = total_samples - seq_len
         # For idx in [0, max_idx), we can fetch target at idx + seq_len
@@ -115,8 +125,11 @@ class CryptoMultimodalDataset(Dataset):
         )
         
         # Initialize FinBERT tokenizer
+        logger.info("Loading FinBERT tokenizer (first time may take 30-60s)...")
+        print("[PROGRESS] Downloading FinBERT tokenizer from HuggingFace...")
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        logger.info("FinBERT tokenizer loaded")
+        logger.info("✓ FinBERT tokenizer loaded successfully")
+        print("[PROGRESS] ✓ FinBERT tokenizer ready")
         
         # Pre-cache tokenized text if requested
         if cache_text:
@@ -378,6 +391,7 @@ def create_dataloaders(
     dataloaders = {}
     
     for split_name in splits:
+        print(f"[PROGRESS] Loading {split_name} dataset...")
         dataset = CryptoMultimodalDataset(
             asset=config.data.asset,
             split=split_name,
@@ -388,6 +402,7 @@ def create_dataloaders(
             cache_text=True,  # Cache text (small footprint)
             debug=config.debug,
         )
+        print(f"[PROGRESS] ✓ {split_name} dataset loaded, creating DataLoader...")
         
         shuffle = (split_name == "train") and config.data.shuffle_train
         batch_size = config.data.batch_size if split_name == "train" else config.inference.inference_batch_size
@@ -403,6 +418,7 @@ def create_dataloaders(
             prefetch_factor=config.data.prefetch_factor if workers > 0 else None,
             persistent_workers=False if workers == 0 else True,
         )
+        print(f"[PROGRESS] ✓ {split_name} DataLoader ready ({len(dataset)} sequences)")
         
         dataloaders[split_name] = loader
         logger.info(f"Created DataLoader for {split_name}: {len(loader)} batches")
