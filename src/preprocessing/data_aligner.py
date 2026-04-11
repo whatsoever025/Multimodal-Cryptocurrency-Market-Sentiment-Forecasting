@@ -545,6 +545,17 @@ class DataAligner:
         # Calculate return_1h (% change from 1 hour ago)
         self.df['return_1h'] = self.df['close'].pct_change() * 100  # Convert to percentage
         
+        # CRITICAL: Fill all missing values with 0
+        # return_1h: first hour has NaN, fill with 0
+        self.df['return_1h'] = self.df['return_1h'].fillna(0)
+        
+        # GDELT columns: fill any remaining NaN values
+        self.df['gdelt_econ_volume'] = self.df['gdelt_econ_volume'].fillna(0)
+        self.df['gdelt_econ_tone'] = self.df['gdelt_econ_tone'].fillna(0)
+        self.df['gdelt_conflict_volume'] = self.df['gdelt_conflict_volume'].fillna(0)
+        
+        logger.info("  ✓ Filled all missing values with 0 (return_1h, gdelt columns)")
+        
         # Define final columns in order (10 features + target)
         final_columns = [
             'return_1h',
