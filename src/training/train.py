@@ -142,9 +142,8 @@ class Trainer:
             
             # Forward pass with AMP
             with autocast(
-                device_type="cuda" if self.device == "cuda" else "cpu",
-                dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.bfloat16,
                 enabled=self.config.optimization.mixed_precision,
+                dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.float32,
             ):
                 predictions = self.model(batch)  # (batch, 1)
                 targets = batch["target"].unsqueeze(1)  # (batch, 1)
@@ -234,9 +233,8 @@ class Trainer:
                 
                 # Forward with AMP
                 with autocast(
-                    device_type="cuda" if self.device == "cuda" else "cpu",
-                    dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.bfloat16,
                     enabled=self.config.optimization.mixed_precision,
+                    dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.float32,
                 ):
                     predictions = self.model(batch)  # (batch, 1)
                     targets = batch["target"].unsqueeze(1)  # (batch, 1)
