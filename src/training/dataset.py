@@ -13,6 +13,7 @@ from typing import Dict, Optional, Tuple, Any
 from pathlib import Path
 from PIL import Image
 import logging
+import sys
 
 try:
     from datasets import load_dataset, concatenate_datasets
@@ -100,12 +101,15 @@ class CryptoMultimodalDataset(Dataset):
         # Quick validation: test dataset accessibility
         try:
             print("[PROGRESS] Validating dataset accessibility...")
+            sys.stdout.flush()
             _ = self.dataset[0]  # Try accessing first sample
             logger.info("✓ Dataset is accessible")
             print("[PROGRESS] ✓ Dataset accessible")
+            sys.stdout.flush()
         except Exception as e:
             logger.warning(f"Dataset validation warning: {e}")
             print(f"[WARNING] Dataset validation issue: {e}")
+            sys.stdout.flush()
         
         # CRITICAL: Safe sliding window math
         # max_idx = total_samples - seq_len
@@ -127,16 +131,18 @@ class CryptoMultimodalDataset(Dataset):
         # Initialize FinBERT tokenizer
         logger.info("Loading FinBERT tokenizer (first time may take 30-60s)...")
         print("[PROGRESS] Downloading FinBERT tokenizer from HuggingFace...")
+        sys.stdout.flush()
         self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
         logger.info("✓ FinBERT tokenizer loaded successfully")
         print("[PROGRESS] ✓ FinBERT tokenizer ready")
+        sys.stdout.flush()
         
         # Pre-cache tokenized text if requested
+        # NOTE: Disabled pre-tokenization (62k samples = 5-15min silent processing)
+        # Instead, use lazy caching during data loading (much better UX)
         if cache_text:
-            logger.info("Pre-tokenizing all text samples...")
-            self._tokenize_all()
-        else:
-            self._text_cache = {}
+            logger.info("Text caching enabled (lazy per-sample during data loading)")
+        self._text_cache = {}  # Always initialize as empty dict
         
         # Pre-cache images if requested
         if cache_images:
@@ -187,7 +193,7 @@ class CryptoMultimodalDataset(Dataset):
     
     def _get_text(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get tokenized text (input_ids, attention_mask)."""
-        if self.cache_text and idx in self._text_cache:
+        if idx in self._text_cache:
             item = self._text_cache[idx]
             return item["input_ids"], item["attention_mask"]
         
@@ -200,6 +206,14 @@ class CryptoMultimodalDataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
+        
+        # Cache if enabled
+        if self.cache_text:
+            self._text_cache[idx] = {
+                "input_ids": encoded["input_ids"].squeeze(0),
+                "attention_mask": encoded["attention_mask"].squeeze(0),
+            }
+        
         return encoded["input_ids"].squeeze(0), encoded["attention_mask"].squeeze(0)
     
     def _get_image(self, idx: int) -> torch.Tensor:
@@ -392,6 +406,7 @@ def create_dataloaders(
     
     for split_name in splits:
         print(f"[PROGRESS] Loading {split_name} dataset...")
+        sys.stdout.flush()
         dataset = CryptoMultimodalDataset(
             asset=config.data.asset,
             split=split_name,
@@ -403,6 +418,7 @@ def create_dataloaders(
             debug=config.debug,
         )
         print(f"[PROGRESS] ✓ {split_name} dataset loaded, creating DataLoader...")
+        sys.stdout.flush()
         
         shuffle = (split_name == "train") and config.data.shuffle_train
         batch_size = config.data.batch_size if split_name == "train" else config.inference.inference_batch_size
@@ -419,6 +435,7 @@ def create_dataloaders(
             persistent_workers=False if workers == 0 else True,
         )
         print(f"[PROGRESS] ✓ {split_name} DataLoader ready ({len(dataset)} sequences)")
+        sys.stdout.flush()
         
         dataloaders[split_name] = loader
         logger.info(f"Created DataLoader for {split_name}: {len(loader)} batches")

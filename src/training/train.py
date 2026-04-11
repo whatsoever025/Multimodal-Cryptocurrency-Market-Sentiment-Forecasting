@@ -382,8 +382,18 @@ def main(args):
     logger.info("\n" + "-" * 80)
     logger.info("Loading datasets...")
     print("[PROGRESS] Starting to load datasets (this may take 1-5 minutes)...")
-    dataloaders = create_dataloaders(config, num_workers=0 if args.debug else 4)
-    print("[PROGRESS] ✓ All datasets loaded successfully!")
+    sys.stdout.flush()
+    # NOTE: num_workers=0 always (Kaggle multi-worker deadlock fix)
+    # Multi-worker DataLoader spawns intermittently deadlock on Kaggle
+    try:
+        dataloaders = create_dataloaders(config, num_workers=0)
+        print("[PROGRESS] ✓ All datasets loaded successfully!")
+        sys.stdout.flush()
+    except Exception as e:
+        logger.error(f"Failed to create dataloaders: {e}", exc_info=True)
+        print(f"[ERROR] Failed to load datasets: {e}")
+        sys.stdout.flush()
+        raise
     train_loader = dataloaders["train"]
     val_loader = dataloaders["validation"]
     
@@ -438,6 +448,7 @@ def main(args):
     logger.info("Starting training...")
     logger.info("-" * 80 + "\n")
     print("[PROGRESS] ✓ Setup complete, training begins now...")
+    sys.stdout.flush()
     
     for epoch in range(start_epoch, config.training.max_epochs):
         trainer.epoch = epoch
