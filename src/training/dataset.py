@@ -351,16 +351,17 @@ def create_dataloaders(
         
         shuffle = (split_name == "train") and config.data.shuffle_train
         batch_size = config.data.batch_size if split_name == "train" else config.inference.inference_batch_size
+        workers = num_workers if split_name == "train" else 0
         
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=multimodal_collate_fn,
-            num_workers=num_workers if split_name == "train" else 0,
+            num_workers=workers,
             pin_memory=pin_memory,
-            prefetch_factor=config.data.prefetch_factor if split_name == "train" else 2,
-            persistent_workers=False,
+            prefetch_factor=config.data.prefetch_factor if workers > 0 else None,
+            persistent_workers=False if workers == 0 else True,
         )
         
         dataloaders[split_name] = loader
