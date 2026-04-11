@@ -78,14 +78,16 @@ class CryptoMultimodalDataset(Dataset):
         self.device = device
         self.debug = debug
         
-        logger.info(f"Loading {asset} dataset ({split} split)...")
+        logger.info(f"Loading multi-asset dataset ({split} split)...")
         
-        # Load from HuggingFace Hub
-        hf_repo = f"khanh252004/multimodal_crypto_sentiment_{asset.lower()}"
+        # Load both BTC and ETH, then concatenate
         try:
-            self.dataset = load_dataset(hf_repo, split=split)
+            btc_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_btc", split=split)
+            eth_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_eth", split=split)
+            self.dataset = btc_dataset.concatenate_datasets([eth_dataset])
+            logger.info(f"Loaded multi-asset dataset: {len(btc_dataset)} BTC + {len(eth_dataset)} ETH")
         except Exception as e:
-            logger.error(f"Failed to load dataset from {hf_repo}: {e}")
+            logger.error(f"Failed to load multi-asset dataset: {e}")
             raise
         
         # For debugging, subsample
@@ -93,7 +95,7 @@ class CryptoMultimodalDataset(Dataset):
             self.dataset = self.dataset.select(range(min(100, len(self.dataset))))
         
         total_samples = len(self.dataset)
-        logger.info(f"Loaded {total_samples} samples from {hf_repo}/{split}")
+        logger.info(f"Loaded {total_samples} samples for {asset}/{split}")
         
         # CRITICAL: Safe sliding window math
         # max_idx = total_samples - seq_len
