@@ -58,7 +58,7 @@ def download_hf_dataset_multi_asset(
         logger.info(f"  Loading {asset_upper}...")
         
         try:
-            dataset_repo = get_dataset_repo(asset_upper)
+            dataset_repo = HF_DATASET_REPOS[asset_upper]
             dataset = load_dataset(
                 dataset_repo,
                 token=hf_token,
