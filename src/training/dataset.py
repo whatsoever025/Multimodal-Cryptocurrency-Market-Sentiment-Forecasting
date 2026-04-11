@@ -15,7 +15,7 @@ from PIL import Image
 import logging
 
 try:
-    from datasets import load_dataset
+    from datasets import load_dataset, concatenate_datasets
 except ImportError:
     raise ImportError("'datasets' package required: pip install datasets")
 
@@ -84,7 +84,7 @@ class CryptoMultimodalDataset(Dataset):
         try:
             btc_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_btc", split=split)
             eth_dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_eth", split=split)
-            self.dataset = btc_dataset.concatenate_datasets([eth_dataset])
+            self.dataset = concatenate_datasets([btc_dataset, eth_dataset])
             logger.info(f"Loaded multi-asset dataset: {len(btc_dataset)} BTC + {len(eth_dataset)} ETH")
         except Exception as e:
             logger.error(f"Failed to load multi-asset dataset: {e}")
