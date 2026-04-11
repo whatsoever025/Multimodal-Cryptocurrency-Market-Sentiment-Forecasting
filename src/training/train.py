@@ -10,6 +10,9 @@ Key Features:
 """
 
 import torch
+
+torch.autograd.set_detect_anomaly(True) # Công cụ truy tìm nguồn gốc NaN
+
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
