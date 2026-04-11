@@ -203,8 +203,9 @@ class CryptoMultimodalDataset(Dataset):
                 image = Image.open(image_path).convert("RGB")
                 logger.debug(f"  Loaded PIL Image from string path: {image.size}")
             else:
-                image = image_path  # Already PIL Image
-                logger.debug(f"  Using PIL Image directly: {image.size if hasattr(image, 'size') else 'no size attr'}")
+                # Already PIL Image from HuggingFace, but may be RGBA - convert to RGB
+                image = image_path.convert("RGB")
+                logger.debug(f"  Converted PIL Image to RGB: {image.size}")
             
             # Convert to numpy and tensor
             np_arr = np.array(image)
