@@ -197,17 +197,28 @@ class CryptoMultimodalDataset(Dataset):
         # Load on-the-fly
         try:
             image_path = self.dataset[idx]["image_path"]
+            logger.debug(f"_get_image({idx}): image_path type={type(image_path)}, isinstance PIL={isinstance(image_path, Image.Image)}")
+            
             if isinstance(image_path, str):
                 image = Image.open(image_path).convert("RGB")
+                logger.debug(f"  Loaded PIL Image from string path: {image.size}")
             else:
                 image = image_path  # Already PIL Image
+                logger.debug(f"  Using PIL Image directly: {image.size if hasattr(image, 'size') else 'no size attr'}")
             
-            image_tensor = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1)
+            # Convert to numpy and tensor
+            np_arr = np.array(image)
+            logger.debug(f"  numpy array shape: {np_arr.shape}, dtype: {np_arr.dtype}")
+            
+            image_tensor = torch.tensor(np_arr, dtype=torch.float32).permute(2, 0, 1)
+            logger.debug(f"  tensor after permute: {image_tensor.shape}")
+            
             image_tensor = image_tensor / 255.0  # [0, 1]
             
             if self.cache_images:
                 self._image_cache[idx] = image_tensor
             
+            logger.debug(f"  final image_tensor shape: {image_tensor.shape}")
             return image_tensor
         except Exception as e:
             logger.warning(f"Failed to load image at idx {idx}: {e}")
@@ -287,11 +298,20 @@ class CryptoMultimodalDataset(Dataset):
         target = torch.tensor(target_sample["target_score"], dtype=torch.float32)
         timestamp = torch.tensor(idx + self.seq_len, dtype=torch.long)  # For traceability
         
+        # DEBUG: Log sequence shapes before return
+        tabular_stacked = torch.stack(tabular_list) 
+        text_ids_stacked = torch.stack(text_ids_list) 
+        text_mask_stacked = torch.stack(text_mask_list)
+        images_stacked = torch.stack(images_list)
+        
+        logger.debug(f"__getitem__({idx}): stacked shapes - tabular={tabular_stacked.shape}, "
+                    f"text_ids={text_ids_stacked.shape}, images={images_stacked.shape}")
+        
         return {
-            "tabular": torch.stack(tabular_list),  # (seq_len, 7)
-            "text_ids": torch.stack(text_ids_list),  # (seq_len, max_text_length)
-            "text_mask": torch.stack(text_mask_list),  # (seq_len, max_text_length)
-            "images": torch.stack(images_list),  # (seq_len, 3, 224, 224)
+            "tabular": tabular_stacked,  # (seq_len, 7)
+            "text_ids": text_ids_stacked,  # (seq_len, max_text_length)
+            "text_mask": text_mask_stacked,  # (seq_len, max_text_length)
+            "images": images_stacked,  # (seq_len, 3, 224, 224)
             "target": target,  # scalar
             "timestamp": timestamp,  # scalar (for debugging)
         }

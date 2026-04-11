@@ -403,6 +403,15 @@ class MultimodalFusionNet(nn.Module):
         logger.info(f"Batch shapes - tabular: {batch['tabular'].shape}, images: {batch['images'].shape}, "
                    f"text_ids: {batch['text_ids'].shape}, batch_size={batch_size}, seq_len={seq_len}")
         
+        # DEBUG: Log actual images tensor details
+        images_tensor = batch["images"]
+        logger.info(f"Images tensor: dtype={images_tensor.dtype}, device={images_tensor.device}, "
+                   f"numel={images_tensor.numel()}, shape={images_tensor.shape}")
+        expected_elems = batch_size * seq_len * 3 * 224 * 224
+        actual_elems = images_tensor.numel()
+        logger.info(f"Expected elements: {expected_elems}, Actual elements: {actual_elems}, "
+                   f"Ratio: {actual_elems / expected_elems if expected_elems > 0 else 'N/A'}")
+        
         # ==================== ENCODE EACH MODALITY ====================
         
         # Text encoder: (batch, seq_len, max_text_length) → (batch, seq_len, hidden_dim)
@@ -412,6 +421,10 @@ class MultimodalFusionNet(nn.Module):
         text_features = text_features.reshape(batch_size, seq_len, -1)  # (batch, seq_len, hidden_dim)
         
         # Image encoder: (batch, seq_len, 3, 224, 224) → (batch, seq_len, hidden_dim)
+        logger.info(f"Before reshape - batch['images'].shape: {batch['images'].shape}, "
+                   f"batch['images'].numel(): {batch['images'].numel()}")
+        logger.info(f"Attempting to reshape to ({batch_size * seq_len}, 3, 224, 224)")
+        
         images = batch["images"].reshape(batch_size * seq_len, 3, 224, 224)
         image_features = self.image_encoder(images)  # (batch*seq_len, hidden_dim)
         image_features = image_features.reshape(batch_size, seq_len, -1)  # (batch, seq_len, hidden_dim)
