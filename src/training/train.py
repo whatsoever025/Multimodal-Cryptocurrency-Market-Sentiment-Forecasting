@@ -31,9 +31,9 @@ try:
 except ImportError:
     wandb = None
 
-from config import ExperimentConfig, create_config
-from dataset import CryptoMultimodalDataset, multimodal_collate_fn, create_dataloaders
-from model import MultimodalFusionNet
+from .config import ExperimentConfig, create_config
+from .dataset import CryptoMultimodalDataset, multimodal_collate_fn, create_dataloaders
+from .model import MultimodalFusionNet
 
 
 logger = logging.getLogger(__name__)
