@@ -234,12 +234,21 @@ class CryptoMultimodalDataset(Dataset):
                 image = image_path.convert("RGB")
                 logger.debug(f"  Converted PIL Image to RGB: {image.size}")
             
+            # CRITICAL: Resize to fixed size (self.image_size x self.image_size)
+            image = image.resize((self.image_size, self.image_size), Image.Resampling.LANCZOS)
+            
             # Convert to numpy and tensor
             np_arr = np.array(image)
             logger.debug(f"  numpy array shape: {np_arr.shape}, dtype: {np_arr.dtype}")
             
             image_tensor = torch.tensor(np_arr, dtype=torch.float32).permute(2, 0, 1)
             logger.debug(f"  tensor after permute: {image_tensor.shape}")
+            
+            # Validate shape
+            if image_tensor.shape != (3, self.image_size, self.image_size):
+                logger.error(f"Image shape mismatch at idx {idx}: got {image_tensor.shape}, "
+                           f"expected (3, {self.image_size}, {self.image_size})")
+                raise ValueError(f"Image shape {image_tensor.shape} doesn't match expected (3, {self.image_size}, {self.image_size})")
             
             image_tensor = image_tensor / 255.0  # [0, 1]
             
@@ -341,7 +350,16 @@ class CryptoMultimodalDataset(Dataset):
         tabular_stacked = torch.stack(tabular_list) 
         text_ids_stacked = torch.stack(text_ids_list) 
         text_mask_stacked = torch.stack(text_mask_list)
-        images_stacked = torch.stack(images_list)
+        
+        # Stack images with shape validation
+        try:
+            images_stacked = torch.stack(images_list)
+        except RuntimeError as e:
+            logger.error(f"Failed to stack images for sequence starting at idx {idx}")
+            logger.error(f"Number of images: {len(images_list)}")
+            for i, img in enumerate(images_list):
+                logger.error(f"  Image {i}: shape={img.shape}, dtype={img.dtype}, min={img.min():.3f}, max={img.max():.3f}")
+            raise RuntimeError(f"Image stacking failed: {e}")
         
         logger.debug(f"__getitem__({idx}): stacked shapes - tabular={tabular_stacked.shape}, "
                     f"text_ids={text_ids_stacked.shape}, images={images_stacked.shape}")
