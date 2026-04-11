@@ -300,16 +300,23 @@ class CryptoMultimodalDataset(Dataset):
             sample_idx = idx + t
             sample = self.dataset[sample_idx]
             
-            # Tabular: 7 features
-            tabular = torch.tensor([
-                sample["return_1h"],
-                sample["volume"],
-                sample["funding_rate"],
-                sample["fear_greed_value"],
-                sample["gdelt_econ_volume"],
-                sample["gdelt_econ_tone"],
-                sample["gdelt_conflict_volume"],
-            ], dtype=torch.float32)
+            # Tabular: 7 features (handle None values with default 0)
+            tabular_values = [
+                sample.get("return_1h") or 0.0,
+                sample.get("volume") or 0.0,
+                sample.get("funding_rate") or 0.0,
+                sample.get("fear_greed_value") or 0.0,
+                sample.get("gdelt_econ_volume") or 0.0,
+                sample.get("gdelt_econ_tone") or 0.0,
+                sample.get("gdelt_conflict_volume") or 0.0,
+            ]
+            
+            # Validate no None values remain
+            if any(v is None for v in tabular_values):
+                logger.warning(f"None value detected in sample {sample_idx}: {sample}")
+                tabular_values = [v if v is not None else 0.0 for v in tabular_values]
+            
+            tabular = torch.tensor(tabular_values, dtype=torch.float32)
             tabular_list.append(tabular)
             
             # Text
@@ -323,7 +330,11 @@ class CryptoMultimodalDataset(Dataset):
         
         # Get target at idx + seq_len (guaranteed to exist)
         target_sample = self.dataset[idx + self.seq_len]
-        target = torch.tensor(target_sample["target_score"], dtype=torch.float32)
+        target_score = target_sample.get("target_score") or 0.0
+        if target_score is None:
+            logger.warning(f"None target score at index {idx + self.seq_len}")
+            target_score = 0.0
+        target = torch.tensor(target_score, dtype=torch.float32)
         timestamp = torch.tensor(idx + self.seq_len, dtype=torch.long)  # For traceability
         
         # DEBUG: Log sequence shapes before return
