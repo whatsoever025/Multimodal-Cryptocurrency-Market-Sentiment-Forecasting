@@ -173,23 +173,21 @@ class CryptoMultimodalDataset(Dataset):
             }
     
     def _load_all_images(self) -> None:
-        """Pre-load all images into memory."""
+        """Pre-load all images into memory - ALWAYS resized to (image_size, image_size)."""
         for idx in range(self.total_samples):
-            try:
-                image_path = self.dataset[idx]["image_path"]
-                if isinstance(image_path, str):
-                    image = Image.open(image_path).convert("RGB")
-                else:
-                    image = image_path  # Already PIL Image from HF dataset
-                
-                # Convert to tensor and normalize
-                image_tensor = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1)
-                image_tensor = image_tensor / 255.0  # Normalize to [0, 1]
-                self._image_cache[idx] = image_tensor
-            except Exception as e:
-                logger.warning(f"Failed to load image at idx {idx}: {e}")
-                # Use black image as fallback
-                self._image_cache[idx] = torch.zeros(3, self.image_size, self.image_size)
+            image_path = self.dataset[idx]["image_path"]
+            if isinstance(image_path, str):
+                image = Image.open(image_path).convert("RGB")
+            else:
+                image = image_path.convert("RGB")  # Already PIL Image from HF dataset
+            
+            # Resize to fixed size
+            image = image.resize((self.image_size, self.image_size), Image.LANCZOS)
+            
+            # Convert to tensor and normalize
+            image_tensor = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1)
+            image_tensor = image_tensor / 255.0  # Normalize to [0, 1]
+            self._image_cache[idx] = image_tensor
     
     def _get_text(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get tokenized text (input_ids, attention_mask)."""
@@ -217,51 +215,30 @@ class CryptoMultimodalDataset(Dataset):
         return encoded["input_ids"].squeeze(0), encoded["attention_mask"].squeeze(0)
     
     def _get_image(self, idx: int) -> torch.Tensor:
-        """Get image tensor."""
+        """Get image tensor - ALWAYS (3, image_size, image_size)."""
         if self.cache_images and idx in self._image_cache:
             return self._image_cache[idx]
         
         # Load on-the-fly
-        try:
-            image_path = self.dataset[idx]["image_path"]
-            logger.debug(f"_get_image({idx}): image_path type={type(image_path)}, isinstance PIL={isinstance(image_path, Image.Image)}")
-            
-            if isinstance(image_path, str):
-                image = Image.open(image_path).convert("RGB")
-                logger.debug(f"  Loaded PIL Image from string path: {image.size}")
-            else:
-                # Already PIL Image from HuggingFace, but may be RGBA - convert to RGB
-                image = image_path.convert("RGB")
-                logger.debug(f"  Converted PIL Image to RGB: {image.size}")
-            
-            # CRITICAL: Resize to fixed size (self.image_size x self.image_size)
-            image = image.resize((self.image_size, self.image_size), Image.Resampling.LANCZOS)
-            
-            # Convert to numpy and tensor
-            np_arr = np.array(image)
-            logger.debug(f"  numpy array shape: {np_arr.shape}, dtype: {np_arr.dtype}")
-            
-            image_tensor = torch.tensor(np_arr, dtype=torch.float32).permute(2, 0, 1)
-            logger.debug(f"  tensor after permute: {image_tensor.shape}")
-            
-            # Validate shape
-            if image_tensor.shape != (3, self.image_size, self.image_size):
-                logger.error(f"Image shape mismatch at idx {idx}: got {image_tensor.shape}, "
-                           f"expected (3, {self.image_size}, {self.image_size})")
-                raise ValueError(f"Image shape {image_tensor.shape} doesn't match expected (3, {self.image_size}, {self.image_size})")
-            
-            image_tensor = image_tensor / 255.0  # [0, 1]
-            
-            if self.cache_images:
-                self._image_cache[idx] = image_tensor
-            
-            logger.debug(f"  final image_tensor shape: {image_tensor.shape}")
-            return image_tensor
-        except Exception as e:
-            logger.warning(f"Failed to load image at idx {idx}: {e}")
-            fallback = torch.zeros(3, self.image_size, self.image_size)
-            logger.debug(f"  Returning fallback zeros with shape {fallback.shape}")
-            return fallback
+        image_path = self.dataset[idx]["image_path"]
+        
+        if isinstance(image_path, str):
+            image = Image.open(image_path).convert("RGB")
+        else:
+            image = image_path.convert("RGB")
+        
+        # Resize to fixed size
+        image = image.resize((self.image_size, self.image_size), Image.LANCZOS)
+        
+        # Convert to tensor
+        np_arr = np.array(image)
+        image_tensor = torch.tensor(np_arr, dtype=torch.float32).permute(2, 0, 1)
+        image_tensor = image_tensor / 255.0  # Normalize to [0, 1]
+        
+        if self.cache_images:
+            self._image_cache[idx] = image_tensor
+        
+        return image_tensor
     
     def __len__(self) -> int:
         """
@@ -309,21 +286,16 @@ class CryptoMultimodalDataset(Dataset):
             sample_idx = idx + t
             sample = self.dataset[sample_idx]
             
-            # Tabular: 7 features (handle None values with default 0)
+            # Tabular: 7 features
             tabular_values = [
-                sample.get("return_1h") or 0.0,
-                sample.get("volume") or 0.0,
-                sample.get("funding_rate") or 0.0,
-                sample.get("fear_greed_value") or 0.0,
-                sample.get("gdelt_econ_volume") or 0.0,
-                sample.get("gdelt_econ_tone") or 0.0,
-                sample.get("gdelt_conflict_volume") or 0.0,
+                sample["return_1h"],
+                sample["volume"],
+                sample["funding_rate"],
+                sample["fear_greed_value"],
+                sample["gdelt_econ_volume"],
+                sample["gdelt_econ_tone"],
+                sample["gdelt_conflict_volume"],
             ]
-            
-            # Validate no None values remain
-            if any(v is None for v in tabular_values):
-                logger.warning(f"None value detected in sample {sample_idx}: {sample}")
-                tabular_values = [v if v is not None else 0.0 for v in tabular_values]
             
             tabular = torch.tensor(tabular_values, dtype=torch.float32)
             tabular_list.append(tabular)
@@ -339,30 +311,15 @@ class CryptoMultimodalDataset(Dataset):
         
         # Get target at idx + seq_len (guaranteed to exist)
         target_sample = self.dataset[idx + self.seq_len]
-        target_score = target_sample.get("target_score") or 0.0
-        if target_score is None:
-            logger.warning(f"None target score at index {idx + self.seq_len}")
-            target_score = 0.0
+        target_score = target_sample["target_score"]
         target = torch.tensor(target_score, dtype=torch.float32)
-        timestamp = torch.tensor(idx + self.seq_len, dtype=torch.long)  # For traceability
+        timestamp = torch.tensor(idx + self.seq_len, dtype=torch.long)
         
-        # DEBUG: Log sequence shapes before return
+        # Stack all sequences
         tabular_stacked = torch.stack(tabular_list) 
         text_ids_stacked = torch.stack(text_ids_list) 
         text_mask_stacked = torch.stack(text_mask_list)
-        
-        # Stack images with shape validation
-        try:
-            images_stacked = torch.stack(images_list)
-        except RuntimeError as e:
-            logger.error(f"Failed to stack images for sequence starting at idx {idx}")
-            logger.error(f"Number of images: {len(images_list)}")
-            for i, img in enumerate(images_list):
-                logger.error(f"  Image {i}: shape={img.shape}, dtype={img.dtype}, min={img.min():.3f}, max={img.max():.3f}")
-            raise RuntimeError(f"Image stacking failed: {e}")
-        
-        logger.debug(f"__getitem__({idx}): stacked shapes - tabular={tabular_stacked.shape}, "
-                    f"text_ids={text_ids_stacked.shape}, images={images_stacked.shape}")
+        images_stacked = torch.stack(images_list)
         
         return {
             "tabular": tabular_stacked,  # (seq_len, 7)
@@ -390,14 +347,6 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
             - targets: (batch_size,)
             - timestamps: (batch_size,)
     """
-    # DEBUG: Log individual sample shapes
-    if len(batch) > 0:
-        logger.info(f"collate_fn: batch_size={len(batch)}, first sample shapes:")
-        first = batch[0]
-        logger.info(f"  tabular: {first['tabular'].shape}")
-        logger.info(f"  images: {first['images'].shape}")
-        logger.info(f"  text_ids: {first['text_ids'].shape}")
-    
     stacked = {
         "tabular": torch.stack([sample["tabular"] for sample in batch]),  # (B, seq_len, 7)
         "text_ids": torch.stack([sample["text_ids"] for sample in batch]),  # (B, seq_len, max_len)
@@ -406,9 +355,6 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
         "target": torch.stack([sample["target"] for sample in batch]),  # (B,)
         "timestamp": torch.stack([sample["timestamp"] for sample in batch]),  # (B,)
     }
-    
-    logger.info(f"collate_fn: output shapes - tabular: {stacked['tabular'].shape}, "
-               f"images: {stacked['images'].shape}, text_ids: {stacked['text_ids'].shape}")
     
     return stacked
 

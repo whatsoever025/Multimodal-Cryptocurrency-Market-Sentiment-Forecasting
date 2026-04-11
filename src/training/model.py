@@ -398,13 +398,6 @@ class MultimodalFusionNet(nn.Module):
         """
         batch_size, seq_len = batch["tabular"].shape[0], batch["tabular"].shape[1]
         
-        # DEBUG: Log batch shapes (first batch only to reduce clutter)
-        logger = logging.getLogger(__name__)
-        if not hasattr(self, "_logged_shapes"):
-            logger.info(f"Model input shapes - tabular: {batch['tabular'].shape}, "
-                       f"images: {batch['images'].shape}, text_ids: {batch['text_ids'].shape}")
-            self._logged_shapes = True
-        
         # ==================== ENCODE EACH MODALITY ====================
         
         # Text encoder: (batch, seq_len, max_text_length) → (batch, seq_len, hidden_dim)

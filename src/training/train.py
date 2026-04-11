@@ -141,10 +141,7 @@ class Trainer:
             batch = {k: v.to(self.device) for k, v in batch.items()}
             
             # Forward pass with AMP
-            with autocast(
-                enabled=self.config.optimization.mixed_precision,
-                dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.float32,
-            ):
+            with autocast(enabled=self.config.optimization.mixed_precision):
                 predictions = self.model(batch)  # (batch, 1)
                 targets = batch["target"].unsqueeze(1)  # (batch, 1)
                 
@@ -153,11 +150,6 @@ class Trainer:
                 
                 # Scale loss for gradient accumulation
                 loss = loss / self.config.training.accumulate_steps
-            
-            # Log loss at every batch
-            if (batch_idx + 1) % 10 == 0:
-                print(f"[TRAINING] Epoch step {batch_idx+1:4d}: Loss = {loss.item():.6f}")
-                sys.stdout.flush()
             
             # Backward pass with scaled loss
             if self.scaler is not None:
