@@ -482,17 +482,23 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
 def create_dataloaders(
     config,
     splits: Optional[Tuple[str, str, str]] = ("train", "validation", "test_in_domain"),
-    num_workers: int = 4,
+    num_workers: int = 2,
     pin_memory: bool = True,
 ) -> Dict[str, DataLoader]:
     """
     Create DataLoaders for all splits with progress tracking.
     
+    CRITICAL: DataLoader Optimization
+    - num_workers=2: Balanced for BS=8 (prevents CPU bottleneck without excess overhead)
+    - pin_memory=True: Transfer data to GPU via pinned memory (faster than pageable)
+    - prefetch_factor: Hold multiple batches in memory (0 if workers=0, else config.data.prefetch_factor)
+    - persistent_workers: Keep workers alive between epochs (faster warmup)
+    
     Args:
         config: ExperimentConfig instance
         splits: Tuple of (train_split, val_split, test_split)
-        num_workers: Number of data loading workers
-        pin_memory: Pin memory for faster GPU transfer
+        num_workers: Number of data loading workers (default 2 for BS=8)
+        pin_memory: Pin memory for faster GPU transfer (True→GPU, False→CPU)
     
     Returns:
         Dict with keys "train", "validation", "test" and DataLoader values
@@ -524,6 +530,7 @@ def create_dataloaders(
             
             shuffle = (split_name == "train") and config.data.shuffle_train
             batch_size = config.data.batch_size if split_name == "train" else config.inference.inference_batch_size
+            # Validation/test: never use workers (no shuffling, simpler logic)
             workers = num_workers if split_name == "train" else 0
             
             loader = DataLoader(
@@ -532,15 +539,15 @@ def create_dataloaders(
                 shuffle=shuffle,
                 collate_fn=multimodal_collate_fn,
                 num_workers=workers,
-                pin_memory=pin_memory,
+                pin_memory=pin_memory,  # CRITICAL: True for GPU transfer speed
                 prefetch_factor=config.data.prefetch_factor if workers > 0 else None,
-                persistent_workers=False if workers == 0 else True,
+                persistent_workers=True if workers > 0 else False,  # Keep workers alive between epochs
             )
-            print(f"[PROGRESS] ✓ {split_name} DataLoader ready: {len(dataset)} sequences, {len(loader)} batches")
+            print(f"[PROGRESS] ✓ {split_name} DataLoader ready: {len(dataset)} sequences, {len(loader)} batches (num_workers={workers}, pin_memory={pin_memory})")
             sys.stdout.flush()
             
             dataloaders[split_name] = loader
-            logger.info(f"Created DataLoader for {split_name}: {len(loader)} batches ({format_duration(split_time)})")
+            logger.info(f"Created DataLoader for {split_name}: {len(loader)} batches, num_workers={workers}, pin_memory={pin_memory} ({format_duration(split_time)})")
             
             # Update progress bar
             progress.update(1)

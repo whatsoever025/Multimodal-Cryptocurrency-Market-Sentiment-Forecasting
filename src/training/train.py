@@ -24,6 +24,7 @@ import json
 import argparse
 from datetime import datetime
 import sys
+from tqdm import tqdm
 
 # Suppress transformers warnings
 import warnings
@@ -142,9 +143,10 @@ class Trainer:
         """
         Run one training epoch with gradient accumulation and explicit gradient clipping.
         Pure float32 implementation (no AMP) for numerical stability.
+        Includes batch-level tqdm progress bar with moving loss average.
         
         ============================================================================
-        TRAINING LOOP STRUCTURE (Pure Float32)
+        TRAINING LOOP STRUCTURE (Pure Float32 + tqdm)
         ============================================================================
         
         1. Forward pass:         model(batch) → predictions (float32)
@@ -156,6 +158,7 @@ class Trainer:
         7. Optimizer step:       optimizer.step() (standard update)
         8. Schedule step:        scheduler.step() (learning rate decay)
         9. Zero gradients:       optimizer.zero_grad() (reset for next accumulation)
+        10. tqdm update:         Update progress bar with moving loss average
         
         Why pure float32?
         - Eliminates float16 underflow/overflow in backward pass
@@ -181,7 +184,16 @@ class Trainer:
         total_loss = 0.0
         num_steps = 0
         
-        for batch_idx, batch in enumerate(train_loader):
+        # Wrap DataLoader with tqdm for batch-level progress visibility
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {self.epoch+1}",
+            total=len(train_loader),
+            leave=True,  # Keep progress bar after epoch completes
+            unit="batch",
+        )
+        
+        for batch_idx, batch in enumerate(pbar):
             # Move batch to device (float32 by default)
             batch = {k: v.to(self.device) for k, v in batch.items()}
             
@@ -217,7 +229,7 @@ class Trainer:
                         norm_type=2.0,  # L2 norm (standard)
                     )
                     
-                    # Log if clipping occurred
+                    # Log if clipping occurred (rare, only during instability)
                     if total_norm > max_grad_norm:
                         logger.debug(
                             f"Gradient clipped: norm={total_norm:.4f} → {max_grad_norm}"
@@ -256,9 +268,22 @@ class Trainer:
             # Accumulate loss for epoch average
             total_loss += loss.item() * self.config.training.accumulate_steps
             num_steps += 1
+            
+            # ========== UPDATE PROGRESS BAR ==========
+            # Show moving average of loss (smoothed with exponential moving average)
+            # Formula: EMA = (current_loss + (n-1) * prev_EMA) / n
+            moving_avg_loss = total_loss / num_steps
+            pbar.set_postfix({
+                "loss": moving_avg_loss,
+                "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+            })
+        
+        pbar.close()
         
         avg_loss = total_loss / num_steps
         self.train_losses.append(avg_loss)
+        
+        logger.info(f"Epoch {self.epoch+1} completed | Avg Loss: {avg_loss:.6f}")
         
         return avg_loss
     
