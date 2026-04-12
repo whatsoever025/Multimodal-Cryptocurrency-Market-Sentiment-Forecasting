@@ -140,34 +140,35 @@ class Trainer:
     
     def train_epoch(self, train_loader: DataLoader) -> float:
         """
-        Run one training epoch with gradient accumulation, AMP, and explicit gradient clipping.
+        Run one training epoch with gradient accumulation and explicit gradient clipping.
+        Pure float32 implementation (no AMP) for numerical stability.
         
         ============================================================================
-        CRITICAL: AMP + Gradient Clipping Pattern (PyTorch Best Practice)
+        TRAINING LOOP STRUCTURE (Pure Float32)
         ============================================================================
         
-        When using GradScaler (AMP), gradient clipping must follow this order:
+        1. Forward pass:         model(batch) → predictions (float32)
+        2. Compute loss:         MSE(predictions, targets)
+        3. Scale loss:           loss / accumulate_steps (for accumulation)
+        4. Backward pass:        loss.backward() (standard PyTorch)
+        5. Accumulation check:   if (batch_idx + 1) % accumulate_steps == 0
+        6. Gradient clipping:    clip_grad_norm_(model.parameters(), max_norm=1.0)
+        7. Optimizer step:       optimizer.step() (standard update)
+        8. Schedule step:        scheduler.step() (learning rate decay)
+        9. Zero gradients:       optimizer.zero_grad() (reset for next accumulation)
         
-        1. Forward pass (autocast context)           → loss in float16
-        2. Backward pass (scaler.scale)              → gradients scaled by scale factor
-        3. UNSCALE gradients (scaler.unscale_)       ← CRITICAL: Must come first!
-        4. Clip gradients (clip_grad_norm_)          @ normal float32 scale
-        5. Optimizer step (scaler.step)              @ scaled learning rate
-        6. Update scale (scaler.update)              → dynamic loss scaling
-        
-        Why this order?
-        - GradScaler multiplies loss by scale (default 65536) before backward
-        - Gradients are scaled proportionally
-        - Clipping at scaled magnitude → actual gradient norm too small → training stalls
-        - unscale_() restores true gradient magnitude before clipping
-        - After clipping, scaler.step() applies learning rate
+        Why pure float32?
+        - Eliminates float16 underflow/overflow in backward pass
+        - Eliminates GradScaler scaling complexity
+        - Direct gradient magnitudes → easier debugging
+        - Kaggle 16GB VRAM sufficient for BS=8, seq_len=24
         
         ============================================================================
         
         VRAM Management:
         - Batch size 8 (seq_len 24 = 192 effective samples)
         - Gradient accumulation: accumulate_steps=2 → effective batch=16
-        - Mixed precision: forward/backward in float16, updates in float32
+        - Precision: Native float32 (no mixed precision)
         - Gradient clipping: max_norm=1.0 (prevents explosion in LSTM/Attention)
         
         Args:
@@ -181,73 +182,50 @@ class Trainer:
         num_steps = 0
         
         for batch_idx, batch in enumerate(train_loader):
-            # Move batch to device
+            # Move batch to device (float32 by default)
             batch = {k: v.to(self.device) for k, v in batch.items()}
             
-            # ========== FORWARD PASS (AMP) ==========
-            # Use autocast to reduce VRAM (float16 for forward/backward)
-            with autocast(enabled=self.config.optimization.mixed_precision):
-                predictions = self.model(batch)  # (batch, 1) - float16 in autocast
-                targets = batch["target"].unsqueeze(1)  # (batch, 1)
-                
-                # MSE loss - inherit dtype from predictions (float16 in autocast)
-                loss = nn.MSELoss()(predictions, targets)
-                
-                # CRITICAL: Scale loss for gradient accumulation
-                # This prevents individual batch gradients from being too small
-                loss = loss / self.config.training.accumulate_steps
+            # ========== FORWARD PASS (FLOAT32) ==========
+            # Standard PyTorch forward pass - all tensors remain float32
+            predictions = self.model(batch)  # (batch, 1) shape
+            targets = batch["target"].unsqueeze(1)  # (batch, 1) shape
             
-            # ========== BACKWARD PASS (SCALED) ==========
-            # GradScaler multiplies loss by scale factor (e.g., 65536) before backward
-            # This prevents underflow in float16 gradients
-            if self.scaler is not None:
-                # AMP path: scale loss, backward, then unscale before clip
-                self.scaler.scale(loss).backward()
-            else:
-                # Non-AMP path: direct backward (fallback for CPU/debugging)
-                loss.backward()
+            # Compute MSE loss
+            loss = nn.MSELoss()(predictions, targets)
+            
+            # Scale loss for gradient accumulation
+            # Prevents accumulated gradients from growing too large
+            loss = loss / self.config.training.accumulate_steps
+            
+            # ========== BACKWARD PASS (STANDARD) ==========
+            # Standard PyTorch backward - gradients computed in float32
+            loss.backward()
             
             # ========== GRADIENT ACCUMULATION CHECK ==========
             # Only update weights every accumulate_steps batches
             if (batch_idx + 1) % self.config.training.accumulate_steps == 0:
                 
-                # ========== UNSCALE GRADIENTS (CRITICAL FOR AMP) ==========
-                # MUST happen before clip_grad_norm_!
-                # Restores true gradient scale for proper clipping
-                if self.scaler is not None:
-                    self.scaler.unscale_(self.optimizer)
-                    # After unscale_, gradients are in float32 at true scale
-                
                 # ========== GRADIENT CLIPPING ==========
-                # Prevents explosion in LSTM/Attention layers
-                # max_norm=1.0: clip total gradient norm to ≤ 1.0
+                # Prevents gradient explosion in LSTM/Attention layers
+                # Clips total gradient norm to ≤ max_norm
                 max_grad_norm = self.config.model.grad_clip
                 if max_grad_norm > 0:
-                    # Returns total gradient norm (useful for debugging)
+                    # Returns total gradient norm before clipping
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         max_grad_norm,
-                        norm_type=2.0,  # L2 norm (standard for gradient clipping)
+                        norm_type=2.0,  # L2 norm (standard)
                     )
                     
-                    # Log clipping if gradients were large
+                    # Log if clipping occurred
                     if total_norm > max_grad_norm:
                         logger.debug(
-                            f"Gradient clipped: norm={total_norm:.4f} "
-                            f"(clipped to {max_grad_norm})"
+                            f"Gradient clipped: norm={total_norm:.4f} → {max_grad_norm}"
                         )
                 
-                # ========== OPTIMIZER STEP (with scaling) ==========
-                # Apply learning rate update to scaled gradients
-                if self.scaler is not None:
-                    # AMP path: step with scaler (applies learning rate)
-                    self.scaler.step(self.optimizer)
-                    # Update scale factor for next iteration
-                    # (increases if no NaNs, decreases if overflow detected)
-                    self.scaler.update()
-                else:
-                    # Non-AMP path: standard optimizer step
-                    self.optimizer.step()
+                # ========== OPTIMIZER STEP ==========
+                # Standard optimizer update (float32)
+                self.optimizer.step()
                 
                 # ========== LEARNING RATE SCHEDULE ==========
                 # Update learning rate (warmup → cosine decay)
@@ -286,7 +264,7 @@ class Trainer:
     
     def validate(self, val_loader: DataLoader) -> Tuple[float, float]:
         """
-        Run validation.
+        Run validation (pure float32, no AMP).
         
         Args:
             val_loader: Validation DataLoader
@@ -301,19 +279,16 @@ class Trainer:
         
         with torch.no_grad():
             for batch in val_loader:
-                # Move to device
+                # Move to device (float32)
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
-                # Forward with AMP
-                with autocast(
-                    enabled=self.config.optimization.mixed_precision,
-                    dtype=torch.float16 if self.config.optimization.dtype == "float16" else torch.float32,
-                ):
-                    predictions = self.model(batch)  # (batch, 1)
-                    targets = batch["target"].unsqueeze(1)  # (batch, 1)
-                    
-                    mse = nn.MSELoss()(predictions, targets)
-                    mae = nn.L1Loss()(predictions, targets)
+                # Forward pass (pure float32, no AMP)
+                predictions = self.model(batch)  # (batch, 1)
+                targets = batch["target"].unsqueeze(1)  # (batch, 1)
+                
+                # Compute metrics
+                mse = nn.MSELoss()(predictions, targets)
+                mae = nn.L1Loss()(predictions, targets)
                 
                 total_mse += mse.item()
                 total_mae += mae.item()
