@@ -15,7 +15,6 @@ torch.autograd.set_detect_anomaly(True) # Công cụ truy tìm nguồn gốc NaN
 
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -69,7 +68,6 @@ class Trainer:
         # Optimizer & scheduler
         self.optimizer = None
         self.scheduler = None
-        self.scaler = None
         
         # State tracking
         self.epoch = 0
@@ -83,17 +81,19 @@ class Trainer:
     
     def setup_optimizer(self) -> None:
         """
-        Initialize optimizer with conservative hyperparameters for multimodal fine-tuning.
+        Initialize optimizer with conservative hyperparameters for offline feature extraction.
         
-        CRITICAL: Learning Rate Strategy
-        - For multimodal architectures (BERT + ResNet + LSTM + Attention):
-          - Safe range: 5e-5 to 1e-4 (fine-tuning frozen backbones)
-          - Default: 5e-5 (balanced between stability and convergence speed)
-          - If encountering gradient explosion: reduce to 1e-5 to 5e-6
+        CRITICAL: Learning Rate Strategy (Pure Float32)
+        - Off-line features: only TabularEncoder, CrossModalAttention, LSTM, and PredictionHead are trainable
+        - Safe range: 1e-4 to 5e-4 (learnable components only, no backbones)
+        - Default: 1e-4 (balanced between stability and convergence speed)
+        - If encountering NaN or gradient explosion: reduce to 5e-5 to 1e-5
         
-        - AMP (Automatic Mixed Precision) sensitivity:
-          - float16 amplifies gradient magnitude by ~100x
-          - Conservative LR mitigates explosion risk in mixed precision
+        - Pure float32 advantages:
+          - No gradient scaling complexity (no underflow/overflow)
+          - Direct gradient magnitudes (easier debugging)
+          - Sufficient VRAM on Kaggle 16GB (BS=8, seq_len=24)
+          - Gradient clipping handles LSTM/Attention instability
         """
         # AdamW optimizer with conservative defaults for multimodal training
         self.optimizer = optim.AdamW(
@@ -101,13 +101,13 @@ class Trainer:
             lr=self.config.training.learning_rate,
             weight_decay=self.config.training.weight_decay,
             betas=(0.9, 0.999),  # Default AdamW betas
-            eps=1e-8,             # Numerical stability for float16
+            eps=1e-8,             # Numerical stability (float32 safe)
         )
         logger.info(
             f"✓ Optimizer: AdamW\n"
             f"  Learning Rate: {self.config.training.learning_rate:.2e}\n"
             f"  Weight Decay: {self.config.training.weight_decay:.2e}\n"
-            f"  Strategy: Conservative (AMP-safe for multimodal fine-tuning)"
+            f"  Strategy: Conservative (Pure float32, no AMP)"
         )
         
         # Learning rate scheduler
@@ -128,16 +128,7 @@ class Trainer:
         else:
             self.scheduler = None
             logger.info("Scheduler: None (constant LR)")
-        
-        # AMP GradScaler
-        if self.config.optimization.mixed_precision:
-            self.scaler = GradScaler(
-                init_scale=self.config.optimization.init_scale,
-                growth_factor=self.config.optimization.growth_factor,
-                backoff_factor=self.config.optimization.backoff_factor,
-                growth_interval=self.config.optimization.growth_interval,
-            )
-            logger.info("AMP GradScaler initialized")
+        logger.info("Pure float32 training (no AMP)")
     
     def train_epoch(self, train_loader: DataLoader) -> float:
         """
@@ -220,20 +211,18 @@ class Trainer:
                 # ========== GRADIENT CLIPPING ==========
                 # Prevents gradient explosion in LSTM/Attention layers
                 # Clips total gradient norm to ≤ max_norm
-                max_grad_norm = self.config.model.grad_clip
-                if max_grad_norm > 0:
-                    # Returns total gradient norm before clipping
-                    total_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_grad_norm,
-                        norm_type=2.0,  # L2 norm (standard)
+                max_grad_norm = 1.0  # Standard max norm for RNN/Attention stability
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_grad_norm,
+                    norm_type=2.0,  # L2 norm (standard)
+                )
+                
+                # Log if clipping occurred (indicator of training instability)
+                if total_norm > max_grad_norm:
+                    logger.debug(
+                        f"Gradient clipped: norm={total_norm:.4f} → {max_grad_norm}"
                     )
-                    
-                    # Log if clipping occurred (rare, only during instability)
-                    if total_norm > max_grad_norm:
-                        logger.debug(
-                            f"Gradient clipped: norm={total_norm:.4f} → {max_grad_norm}"
-                        )
                 
                 # ========== OPTIMIZER STEP ==========
                 # Standard optimizer update (float32)
@@ -339,7 +328,6 @@ class Trainer:
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
-            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
             "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
             "train_losses": self.train_losses,
@@ -370,9 +358,6 @@ class Trainer:
         
         if self.scheduler and checkpoint.get("scheduler_state_dict"):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        
-        if self.scaler and checkpoint.get("scaler_state_dict"):
-            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
         
         self.epoch = checkpoint["epoch"]
         self.global_step = checkpoint["global_step"]
@@ -459,7 +444,11 @@ def main(args):
     # NOTE: num_workers=0 always (Kaggle multi-worker deadlock fix)
     # Multi-worker DataLoader spawns intermittently deadlock on Kaggle
     try:
-        dataloaders = create_dataloaders(config, num_workers=0)
+        dataloaders = create_dataloaders(
+            config,
+            features_dir="/kaggle/working/crypto/data/features",
+            num_workers=0
+        )
         print("[PROGRESS] ✓ All datasets loaded successfully!")
         sys.stdout.flush()
     except Exception as e:
