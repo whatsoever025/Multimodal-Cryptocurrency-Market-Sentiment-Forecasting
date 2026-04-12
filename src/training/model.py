@@ -363,53 +363,6 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-"""
-MultimodalFusionNet: Production-grade multimodal sentiment forecasting architecture.
-
-Architecture:
-1. TimeDistributed Encoders (VRAM-safe):
-   - FinBERT for text: frozen backbone + gradient checkpointing
-   - ResNet50 for images: frozen backbone + gradient checkpointing
-   - MLP for tabular features
-
-2. Cross-Modal Attention:
-   - 3 modalities (text, image, tabular) attend to each other at each timestep
-   - Treated as sequence length = 3
-
-3. Temporal LSTM:
-   - Captures temporal dynamics across seq_len timesteps
-   - 2 layers with dropout
-
-4. Prediction Head:
-   - MLP reducing to single continuous output (-100 to +100)
-"""
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Optional
-import logging
-
-try:
-    from transformers import AutoModel
-except ImportError:
-    raise ImportError("'transformers' package required: pip install transformers")
-
-try:
-    import torchvision.models as models
-except ImportError:
-    raise ImportError("'torchvision' package required: pip install torchvision")
-
-
-logger = logging.getLogger(__name__)
-
-
-class TimeDistributedTextEncoder(nn.Module):
-    """
-    FinBERT encoder for sequences of text.
-    
-    Input: (batch*seq_len, max_text_length) token IDs
-    Output: (batch*seq_len, hidden_dim) contextual embeddings
     
     VRAM Strategy:
     - Freeze FinBERT backbone (no gradient updates)
