@@ -27,6 +27,10 @@ try:
 except ImportError:
     raise ImportError("'transformers' package required: pip install transformers")
 
+try:
+    from sklearn.preprocessing import StandardScaler
+except ImportError:
+    raise ImportError("'scikit-learn' package required: pip install scikit-learn")
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +204,75 @@ class CryptoMultimodalDataset(Dataset):
         else:
             self._image_cache = {}
         
+        # Fit StandardScaler on tabular features (with log1p on volume)
+        logger.info("Fitting StandardScaler on tabular features...")
+        print("[PROGRESS] Fitting StandardScaler on tabular features...")
+        sys.stdout.flush()
+        self._fit_tabular_scaler()
+        logger.info(f"✓ StandardScaler fitted on {total_samples} samples")
+        print("[PROGRESS] ✓ StandardScaler fitted")
+        sys.stdout.flush()
+        
         logger.info(f"✓ Dataset ready: {len(self)} valid sequences of length {seq_len}")
+    
+    def _fit_tabular_scaler(self) -> None:
+        """Fit StandardScaler on all tabular features (with log1p on volume).
+        
+        CRITICAL: Fit only once during initialization to prevent data leakage.
+        - Extracts 7 tabular features from entire dataset split
+        - Applies np.log1p ONLY to volume column (index 1)
+        - Fits StandardScaler to normalize all 7 columns (mean=0, std=1)
+        """
+        tabular_features_list = []
+        
+        # Iterate through entire dataset split to collect tabular values
+        for idx in tqdm(range(self.total_samples), desc="Fitting scaler", unit="samples"):
+            sample = self.dataset[idx]
+            
+            # Extract 7 tabular features
+            tabular_values = np.array([
+                sample["return_1h"],
+                sample["volume"],
+                sample["funding_rate"],
+                sample["fear_greed_value"],
+                sample["gdelt_econ_volume"],
+                sample["gdelt_econ_tone"],
+                sample["gdelt_conflict_volume"],
+            ], dtype=np.float32)
+            
+            # Apply log1p ONLY to volume (index 1)
+            tabular_values[1] = np.log1p(tabular_values[1])
+            
+            tabular_features_list.append(tabular_values)
+        
+        # Stack into (total_samples, 7) array and fit scaler
+        tabular_array = np.stack(tabular_features_list, axis=0)  # (total_samples, 7)
+        self.scaler = StandardScaler()
+        self.scaler.fit(tabular_array)
+        
+        logger.info(
+            f"StandardScaler fitted on {self.total_samples} samples. "
+            f"Means: {self.scaler.mean_}, Stds: {self.scaler.scale_}"
+        )
+    
+    def _scale_tabular_features(self, tabular_values: np.ndarray) -> torch.Tensor:
+        """Scale tabular features using fitted StandardScaler.
+        
+        Args:
+            tabular_values: (seq_len, 7) numpy array of raw tabular features
+        
+        Returns:
+            (seq_len, 7) torch.FloatTensor with normalized features
+        """
+        # Apply log1p ONLY to volume column (index 1) for all timesteps
+        tabular_values = tabular_values.copy()  # Don't modify original
+        tabular_values[:, 1] = np.log1p(tabular_values[:, 1])  # log1p to volume
+        
+        # Apply StandardScaler transformation
+        scaled = self.scaler.transform(tabular_values)  # (seq_len, 7)
+        
+        # Convert to torch tensor
+        return torch.tensor(scaled, dtype=torch.float32)
     
     def _tokenize_all(self) -> None:
         """Pre-tokenize all text samples for faster training."""
@@ -324,7 +396,7 @@ class CryptoMultimodalDataset(Dataset):
             )
         
         # Collect sequence [idx, idx+seq_len-1]
-        tabular_list = []
+        tabular_list = []  # Will collect raw values, then scale all at once
         text_ids_list = []
         text_mask_list = []
         images_list = []
@@ -333,8 +405,8 @@ class CryptoMultimodalDataset(Dataset):
             sample_idx = idx + t
             sample = self.dataset[sample_idx]
             
-            # Tabular: 7 features
-            tabular_values = [
+            # Tabular: 7 features (raw, will be scaled later)
+            tabular_values = np.array([
                 sample["return_1h"],
                 sample["volume"],
                 sample["funding_rate"],
@@ -342,10 +414,9 @@ class CryptoMultimodalDataset(Dataset):
                 sample["gdelt_econ_volume"],
                 sample["gdelt_econ_tone"],
                 sample["gdelt_conflict_volume"],
-            ]
+            ], dtype=np.float32)
             
-            tabular = torch.tensor(tabular_values, dtype=torch.float32)
-            tabular_list.append(tabular)
+            tabular_list.append(tabular_values)
             
             # Text
             text_ids, text_mask = self._get_text(sample_idx)
@@ -363,7 +434,9 @@ class CryptoMultimodalDataset(Dataset):
         timestamp = torch.tensor(idx + self.seq_len, dtype=torch.long)
         
         # Stack all sequences
-        tabular_stacked = torch.stack(tabular_list) 
+        # Stack raw tabular features into (seq_len, 7) array, then scale
+        tabular_raw = np.stack(tabular_list, axis=0)  # (seq_len, 7)
+        tabular_stacked = self._scale_tabular_features(tabular_raw)  # Scaled (seq_len, 7) 
         text_ids_stacked = torch.stack(text_ids_list) 
         text_mask_stacked = torch.stack(text_mask_list)
         images_stacked = torch.stack(images_list)
