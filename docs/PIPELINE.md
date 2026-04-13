@@ -18,7 +18,7 @@ This document describes the entire offline feature extraction pipeline from raw 
 │  3. Save .pt files locally (text_embeddings_*.pt, image_embeddings_*.pt)│
 │                                                                          │
 │  4. Upload .pt files to HuggingFace                                     │
-│     (your-username/crypto-features)                                     │
+│     (khanh252004/crypto_sentiment_features)                            │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -26,7 +26,7 @@ This document describes the entire offline feature extraction pipeline from raw 
 │                                                                          │
 │  1. Clone repo on Kaggle                                                │
 │  2. pip install -r requirements.txt                                     │
-│  3. Download embeddings from HF (automatic, cached locally)             │
+  3. Download embeddings from HF (182MB, auto-cached locally)             │
 │  4. Load pre-extracted embeddings (no FinBERT/ResNet50 downloads)       │
 │  5. Train lightweight fusion network                                    │
 │     - Tabular MLP + Cross-modal Attention + Temporal LSTM               │
@@ -59,8 +59,9 @@ Data structure (from HF datasets):
 ```
 
 **Datasets:**
-- `khanh252004/multimodal_crypto_sentiment_btc` (~15K samples)
-- `khanh252004/multimodal_crypto_sentiment_eth` (~15K samples)
+- `khanh252004/multimodal_crypto_sentiment_btc` (31,133 train + splits)
+- `khanh252004/multimodal_crypto_sentiment_eth` (31,133 train + splits)
+- Combined: 62,266 train, 13,342 validation, 13,250 test_in_domain samples
 - Splits: `train`, `validation`, `test_in_domain`
 
 ### Step 1.2: Extract Features Locally
@@ -84,29 +85,37 @@ python src/data/extract_features.py \
 
 **Output files** (in `./data/features/`):
 ```
-text_embeddings_train.pt          # (N_train, 256)
-image_embeddings_train.pt         # (N_train, 256)
-text_embeddings_validation.pt     # (N_val, 256)
-image_embeddings_validation.pt    # (N_val, 256)
-text_embeddings_test_in_domain.pt # (N_test, 256)
-image_embeddings_test_in_domain.pt# (N_test, 256)
+text_embeddings_train.pt          # (62266, 256) - 63.8 MB
+image_embeddings_train.pt         # (62266, 256) - 63.8 MB
+text_embeddings_validation.pt     # (13342, 256) - 13.7 MB
+image_embeddings_validation.pt    # (13342, 256) - 13.7 MB
+text_embeddings_test_in_domain.pt # (13250, 256) - 13.6 MB
+image_embeddings_test_in_domain.pt# (13250, 256) - 13.6 MB
 ```
 
 **Progress in terminal:**
 ```
-[PROGRESS] Loading multi-asset dataset (train split)...
-[PROGRESS] Extracting text embeddings...
-Text extraction: 100%|████████| 468/468 [1:23<00:00, 5.6 batch/s]
-✓ Text embeddings saved (15000, 256)
+Loading multi-asset dataset (train split)...
+Loaded 62266 samples for train
 
-[PROGRESS] Extracting image embeddings...
-Image extraction: 100%|████████| 468/468 [2:14<00:00, 3.5 batch/s]
-✓ Image embeddings saved (15000, 256)
+Extracting text embeddings (62266 samples)...
+Text extraction: 100%|████████████| 1946/1946 [31:17<00:00, 1.04 batch/s]
+✓ Text embeddings saved (torch.Size([62266, 256]))
 
-[PROGRESS] ✓ Feature extraction pipeline complete!
+Extracting image embeddings (62266 samples)...
+Image extraction: 100%|████████████| 1946/1946 [04:39<00:00, 6.95 batch/s]
+✓ Image embeddings saved (torch.Size([62266, 256]))
+
+[... validation & test splits ...]
+
+✓ Feature extraction pipeline complete!
 ```
 
-**Time estimate:** 10-15 minutes on GPU (NVIDIA RTX 3090)
+**Actual execution time:** ~52 minutes total on NVIDIA RTX 4050 Laptop GPU
+- Text extraction (train): 31m 17s
+- Image extraction (train): 4m 39s
+- Validation split: 7m 52s
+- Test split: 7m 30s
 
 ### Step 1.3: Upload Features to HuggingFace
 
@@ -126,7 +135,7 @@ python src/data/extract_features.py \
   --output_dir ./data/features \
   --asset MULTI \
   --push-to-hf \
-  --hf-repo-id username/crypto-features
+  --hf-repo-id khanh252004/crypto_sentiment_features
 ```
 
 **What happens:**
@@ -137,10 +146,14 @@ python src/data/extract_features.py \
 
 **Output:**
 ```
-[PROGRESS] ✓ Features uploaded to https://huggingface.co/datasets/username/crypto-features
+Processing Files (6 / 6)      : 100%|█████████████|  182MB /  182MB, 4.13MB/s
+New Data Upload               : 100%|█████████████|  137MB /  137MB, 2.10MB/s
+✓ Features uploaded to https://huggingface.co/datasets/khanh252004/crypto_sentiment_features
+
+Commit: https://huggingface.co/datasets/khanh252004/crypto_sentiment_features/commit/...
 
 Use in training with:
-  python src/training/train.py --hf-features-repo username/crypto-features
+  python src/training/train.py --hf-features-repo khanh252004/crypto_sentiment_features
 ```
 
 ---
@@ -152,7 +165,7 @@ Use in training with:
 **In your Kaggle notebook, cell 1:**
 ```python
 !cd /kaggle/working && rm -rf crypto && mkdir -p crypto && cd crypto
-!git clone https://github.com/yourname/Multimodal-Cryptocurrency-Market-Sentiment-Forecasting.git
+!git clone https://github.com/khanh252004/Multimodal-Cryptocurrency-Market-Sentiment-Forecasting.git
 !cd Multimodal-Cryptocurrency-Market-Sentiment-Forecasting && pip install -q -r requirements.txt
 ```
 
@@ -162,7 +175,7 @@ Use in training with:
 ```bash
 !cd /kaggle/working/Multimodal-Cryptocurrency-Market-Sentiment-Forecasting && \
   python src/training/train.py \
-    --hf-features-repo username/crypto-features \
+    --hf-features-repo khanh252004/crypto_sentiment_features \
     --run-name btc_kaggle_run_001
 ```
 
@@ -271,7 +284,7 @@ Total parameters: ~500K (vs 500M for BERT)
 
 **Check 1**: Repo ID is correct
 ```bash
-python -c "from datasets import load_dataset; load_dataset('username/crypto-features')"
+python -c "from datasets import load_dataset; load_dataset('khanh252004/crypto_sentiment_features')"
 ```
 
 **Check 2**: HF token available
@@ -283,7 +296,7 @@ huggingface-cli login
 
 **Check 3**: Fallback to local features
 ```bash
-# Copy features to Kaggle via file upload, then:
+# Copy features to Kaggle dataset or input folder, then:
 python src/training/train.py --features-dir /kaggle/input/crypto-features/
 ```
 
@@ -291,8 +304,8 @@ python src/training/train.py --features-dir /kaggle/input/crypto-features/
 
 **This should NOT happen** with this pipeline. If it does:
 1. Check that `extract_features.py` ran successfully locally ✓
-2. Verify `.pt` files are on HF: `https://huggingface.co/datasets/username/crypto-features`
-3. Verify train.py uses `--hf-features-repo` argument
+2. Verify `.pt` files are on HF: `https://huggingface.co/datasets/khanh252004/crypto_sentiment_features` ✓
+3. Verify train.py uses `--hf-features-repo khanh252004/crypto_sentiment_features` argument
 4. Check `src/training/dataset.py` loads from HF, not runs extraction
 
 ### If dataset loads very slowly on Kaggle:
@@ -306,16 +319,16 @@ python src/training/train.py --features-dir /kaggle/input/crypto-features/
 ## Complete Workflow Checklist
 
 ### Local Machine
-- [ ] Activate venv: `. ./.venv/bin/activate` or `& .\.venv\Scripts\Activate.ps1`
-- [ ] Extract features: `python src/data/extract_features.py --output_dir ./data/features --asset MULTI`
-- [ ] Login to HF: `huggingface-cli login`
-- [ ] Upload to HF: `python src/data/extract_features.py --output_dir ./data/features --asset MULTI --push-to-hf --hf-repo-id username/crypto-features`
+- [x] Activate venv: `. ./.venv/bin/activate` or `& .`.venv\Scripts\Activate.ps1`
+- [x] Extract features: `python src/data/extract_features.py --output_dir ./data/features --asset MULTI`
+- [x] Login to HF: `huggingface-cli login`
+- [x] Upload to HF: `python src/data/extract_features.py --output_dir ./data/features --asset MULTI --push-to-hf --hf-repo-id khanh252004/crypto_sentiment_features`
 - [ ] Git commit & push: `git add -A && git commit -m "..." && git push origin main`
 
 ### Kaggle Notebook
-- [ ] Clone repo: `!git clone https://github.com/username/...`
+- [ ] Clone repo: `!git clone https://github.com/khanh252004/Multimodal-Cryptocurrency-Market-Sentiment-Forecasting.git`
 - [ ] Install deps: `!pip install -r requirements.txt`
-- [ ] Train: `!python src/training/train.py --hf-features-repo username/crypto-features`
+- [ ] Train: `!python src/training/train.py --hf-features-repo khanh252004/crypto_sentiment_features`
 
 ---
 
@@ -331,10 +344,23 @@ python src/training/train.py --features-dir /kaggle/input/crypto-features/
 
 ---
 
+## Execution Status
+
+**✓ Phase 1 Complete (Local Machine)**
+- Extracted: 62,266 train + 13,342 validation + 13,250 test samples
+- Both modalities: Text (FinBERT) + Image (ResNet50) embeddings
+- Total time: ~52 minutes on RTX 4050 Laptop GPU
+- Uploaded to HF: https://huggingface.co/datasets/khanh252004/crypto_sentiment_features
+- Dataset size: 182 MB total, 137 MB of new embeddings
+
+**⏳ Phase 2 Pending (Kaggle Training)**
+- Waiting to test training on Kaggle with `--hf-features-repo khanh252004/crypto_sentiment_features`
+- Expected: No FinBERT/ResNet50 downloads, instant embedding loading from cache
+
 ## Contact & Support
 
 For issues or questions:
 1. Check console output for clear error messages
-2. Verify HF repo ID: `https://huggingface.co/datasets/username/crypto-features`
+2. Verify HF repo ID: `https://huggingface.co/datasets/khanh252004/crypto_sentiment_features` ✓
 3. Test locally first before running on Kaggle
 4. Share error logs in issue tracker
