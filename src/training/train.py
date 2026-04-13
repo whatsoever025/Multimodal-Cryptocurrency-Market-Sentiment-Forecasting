@@ -3,8 +3,9 @@ Production training loop with VRAM management, W&B integration, and best model c
 
 Key Features:
 - Trainer class with full state management (save/load/train/validate)
-- AMP (Automatic Mixed Precision) with float16 for VRAM reduction
-- Gradient accumulation (batch_size=8, accumulate_steps=2 → effective BS=16)
+- Pure float32 training (no AMP) for numerical stability
+- Gradient accumulation configured via config.training.accumulate_steps
+- Gradient clipping via config.model.grad_clip
 - W&B integration per-branch via wandb_run_name
 - Best model checkpointing with experiment naming
 """
@@ -210,18 +211,17 @@ class Trainer:
                 
                 # ========== GRADIENT CLIPPING ==========
                 # Prevents gradient explosion in LSTM/Attention layers
-                # Clips total gradient norm to ≤ max_norm
-                max_grad_norm = 1.0  # Standard max norm for RNN/Attention stability
+                # Clips total gradient norm to ≤ max_norm from config
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    max_grad_norm,
+                    self.config.model.grad_clip,  # From config (default: 1.0)
                     norm_type=2.0,  # L2 norm (standard)
                 )
                 
                 # Log if clipping occurred (indicator of training instability)
-                if total_norm > max_grad_norm:
+                if total_norm > self.config.model.grad_clip:
                     logger.debug(
-                        f"Gradient clipped: norm={total_norm:.4f} → {max_grad_norm}"
+                        f"Gradient clipped: norm={total_norm:.4f} → {self.config.model.grad_clip}"
                     )
                 
                 # ========== OPTIMIZER STEP ==========

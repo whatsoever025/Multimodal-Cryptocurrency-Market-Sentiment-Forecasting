@@ -219,7 +219,7 @@ DEFAULT_CONFIG = ExperimentConfig()
 def create_config(
     asset: str = "BTC",
     seq_len: int = 24,
-    batch_size: int = 8,
+    batch_size: int = None,  # None = use DataConfig default (128)
     hidden_dim: int = 256,
     learning_rate: float = 1e-4,
     wandb_run_name: Optional[str] = None,
@@ -231,7 +231,7 @@ def create_config(
     Args:
         asset: "BTC" or "ETH"
         seq_len: Sliding window length in hours
-        batch_size: Batch size per GPU
+        batch_size: Batch size per GPU (None = use DataConfig default)
         hidden_dim: Model hidden dimension
         learning_rate: Optimizer learning rate
         wandb_run_name: Unique run identifier for W&B tracking
@@ -245,7 +245,8 @@ def create_config(
     # Update data config
     config.data.asset = asset
     config.data.seq_len = seq_len
-    config.data.batch_size = batch_size
+    if batch_size is not None:
+        config.data.batch_size = batch_size
     
     # Update model config
     config.model.hidden_dim = hidden_dim
