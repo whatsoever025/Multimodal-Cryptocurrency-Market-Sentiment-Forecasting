@@ -127,7 +127,10 @@ class MLOpsConfig:
     hf_push_to_hub: bool = False
     
     # Checkpointing
-    checkpoint_dir: Path = field(default_factory=lambda: Path("/kaggle/working/checkpoints"))
+    checkpoint_dir: Path = field(default_factory=lambda: Path(
+        "/kaggle/working/checkpoints" if Path("/kaggle/working").exists() 
+        else "./src/training/checkpoints"
+    ))
     save_best_only: bool = True
     save_frequency: int = 1  # Save after every N epochs
     keep_last_n: int = 3  # Keep only last N checkpoints
