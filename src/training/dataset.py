@@ -220,6 +220,11 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
     
     def _load_embeddings_from_hf(self, split: str) -> None:
         """Download and load embeddings from Hugging Face."""
+        import os
+        
+        # Disable symlinks for Kaggle compatibility
+        os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
+        
         logger.info(f"Downloading from {self.hf_features_repo_id}...")
         
         try:
@@ -230,7 +235,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
                 repo_id=self.hf_features_repo_id,
                 filename=text_filename,
                 repo_type="dataset",
-                cache_dir="~/.cache/huggingface/datasets"
+                cache_dir=os.path.expanduser("~/.cache/huggingface/datasets")
             )
             self.text_embeddings = torch.load(text_path, map_location="cpu")
             logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}")
@@ -242,7 +247,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
                 repo_id=self.hf_features_repo_id,
                 filename=image_filename,
                 repo_type="dataset",
-                cache_dir="~/.cache/huggingface/datasets"
+                cache_dir=os.path.expanduser("~/.cache/huggingface/datasets")
             )
             self.image_embeddings = torch.load(image_path, map_location="cpu")
             logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}")
@@ -257,6 +262,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.error(f"Failed to download from HF: {e}", exc_info=True)
             raise
     
+    def _fit_tabular_scaler(self):
         """Fit StandardScaler on all tabular features (with log1p on volume).
         
         CRITICAL: Fit only once during initialization to prevent data leakage.
