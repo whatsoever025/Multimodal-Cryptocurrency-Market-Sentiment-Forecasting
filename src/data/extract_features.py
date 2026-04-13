@@ -35,6 +35,11 @@ try:
 except ImportError:
     raise ImportError("'datasets' package required: pip install datasets")
 
+try:
+    from huggingface_hub import HfApi, create_repo
+except ImportError:
+    raise ImportError("'huggingface_hub' required: pip install huggingface_hub")
+
 from tqdm import tqdm
 
 
@@ -158,20 +163,18 @@ def load_dataset_multi_asset(split: str = "train", debug: bool = False):
     logger.info(f"Loading multi-asset dataset ({split} split)...")
     
     print(f"[PROGRESS] Downloading BTC dataset ({split})...")
-    with tqdm(desc=f"BTC {split}", unit="B", unit_scale=True, unit_divisor=1024) as pbar:
-        btc_dataset = load_dataset(
-            "path/to/btc_dataset",  # Placeholder - adjust to actual HF dataset path
-            split=split,
-            cache_dir="/tmp/huggingface_cache",
-        )
+    btc_dataset = load_dataset(
+        "khanh252004/multimodal_crypto_sentiment_btc",
+        split=split,
+        cache_dir="/tmp/huggingface_cache",
+    )
     
     print(f"[PROGRESS] Downloading ETH dataset ({split})...")
-    with tqdm(desc=f"ETH {split}", unit="B", unit_scale=True, unit_divisor=1024) as pbar:
-        eth_dataset = load_dataset(
-            "path/to/eth_dataset",  # Placeholder - adjust to actual HF dataset path
-            split=split,
-            cache_dir="/tmp/huggingface_cache",
-        )
+    eth_dataset = load_dataset(
+        "khanh252004/multimodal_crypto_sentiment_eth",
+        split=split,
+        cache_dir="/tmp/huggingface_cache",
+    )
     
     # Concatenate datasets
     dataset = concatenate_datasets([btc_dataset, eth_dataset])
@@ -420,6 +423,75 @@ def main(args):
     sys.stdout.flush()
 
 
+def push_features_to_hf(
+    output_dir: Path,
+    repo_id: str,
+    token: str = None,
+    private: bool = False,
+) -> None:
+    """
+    Upload extracted features to Hugging Face dataset.
+    
+    Args:
+        output_dir: Directory containing .pt files
+        repo_id: HF repo ID (e.g., username/crypto-features)
+        token: HF API token (uses cached if not provided)
+        private: Whether to make repo private
+    """
+    logger.info(f"\nUploading features to HuggingFace: {repo_id}...")
+    print(f"\n[PROGRESS] Uploading features to {repo_id}...")
+    sys.stdout.flush()
+    
+    try:
+        from huggingface_hub import HfFolder
+        
+        if token is None:
+            token = HfFolder.get_token()
+        
+        if token is None:
+            logger.error(
+                "No HF token found. Please login first:\n"
+                "  huggingface-cli login\n"
+                "Or pass --token <your-token>"
+            )
+            raise ValueError("HF token required for upload")
+        
+        api = HfApi(token=token)
+        
+        # Create repo if doesn't exist
+        logger.info(f"Creating/checking repo: {repo_id}")
+        create_repo(
+            repo_id=repo_id,
+            repo_type="dataset",
+            private=private,
+            exist_ok=True,
+            token=token
+        )
+        logger.info(f"✓ Repository ready")
+        
+        # Upload folder
+        logger.info(f"Uploading {output_dir} to {repo_id}...")
+        info = api.upload_folder(
+            folder_path=str(output_dir),
+            repo_id=repo_id,
+            repo_type="dataset",
+            token=token,
+            allow_patterns=["*.pt"],
+            ignore_patterns=[".git", "__pycache__"],
+            commit_message="Upload pre-extracted crypto sentiment features"
+        )
+        logger.info(f"✓ Upload complete")
+        print(f"[PROGRESS] ✓ Features uploaded to https://huggingface.co/datasets/{repo_id}")
+        sys.stdout.flush()
+        
+    except ImportError:
+        logger.error("huggingface_hub not installed. Install with: pip install huggingface_hub")
+        raise
+    except Exception as e:
+        logger.error(f"Upload failed: {e}", exc_info=True)
+        raise
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Extract and cache FinBERT text and ResNet50 image embeddings"
@@ -446,6 +518,49 @@ if __name__ == "__main__":
         action="store_true",
         help="Debug mode (extract only 100 samples per split)",
     )
+    parser.add_argument(
+        "--push-to-hf",
+        action="store_true",
+        help="Upload extracted features to Hugging Face after extraction",
+    )
+    parser.add_argument(
+        "--hf-repo-id",
+        type=str,
+        default=None,
+        help="Hugging Face repo ID for uploading (username/repo-name)",
+    )
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="HF API token (uses cached if not provided)",
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help="Make HF repo private",
+    )
     
     args = parser.parse_args()
+    
     main(args)
+    
+    # Push to HF if requested
+    if args.push_to_hf:
+        if not args.hf_repo_id:
+            print("[ERROR] --hf-repo-id required when --push-to-hf is set")
+            sys.exit(1)
+        
+        output_dir = Path(args.output_dir)
+        push_features_to_hf(
+            output_dir=output_dir,
+            repo_id=args.hf_repo_id,
+            token=args.token,
+            private=args.private,
+        )
+        
+        print("\n" + "=" * 80)
+        print("✅ Feature extraction and upload complete!")
+        print("=" * 80)
+        print(f"\nUse in training with:")
+        print(f"  python src/training/train.py --hf-features-repo {args.hf_repo_id}")

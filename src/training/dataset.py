@@ -23,6 +23,11 @@ except ImportError:
     raise ImportError("'datasets' package required: pip install datasets")
 
 try:
+    from huggingface_hub import hf_hub_download
+except ImportError:
+    raise ImportError("'huggingface_hub' required: pip install huggingface_hub")
+
+try:
     from sklearn.preprocessing import StandardScaler
 except ImportError:
     raise ImportError("'scikit-learn' package required: pip install scikit-learn")
@@ -68,7 +73,8 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         asset: str = "MULTI",
         split: str = "train",
         seq_len: int = 24,
-        features_dir: str = "/kaggle/working/crypto/data/features",
+        hf_features_repo_id: str = None,
+        features_dir: str = None,
         debug: bool = False,
     ):
         """
@@ -78,14 +84,25 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             asset: "BTC", "ETH", or "MULTI" (BTC+ETH)
             split: "train", "validation", or "test_in_domain"
             seq_len: Sliding window length (hours)
-            features_dir: Directory containing pre-extracted embeddings (.pt files)
+            hf_features_repo_id: HF repo ID for pre-extracted embeddings (e.g., username/crypto-features)
+            features_dir: Local directory containing embeddings (used if hf_features_repo_id not provided)
             debug: If True, load only 100 samples for testing
+        
+        Note: Either hf_features_repo_id or features_dir must be provided (HF takes precedence)
         """
         self.asset = asset
         self.split = split
         self.seq_len = seq_len
-        self.features_dir = Path(features_dir)
+        self.hf_features_repo_id = hf_features_repo_id
+        self.features_dir = Path(features_dir) if features_dir else None
         self.debug = debug
+        
+        # Validate: must have either HF repo or local directory
+        if not hf_features_repo_id and not features_dir:
+            raise ValueError(
+                "Must provide either hf_features_repo_id or features_dir. "
+                "Example: hf_features_repo_id='username/crypto-features'"
+            )
         
         logger.info(
             f"Initializing CryptoMultimodalDataset\n"
@@ -129,34 +146,20 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         sys.stdout.flush()
         
         # ==================== LOAD PRE-EXTRACTED EMBEDDINGS ====================
-        logger.info("Loading pre-extracted embeddings from disk...")
+        logger.info("Loading pre-extracted embeddings...")
         print("[PROGRESS] Loading pre-extracted embeddings...")
         sys.stdout.flush()
         
         embed_start = time.time()
         
-        text_embed_path = self.features_dir / f"text_embeddings_{split}.pt"
-        image_embed_path = self.features_dir / f"image_embeddings_{split}.pt"
-        
-        if not text_embed_path.exists():
-            raise FileNotFoundError(f"Text embeddings not found: {text_embed_path}")
-        if not image_embed_path.exists():
-            raise FileNotFoundError(f"Image embeddings not found: {image_embed_path}")
-        
-        # Load embeddings into memory (critical for speed)
-        logger.info(f"Loading text embeddings from {text_embed_path}...")
-        self.text_embeddings = torch.load(text_embed_path, map_location="cpu")  # (total_samples, 256)
-        logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}")
-        
-        logger.info(f"Loading image embeddings from {image_embed_path}...")
-        self.image_embeddings = torch.load(image_embed_path, map_location="cpu")  # (total_samples, 256)
-        logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}")
-        
-        # Validate shapes
-        assert self.text_embeddings.shape[0] == self.total_samples, \
-            f"Text embeddings mismatch: {self.text_embeddings.shape[0]} vs {self.total_samples}"
-        assert self.image_embeddings.shape[0] == self.total_samples, \
-            f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
+        if self.hf_features_repo_id:
+            # Load from Hugging Face
+            logger.info(f"Downloading embeddings from {self.hf_features_repo_id}...")
+            self._load_embeddings_from_hf(split)
+        else:
+            # Load from local disk
+            logger.info(f"Loading embeddings from {self.features_dir}...")
+            self._load_embeddings_from_disk(split)
         
         embed_time = time.time() - embed_start
         logger.info(f"✓ Embeddings loaded in {format_duration(embed_time)}")
@@ -191,7 +194,69 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         
         logger.info(f"✓ Dataset ready: {len(self)} valid sequences of length {seq_len}")
     
-    def _fit_tabular_scaler(self) -> None:
+    def _load_embeddings_from_disk(self, split: str) -> None:
+        """Load embeddings from local disk."""
+        text_embed_path = self.features_dir / f"text_embeddings_{split}.pt"
+        image_embed_path = self.features_dir / f"image_embeddings_{split}.pt"
+        
+        if not text_embed_path.exists():
+            raise FileNotFoundError(f"Text embeddings not found: {text_embed_path}")
+        if not image_embed_path.exists():
+            raise FileNotFoundError(f"Image embeddings not found: {image_embed_path}")
+        
+        logger.info(f"Loading text embeddings from {text_embed_path}...")
+        self.text_embeddings = torch.load(text_embed_path, map_location="cpu")
+        logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}")
+        
+        logger.info(f"Loading image embeddings from {image_embed_path}...")
+        self.image_embeddings = torch.load(image_embed_path, map_location="cpu")
+        logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}")
+        
+        # Validate shapes
+        assert self.text_embeddings.shape[0] == self.total_samples, \
+            f"Text embeddings mismatch: {self.text_embeddings.shape[0]} vs {self.total_samples}"
+        assert self.image_embeddings.shape[0] == self.total_samples, \
+            f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
+    
+    def _load_embeddings_from_hf(self, split: str) -> None:
+        """Download and load embeddings from Hugging Face."""
+        logger.info(f"Downloading from {self.hf_features_repo_id}...")
+        
+        try:
+            # Download text embeddings
+            text_filename = f"text_embeddings_{split}.pt"
+            logger.info(f"Downloading {text_filename}...")
+            text_path = hf_hub_download(
+                repo_id=self.hf_features_repo_id,
+                filename=text_filename,
+                repo_type="dataset",
+                cache_dir="~/.cache/huggingface/datasets"
+            )
+            self.text_embeddings = torch.load(text_path, map_location="cpu")
+            logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}")
+            
+            # Download image embeddings
+            image_filename = f"image_embeddings_{split}.pt"
+            logger.info(f"Downloading {image_filename}...")
+            image_path = hf_hub_download(
+                repo_id=self.hf_features_repo_id,
+                filename=image_filename,
+                repo_type="dataset",
+                cache_dir="~/.cache/huggingface/datasets"
+            )
+            self.image_embeddings = torch.load(image_path, map_location="cpu")
+            logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}")
+            
+            # Validate shapes
+            assert self.text_embeddings.shape[0] == self.total_samples, \
+                f"Text embeddings mismatch: {self.text_embeddings.shape[0]} vs {self.total_samples}"
+            assert self.image_embeddings.shape[0] == self.total_samples, \
+                f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
+        
+        except Exception as e:
+            logger.error(f"Failed to download from HF: {e}", exc_info=True)
+            raise
+    
         """Fit StandardScaler on all tabular features (with log1p on volume).
         
         CRITICAL: Fit only once during initialization to prevent data leakage.
@@ -357,7 +422,8 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
 def create_dataloaders(
     config,
     splits: Optional[Tuple[str, str, str]] = ("train", "validation", "test_in_domain"),
-    features_dir: str = "/kaggle/working/crypto/data/features",
+    hf_features_repo_id: str = None,
+    features_dir: str = None,
     num_workers: int = 0,  # Always 0 on Kaggle (multi-worker deadlock fix)
     pin_memory: bool = True,
 ) -> Dict[str, torch.utils.data.DataLoader]:
@@ -371,7 +437,8 @@ def create_dataloaders(
     Args:
         config: ExperimentConfig instance
         splits: Tuple of (train_split, val_split, test_split)
-        features_dir: Directory containing pre-extracted embeddings
+        hf_features_repo_id: HF repo ID for embeddings (takes precedence)
+        features_dir: Local directory with embeddings (fallback)
         num_workers: Number of data loading workers (0 for Kaggle safety)
         pin_memory: Pin memory for faster GPU transfer
     
@@ -394,6 +461,7 @@ def create_dataloaders(
                 asset=config.data.asset,
                 split=split_name,
                 seq_len=config.data.seq_len,
+                hf_features_repo_id=hf_features_repo_id,
                 features_dir=features_dir,
                 debug=config.debug if hasattr(config, "debug") else False,
             )

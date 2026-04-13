@@ -446,7 +446,8 @@ def main(args):
     try:
         dataloaders = create_dataloaders(
             config,
-            features_dir="/kaggle/working/crypto/data/features",
+            hf_features_repo_id=args.hf_features_repo,
+            features_dir=args.features_dir if not args.hf_features_repo else None,
             num_workers=0
         )
         print("[PROGRESS] ✓ All datasets loaded successfully!")
@@ -562,6 +563,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train multimodal crypto sentiment model")
     parser.add_argument("--asset", choices=["MULTI"], default="MULTI", help="Cryptocurrency asset (multi-asset: BTC+ETH combined)")
+    parser.add_argument("--hf-features-repo", type=str, default=None, help="HF repo ID for pre-extracted embeddings (e.g., username/crypto-features)")
+    parser.add_argument("--features-dir", type=str, default="./data/features", help="Local path to extracted embeddings (fallback if --hf-features-repo not provided)")
     parser.add_argument("--run-name", type=str, default=None, help="W&B run name")
     parser.add_argument("--config", type=str, default=None, help="Config file path (YAML)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
