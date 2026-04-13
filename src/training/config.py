@@ -16,7 +16,7 @@ class DataConfig:
     """Data loading and preprocessing configuration."""
     asset: str = "MULTI"  # "MULTI" for BTC+ETH combined, or single "BTC"/"ETH"
     seq_len: int = 24  # Sliding window length in hours
-    batch_size: int = 8  # Per-GPU batch size
+    batch_size: int = 128  # Per-GPU batch size
     max_text_length: int = 512  # Token sequence length for BERT
     image_size: int = 224  # ResNet50 input size (224x224)
     shuffle_train: bool = True
