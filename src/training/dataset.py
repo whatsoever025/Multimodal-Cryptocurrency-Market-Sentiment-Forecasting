@@ -180,22 +180,22 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             f"(indices 0 to {self.max_valid_idx - 1})"
         )
         
-        # ==================== FIT SCALER ON TABULAR FEATURES ====================
-        logger.info("Fitting StandardScaler on tabular features...")
-        print("[PROGRESS] Fitting StandardScaler on tabular features...")
+        # ==================== EXTRACT & PRE-SCALE ALL TABULAR FEATURES ====================
+        logger.info("Extracting and pre-scaling all tabular features...")
+        print("[PROGRESS] Extracting and pre-scaling all tabular features...")
         sys.stdout.flush()
         
-        scaler_start = time.time()
-        self._fit_tabular_scaler()
-        scaler_time = time.time() - scaler_start
-        logger.info(f"✓ StandardScaler fitted in {format_duration(scaler_time)}")
-        print(f"[PROGRESS] ✓ StandardScaler fitted")
+        tabular_start = time.time()
+        self._extract_and_scale_all_tabular()
+        tabular_time = time.time() - tabular_start
+        logger.info(f"✓ All tabular features pre-scaled in {format_duration(tabular_time)}")
+        print(f"[PROGRESS] ✓ All tabular features pre-scaled")
         sys.stdout.flush()
         
         logger.info(f"✓ Dataset ready: {len(self)} valid sequences of length {seq_len}")
     
     def _load_embeddings_from_disk(self, split: str) -> None:
-        """Load embeddings from local disk."""
+        """Load embeddings from local disk as contiguous tensors."""
         text_embed_path = self.features_dir / f"text_embeddings_{split}.pt"
         image_embed_path = self.features_dir / f"image_embeddings_{split}.pt"
         
@@ -205,12 +205,14 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(f"Image embeddings not found: {image_embed_path}")
         
         logger.info(f"Loading text embeddings from {text_embed_path}...")
-        self.text_embeddings = torch.load(text_embed_path, map_location="cpu")
-        logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}")
+        text_raw = torch.load(text_embed_path, map_location="cpu")
+        self.text_embeddings = text_raw.contiguous()  # Ensure contiguity for zero-copy slicing
+        logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}, contiguous={self.text_embeddings.is_contiguous()}")
         
         logger.info(f"Loading image embeddings from {image_embed_path}...")
-        self.image_embeddings = torch.load(image_embed_path, map_location="cpu")
-        logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}")
+        image_raw = torch.load(image_embed_path, map_location="cpu")
+        self.image_embeddings = image_raw.contiguous()  # Ensure contiguity for zero-copy slicing
+        logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}, contiguous={self.image_embeddings.is_contiguous()}")
         
         # Validate shapes
         assert self.text_embeddings.shape[0] == self.total_samples, \
@@ -219,7 +221,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
     
     def _load_embeddings_from_hf(self, split: str) -> None:
-        """Download and load embeddings from Hugging Face."""
+        """Download and load embeddings from Hugging Face as contiguous tensors."""
         import os
         
         # Disable symlinks for Kaggle compatibility
@@ -237,8 +239,9 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
                 repo_type="dataset",
                 cache_dir=os.path.expanduser("~/.cache/huggingface/datasets")
             )
-            self.text_embeddings = torch.load(text_path, map_location="cpu")
-            logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}")
+            text_raw = torch.load(text_path, map_location="cpu")
+            self.text_embeddings = text_raw.contiguous()  # Ensure contiguity
+            logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}, contiguous={self.text_embeddings.is_contiguous()}")
             
             # Download image embeddings
             image_filename = f"image_embeddings_{split}.pt"
@@ -249,8 +252,9 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
                 repo_type="dataset",
                 cache_dir=os.path.expanduser("~/.cache/huggingface/datasets")
             )
-            self.image_embeddings = torch.load(image_path, map_location="cpu")
-            logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}")
+            image_raw = torch.load(image_path, map_location="cpu")
+            self.image_embeddings = image_raw.contiguous()  # Ensure contiguity
+            logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}, contiguous={self.image_embeddings.is_contiguous()}")
             
             # Validate shapes
             assert self.text_embeddings.shape[0] == self.total_samples, \
@@ -262,21 +266,30 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.error(f"Failed to download from HF: {e}", exc_info=True)
             raise
     
-    def _fit_tabular_scaler(self):
-        """Fit StandardScaler on all tabular features (with log1p on volume).
+    def _extract_and_scale_all_tabular(self):
+        """OPTIMIZED: Extract and scale ALL tabular features once in __init__.
         
-        CRITICAL: Fit only once during initialization to prevent data leakage.
-        - Extracts 7 tabular features from entire dataset split
+        CRITICAL PERFORMANCE: This is called ONCE in __init__, never in __getitem__.
+        - Iterates through entire dataset split once to collect all 7 tabular features
+        - Creates (total_samples, 7) numpy array
         - Applies np.log1p ONLY to volume column (index 1)
-        - Fits StandardScaler to normalize all 7 columns (mean=0, std=1)
-        """
-        tabular_features_list = []
+        - Fits StandardScaler on the log-transformed array
+        - Transforms all at once (vectorized)
+        - Stores as contiguous torch.float32 tensor self.tabular_data
         
-        # Iterate through entire dataset split to collect tabular values
-        for idx in tqdm(range(self.total_samples), desc="Fitting scaler", unit="samples"):
+        Result: __getitem__ only slices self.tabular_data[idx:idx+seq_len] - O(1) per batch.
+        """
+        logger.info("Extracting all tabular features from dataset...")
+        print("[PROGRESS]   Extracting tabular features...", end="", flush=True)
+        
+        tabular_features_list = []
+        target_scores_list = []
+        
+        # SINGLE PASS: Collect all features once
+        for idx in tqdm(range(self.total_samples), desc="Extracting", unit="samples", leave=False):
             sample = self.dataset[idx]
             
-            # Extract 7 tabular features
+            # Extract 7 tabular features as float32
             tabular_values = np.array([
                 sample["return_1h"],
                 sample["volume"],
@@ -287,39 +300,41 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
                 sample["gdelt_conflict_volume"],
             ], dtype=np.float32)
             
-            # Apply log1p ONLY to volume (index 1)
-            tabular_values[1] = np.log1p(tabular_values[1])
-            
             tabular_features_list.append(tabular_values)
+            target_scores_list.append(sample["target_score"])
         
-        # Stack into (total_samples, 7) array and fit scaler
-        tabular_array = np.stack(tabular_features_list, axis=0)  # (total_samples, 7)
+        print(" Done!", flush=True)
+        
+        # Stack into (total_samples, 7) numpy array
+        tabular_array = np.stack(tabular_features_list, axis=0)  # Shape: (total_samples, 7)
+        logger.info(f"Stacked tabular array shape: {tabular_array.shape}")
+        
+        # Apply log1p ONLY to volume column (index 1)
+        print("[PROGRESS]   Applying log1p transformation...", flush=True)
+        tabular_array[:, 1] = np.log1p(tabular_array[:, 1])
+        
+        # Fit StandardScaler on ENTIRE array (prevents data leakage)
+        print("[PROGRESS]   Fitting StandardScaler...", flush=True)
         self.scaler = StandardScaler()
         self.scaler.fit(tabular_array)
-        
         logger.info(
-            f"StandardScaler fitted on {self.total_samples} samples. "
-            f"Means: {self.scaler.mean_}, Stds: {self.scaler.scale_}"
+            f"StandardScaler fitted. Means: {self.scaler.mean_}, Stds: {self.scaler.scale_}"
         )
-    
-    def _scale_tabular_features(self, tabular_values: np.ndarray) -> torch.Tensor:
-        """Scale tabular features using fitted StandardScaler.
         
-        Args:
-            tabular_values: (seq_len, 7) numpy array of raw tabular features
+        # Transform ALL at once (vectorized operation: O(n) not O(n*seq_len))
+        print("[PROGRESS]   Transforming features...", flush=True)
+        scaled_array = self.scaler.transform(tabular_array)  # Shape: (total_samples, 7)
         
-        Returns:
-            (seq_len, 7) torch.FloatTensor with normalized features
-        """
-        # Apply log1p ONLY to volume column (index 1) for all timesteps
-        tabular_values = tabular_values.copy()  # Don't modify original
-        tabular_values[:, 1] = np.log1p(tabular_values[:, 1])  # log1p to volume
+        # Convert to torch tensor (float32, contiguous for zero-copy slicing)
+        self.tabular_data = torch.tensor(scaled_array, dtype=torch.float32).contiguous()
+        logger.info(f"✓ Tabular tensor stored: {self.tabular_data.shape}, dtype={self.tabular_data.dtype}, contiguous={self.tabular_data.is_contiguous()}")
         
-        # Apply StandardScaler transformation
-        scaled = self.scaler.transform(tabular_values)  # (seq_len, 7)
-        
-        # Convert to torch tensor
-        return torch.tensor(scaled, dtype=torch.float32)
+        # Store target scores and timestamps as tensors
+        self.target_scores = torch.tensor(target_scores_list, dtype=torch.float32)
+        self.timestamps = torch.arange(self.total_samples, dtype=torch.long)
+        logger.info(f"✓ Target scores tensor: {self.target_scores.shape}")
+        logger.info(f"✓ Timestamps tensor: {self.timestamps.shape}")
+
     
     def __len__(self) -> int:
         """
@@ -332,21 +347,25 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         return self.max_valid_idx
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get a single sample (sequence of length seq_len + target).
+        """OPTIMIZED: Zero-copy slicing - O(1) operation per index.
         
-        CRITICAL: idx must be in [0, __len__()), which guarantees idx+seq_len exists.
+        CRITICAL: This method does NOTHING except slice pre-computed tensors.
+        - NO dataset iteration
+        - NO feature extraction  
+        - NO tensor conversions (torch.tensor() removed)
+        - NO transformations/scalings
+        - Pure zero-copy view slicing from pre-allocated tensors
         
         Args:
-            idx: Index of sequence start
+            idx: Index of sequence start (must be in [0, __len__()))
         
         Returns:
-            Dict with keys:
-                - tabular: (seq_len, 7) tensor
-                - text_embedding: (seq_len, 256) tensor
-                - image_embedding: (seq_len, 256) tensor
-                - target: scalar tensor (value at idx + seq_len)
-                - timestamp: scalar (epoch time at idx + seq_len)
+            Dict with VIEWS (not copies) into pre-computed tensors:
+                - tabular: (seq_len, 7) float32 view - ALREADY SCALED
+                - text_embedding: (seq_len, 256) float32 view
+                - image_embedding: (seq_len, 256) float32 view
+                - target: scalar float32 tensor
+                - timestamp: scalar int64 tensor
         
         Raises:
             IndexError: If idx >= __len__()
@@ -356,46 +375,13 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
                 f"Index {idx} out of bounds for dataset of length {len(self)}"
             )
         
-        # Collect sequence [idx, idx+seq_len-1]
-        tabular_list = []  # Will collect raw values, then scale all at once
-        
-        for t in range(self.seq_len):
-            sample_idx = idx + t
-            sample = self.dataset[sample_idx]
-            
-            # Extract 7 tabular features
-            tabular_values = np.array([
-                sample["return_1h"],
-                sample["volume"],
-                sample["funding_rate"],
-                sample["fear_greed_value"],
-                sample["gdelt_econ_volume"],
-                sample["gdelt_econ_tone"],
-                sample["gdelt_conflict_volume"],
-            ], dtype=np.float32)
-            
-            tabular_list.append(tabular_values)
-        
-        # Get target at idx + seq_len (guaranteed to exist)
-        target_sample = self.dataset[idx + self.seq_len]
-        target_score = target_sample["target_score"]
-        target = torch.tensor(target_score, dtype=torch.float32)
-        timestamp = torch.tensor(idx + self.seq_len, dtype=torch.long)
-        
-        # Stack and scale tabular features
-        tabular_raw = np.stack(tabular_list, axis=0)  # (seq_len, 7)
-        tabular_stacked = self._scale_tabular_features(tabular_raw)  # (seq_len, 7)
-        
-        # Slice text and image embeddings
-        text_embedding_stacked = self.text_embeddings[idx:idx + self.seq_len]  # (seq_len, 256)
-        image_embedding_stacked = self.image_embeddings[idx:idx + self.seq_len]  # (seq_len, 256)
-        
+        # Pure slicing - these are views into contiguous tensors (O(1) operation)
         return {
-            "tabular": tabular_stacked,
-            "text_embedding": text_embedding_stacked,
-            "image_embedding": image_embedding_stacked,
-            "target": target,
-            "timestamp": timestamp,
+            "tabular": self.tabular_data[idx:idx + self.seq_len],
+            "text_embedding": self.text_embeddings[idx:idx + self.seq_len],
+            "image_embedding": self.image_embeddings[idx:idx + self.seq_len],
+            "target": self.target_scores[idx + self.seq_len],
+            "timestamp": self.timestamps[idx + self.seq_len],
         }
 
 
