@@ -1,8 +1,9 @@
 """
 Simplified Offline Feature Dataset
 
-Loads ALL data (embeddings + tabular + targets) from pre-extracted Kaggle files.
-No HuggingFace dataset loading. All data is pre-scaled with proper scalers.
+Loads ALL data (embeddings + tabular + targets) from pre-extracted RAW Kaggle files.
+No HuggingFace dataset loading. Scaling (StandardScaler for tabular, RobustScaler for targets)
+are applied in-memory during dataset initialization based on training split.
 
 CRITICAL: Safe sliding window logic prevents IndexError at dataset boundaries.
 - __len__() returns total_samples - seq_len (to guarantee idx + seq_len exists)
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
 
 from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from .utils import format_duration
 
 logger = logging.getLogger(__name__)
@@ -26,22 +28,24 @@ logger = logging.getLogger(__name__)
 
 class CryptoMultimodalDataset(torch.utils.data.Dataset):
     """
-    Simplified offline multimodal dataset using pre-extracted and pre-scaled data.
+    Simplified offline multimodal dataset using pre-extracted RAW data.
     
     Loads:
     - Text embeddings (256-dim, pre-extracted by FinBERT)
     - Image embeddings (256-dim, pre-extracted by ResNet50)
-    - Tabular features (7 columns, pre-scaled by StandardScaler)
-    - Target scores (pre-scaled by RobustScaler)
+    - Tabular features (7 columns, RAW - will be scaled)
+    - Target scores (RAW - will be scaled)
     
-    All data is loaded from Kaggle .pt files. NO HuggingFace dataset loading.
-    All scaling is already done during extraction. NO scaling in training.
+    All RAW data is loaded from Kaggle .pt files. NO HuggingFace dataset loading.
+    Scaling is applied in-memory during initialization:
+    - StandardScaler: Fitted on training split, applied to all splits
+    - RobustScaler: Fitted on training split target scores, applied to all splits
     
     CRITICAL: Data structure:
     - text_embeddings: (total_samples, 256)
     - image_embeddings: (total_samples, 256)
-    - tabular_features: (total_samples, 7) ← pre-scaled by StandardScaler
-    - target_scores: (total_samples,) ← pre-scaled by RobustScaler
+    - tabular_features: (total_samples, 7) ← scaled by StandardScaler during init
+    - target_scores: (total_samples,) ← scaled by RobustScaler during init
     
     Example:
         dataset = CryptoMultimodalDataset(
@@ -50,10 +54,10 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             features_dir="/path/to/kaggle/features"
         )
         sample = dataset[0]
-        # sample["tabular"]: (24, 7) ← already scaled
+        # sample["tabular"]: (24, 7) ← scaled in-memory
         # sample["text_embedding"]: (24, 256)
         # sample["image_embedding"]: (24, 256)
-        # sample["target"]: scalar ← already scaled
+        # sample["target"]: scalar ← scaled in-memory
     """
     
     def __init__(
@@ -64,19 +68,24 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         debug: bool = False,
     ):
         """
-        Initialize simplified offline dataset.
+        Initialize simplified offline dataset with in-memory scaling.
         
         Args:
             split: "train", "validation", or "test_in_domain"
             seq_len: Sliding window length (hours)
-            features_dir: Local directory containing pre-extracted Kaggle features
+            features_dir: Local directory containing pre-extracted Kaggle RAW features
             debug: If True, load only 100 samples for testing
+        
+        Scaling Strategy:
+        - StandardScaler: Fit on training split tabular features, applied to all splits
+        - RobustScaler: Fit on training split target scores, applied to all splits
+        - If split != "train": Load scalers from training data first
         
         Note: features_dir should contain:
             - text_embeddings_{split}.pt
             - image_embeddings_{split}.pt
-            - tabular_features_scaled_{split}.pt
-            - target_scores_scaled_{split}.pt
+            - tabular_features_{split}.pt (RAW, no scaling)
+            - target_scores_{split}.pt (RAW, no scaling)
         """
         self.split = split
         self.seq_len = seq_len
@@ -109,16 +118,16 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         print(f"[PROGRESS] ✓ Embeddings loaded ({format_duration(embed_time)})")
         sys.stdout.flush()
         
-        # ==================== LOAD PRE-SCALED TABULAR FEATURES ====================
-        logger.info("Loading pre-scaled tabular features...")
-        print("[PROGRESS] Loading pre-scaled tabular features...")
+        # ==================== LOAD RAW TABULAR FEATURES & APPLY SCALING ====================
+        logger.info("Loading RAW tabular features and targets...")
+        print("[PROGRESS] Loading RAW tabular features and targets...")
         sys.stdout.flush()
         
         tabular_start = time.time()
         self._load_tabular_and_targets(split)
         tabular_time = time.time() - tabular_start
-        logger.info(f"✓ Tabular features and targets loaded in {format_duration(tabular_time)}")
-        print(f"[PROGRESS] ✓ Tabular features and targets loaded")
+        logger.info(f"✓ Tabular features and targets loaded & scaled in {format_duration(tabular_time)}")
+        print(f"[PROGRESS] ✓ Tabular features and targets loaded & scaled")
         sys.stdout.flush()
         
         # ==================== SAFE SLIDING WINDOW ====================
@@ -165,23 +174,87 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
     
     def _load_tabular_and_targets(self, split: str) -> None:
-        """Load pre-scaled tabular features and target scores from disk."""
-        tabular_path = self.features_dir / f"tabular_features_scaled_{split}.pt"
-        target_path = self.features_dir / f"target_scores_scaled_{split}.pt"
+        """Load RAW tabular features and target scores, then apply scalers.
+        
+        Scaling Strategy:
+        - For 'train' split: Fit StandardScaler and RobustScaler on raw data, apply in-place
+        - For 'validation'/'test_in_domain': Load scalers from training data, apply scaled data
+        
+        This ensures proper data leakage prevention:
+        - Training: Learn scaler statistics from train data
+        - Validation/Test: Use train statistics to scale val/test data
+        """
+        tabular_path = self.features_dir / f"tabular_features_{split}.pt"
+        target_path = self.features_dir / f"target_scores_{split}.pt"
         
         if not tabular_path.exists():
             raise FileNotFoundError(f"Tabular features not found: {tabular_path}")
         if not target_path.exists():
             raise FileNotFoundError(f"Target scores not found: {target_path}")
         
-        logger.info(f"Loading tabular features from {tabular_path}...")
-        tabular_raw = torch.load(tabular_path, map_location="cpu")
-        self.tabular_data = tabular_raw.contiguous()
-        logger.info(f"✓ Tabular features: {self.tabular_data.shape}, contiguous={self.tabular_data.is_contiguous()}")
+        logger.info(f"Loading RAW tabular features from {tabular_path}...")
+        tabular_raw = torch.load(tabular_path, map_location="cpu")  # (total_samples, 7)
+        logger.info(f"✓ Raw tabular features: {tabular_raw.shape}")
         
-        logger.info(f"Loading target scores from {target_path}...")
-        self.target_scores = torch.load(target_path, map_location="cpu")
-        logger.info(f"✓ Target scores: {self.target_scores.shape}")
+        logger.info(f"Loading RAW target scores from {target_path}...")
+        target_raw = torch.load(target_path, map_location="cpu")  # (total_samples,)
+        logger.info(f"✓ Raw target scores: {target_raw.shape}")
+        
+        # ========== APPLY SCALERS ==========
+        if split == "train":
+            # TRAIN: Fit scalers on raw data, then apply
+            logger.info("Fitting StandardScaler on tabular features (training split)...")
+            tabular_scaler = StandardScaler()
+            tabular_np = tabular_raw.numpy()  # (total_samples, 7)
+            tabular_scaled_np = tabular_scaler.fit_transform(tabular_np)
+            self.tabular_data = torch.from_numpy(tabular_scaled_np).float()
+            logger.info(f"✓ StandardScaler fitted and applied: {self.tabular_data.shape}")
+            logger.info(f"  Scaler mean: {tabular_scaler.mean_}")
+            logger.info(f"  Scaler scale: {tabular_scaler.scale_}")
+            
+            logger.info("Fitting RobustScaler on target scores (training split)...")
+            target_scaler = RobustScaler()
+            target_np = target_raw.numpy().reshape(-1, 1)  # (total_samples, 1) for sklearn
+            target_scaled_np = target_scaler.fit_transform(target_np).squeeze()  # Back to 1D
+            self.target_scores = torch.from_numpy(target_scaled_np).float()
+            logger.info(f"✓ RobustScaler fitted and applied: {self.target_scores.shape}")
+            logger.info(f"  Scaler center (median): {target_scaler.center_}")
+            logger.info(f"  Scaler scale (IQR): {target_scaler.scale_}")
+            
+            # Store scalers for validation/test (will be loaded by those splits)
+            self.tabular_scaler = tabular_scaler
+            self.target_scaler = target_scaler
+        else:
+            # VALIDATION/TEST: Load scalers from training split, apply to current split
+            logger.info(f"Loading scalers from training split for {split}...")
+            train_dataset = CryptoMultimodalDataset(
+                split="train",
+                seq_len=self.seq_len,
+                features_dir=str(self.features_dir),
+                debug=self.debug
+            )
+            tabular_scaler = train_dataset.tabular_scaler
+            target_scaler = train_dataset.target_scaler
+            
+            # Apply training scalers to current split data
+            logger.info(f"Applying StandardScaler from training to {split} tabular features...")
+            tabular_np = tabular_raw.numpy()
+            tabular_scaled_np = tabular_scaler.transform(tabular_np)
+            self.tabular_data = torch.from_numpy(tabular_scaled_np).float()
+            logger.info(f"✓ Tabular features scaled: {self.tabular_data.shape}")
+            
+            logger.info(f"Applying RobustScaler from training to {split} target scores...")
+            target_np = target_raw.numpy().reshape(-1, 1)
+            target_scaled_np = target_scaler.transform(target_np).squeeze()
+            self.target_scores = torch.from_numpy(target_scaled_np).float()
+            logger.info(f"✓ Target scores scaled: {self.target_scores.shape}")
+            
+            self.tabular_scaler = tabular_scaler
+            self.target_scaler = target_scaler
+        
+        # Make contiguous for efficient slicing
+        self.tabular_data = self.tabular_data.contiguous()
+        self.target_scores = self.target_scores.contiguous()
         
         # Create timestamps (indices for reference)
         self.timestamps = torch.arange(self.total_samples, dtype=torch.long)
