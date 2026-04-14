@@ -11,14 +11,17 @@ Architecture (Offline Feature Extraction):
 
 3. Cross-Modal Attention:
    - 3 modalities (text, image, tabular) attend to each other at each timestep
+   - All modalities: 256D (text, image, tabular all match)
    - Treated as sequence length = 3
 
 4. Temporal LSTM:
    - Captures temporal dynamics across seq_len timesteps
+   - Input/Hidden: 256D (matches embedding dimension)
    - 2 layers with dropout
 
 5. Prediction Head:
    - MLP reducing to single continuous output (-100 to +100)
+   - Input: 256D (from LSTM final hidden state)
 """
 
 import torch
@@ -207,15 +210,16 @@ class MultimodalFusionNet(nn.Module):
     
     Architecture:
     1. Accept pre-extracted embeddings (FinBERT text & ResNet50 images)
-    2. Encode tabular features with lightweight MLP
-    3. Stack modality representations and apply cross-modal attention
-    4. Apply temporal LSTM for temporal dynamics
+    2. Encode tabular features with lightweight MLP (output: 256D to match embeddings)
+    3. Stack modality representations and apply cross-modal attention (all 256D)
+    4. Apply temporal LSTM for temporal dynamics (256D hidden state)
     5. MLP prediction head for continuous output
     
-    Pure float32 training (no AMP):
-    - Eliminates gradient underflow/overflow
-    - Simplifies numerical stability
-    - 16GB VRAM sufficient with batch_size=8, seq_len=24
+    Mixed precision training (AMP):
+    - float16 activations + float32 weights
+    - GradScaler for automatic loss scaling
+    - Gradient clipping (L2 norm ≤ 1.0)
+    - 16GB VRAM sufficient with batch_size=128, seq_len=24
     """
     
     def __init__(self, config):

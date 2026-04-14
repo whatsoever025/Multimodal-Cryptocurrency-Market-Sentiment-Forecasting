@@ -41,7 +41,7 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     """Architecture configuration."""
-    hidden_dim: int = 512  # Hidden dimension in encoders/LSTM (increased from 256)
+    hidden_dim: int = 256  # Hidden dimension in encoders/LSTM - MUST match embedding dimensions (256D)
     lstm_layers: int = 2
     lstm_dropout: float = 0.2
     attention_heads: int = 4
