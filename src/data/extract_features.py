@@ -40,10 +40,7 @@ try:
 except ImportError:
     raise ImportError("'huggingface_hub' required: pip install huggingface_hub")
 
-try:
-    from sklearn.preprocessing import RobustScaler
-except ImportError:
-    raise ImportError("'scikit-learn' required: pip install scikit-learn")
+# Scalers removed - will be applied during training in Kaggle, not during extraction
 
 try:
     from kaggle.api.kaggle_api_extended import KaggleApi
@@ -391,20 +388,36 @@ def main(args):
             logger.info(f"Image extraction took {format_duration(elapsed)}")
             print(f"[PROGRESS] Image extraction complete ({format_duration(elapsed)})")
         
-        # Scaled target scores
-        target_output_path = output_dir / f"target_scores_scaled_{split}.pt"
-        if target_output_path.exists() and not args.force:
-            logger.info(f"✓ Scaled target scores already exist: {target_output_path}")
-            print(f"[PROGRESS] Skipping target scaling (file exists)")
+        # Tabular features (raw, no scaling)
+        tabular_output_path = output_dir / f"tabular_features_{split}.pt"
+        if tabular_output_path.exists() and not args.force:
+            logger.info(f"✓ Tabular features already exist: {tabular_output_path}")
+            print(f"[PROGRESS] Skipping tabular extraction (file exists)")
         else:
             start_time = time.time()
-            extract_and_scale_target_scores(
+            extract_tabular_features(
+                dataset,
+                output_dir,
+                split=split,
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"Tabular extraction took {format_duration(elapsed)}")
+            print(f"[PROGRESS] Tabular extraction complete ({format_duration(elapsed)})")
+        
+        # Target scores (raw, no scaling)
+        target_output_path = output_dir / f"target_scores_{split}.pt"
+        if target_output_path.exists() and not args.force:
+            logger.info(f"✓ Target scores already exist: {target_output_path}")
+            print(f"[PROGRESS] Skipping target extraction (file exists)")
+        else:
+            start_time = time.time()
+            extract_target_scores(
                 dataset,
                 target_output_path,
             )
             elapsed = time.time() - start_time
-            logger.info(f"Target scaling took {format_duration(elapsed)}")
-            print(f"[PROGRESS] Target scaling complete ({format_duration(elapsed)})")
+            logger.info(f"Target extraction took {format_duration(elapsed)}")
+            print(f"[PROGRESS] Target extraction complete ({format_duration(elapsed)})")
         
         sys.stdout.flush()
     
@@ -416,14 +429,17 @@ def main(args):
     for split in splits:
         text_path = output_dir / f"text_embeddings_{split}.pt"
         image_path = output_dir / f"image_embeddings_{split}.pt"
-        target_path = output_dir / f"target_scores_scaled_{split}.pt"
+        tabular_path = output_dir / f"tabular_features_{split}.pt"
+        target_path = output_dir / f"target_scores_{split}.pt"
         
-        if text_path.exists() and image_path.exists() and target_path.exists():
+        if (text_path.exists() and image_path.exists() and 
+            tabular_path.exists() and target_path.exists()):
             text_shape = torch.load(text_path, map_location="cpu").shape
             image_shape = torch.load(image_path, map_location="cpu").shape
+            tabular_shape = torch.load(tabular_path, map_location="cpu").shape
             target_shape = torch.load(target_path, map_location="cpu").shape
-            logger.info(f"✓ {split}: text {text_shape}, image {image_shape}, target {target_shape}")
-            print(f"[PROGRESS] ✓ {split}: text {text_shape}, image {image_shape}, target {target_shape}")
+            logger.info(f"✓ {split}: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
+            print(f"[PROGRESS] ✓ {split}: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
         else:
             logger.warning(f"✗ {split}: Missing files")
             print(f"[PROGRESS] ✗ {split}: Missing files")
@@ -432,37 +448,92 @@ def main(args):
     sys.stdout.flush()
 
 
-def extract_and_scale_target_scores(
+def extract_target_scores(
     dataset,
     output_path: Path,
 ) -> None:
     """
-    Extract and scale target_score using RobustScaler. Save to disk.
+    Extract RAW target_score (no scaling). Save to disk.
+    Scaling will be done during training on Kaggle.
     
     Args:
         dataset: HuggingFace Dataset with target_score column
-        output_path: Path to save scaled target scores
+        output_path: Path to save raw target scores
     """
-    logger.info(f"Extracting and scaling target_score ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting and scaling target_score...")
+    logger.info(f"Extracting target_score ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting target_score (RAW, no scaling)...")
     sys.stdout.flush()
     
-    # Extract target scores
-    target_scores = np.array(dataset["target_score"], dtype=np.float32).reshape(-1, 1)
+    # Extract target scores (raw, no scaling)
+    target_scores = np.array(dataset["target_score"], dtype=np.float32)
     logger.info(f"Target scores shape: {target_scores.shape}")
-    logger.info(f"Target scores range: [{target_scores.min():.4f}, {target_scores.max():.4f}]")
+    logger.info(f"Target scores range (RAW): [{target_scores.min():.4f}, {target_scores.max():.4f}]")
     
-    # Apply RobustScaler
-    scaler = RobustScaler()
-    scaled_targets = scaler.fit_transform(target_scores).squeeze()  # (total_samples,)
-    
-    # Save scaled targets
-    target_tensor = torch.tensor(scaled_targets, dtype=torch.float32)
+    # Save raw targets
+    target_tensor = torch.tensor(target_scores, dtype=torch.float32)
     torch.save(target_tensor, output_path)
-    logger.info(f"✓ Saved scaled target scores to {output_path}")
-    logger.info(f"Scaled target scores range: [{scaled_targets.min():.4f}, {scaled_targets.max():.4f}]")
-    print(f"[PROGRESS] ✓ Target scores scaled and saved ({target_tensor.shape})")
+    logger.info(f"✓ Saved raw target scores to {output_path}")
+    print(f"[PROGRESS] ✓ Target scores extracted and saved ({target_tensor.shape})")
     sys.stdout.flush()
+
+
+def extract_tabular_features(
+    dataset,
+    output_dir: Path,
+    split: str = "train",
+) -> None:
+    """
+    Extract RAW 7 tabular features (no scaling). Scaling will be done during training.
+    
+    Features:
+    1. return_1h: Price return in 1 hour
+    2. volume: Trading volume
+    3. funding_rate: Futures funding rate
+    4. fear_greed_value: Fear & Greed Index
+    5. gdelt_econ_volume: News volume (economic)
+    6. gdelt_econ_tone: News tone (economic)
+    7. gdelt_conflict_volume: News volume (conflict)
+    
+    Args:
+        dataset: HuggingFace Dataset with tabular columns
+        output_dir: Directory to save raw features
+        split: "train", "validation", or "test_in_domain"
+    """
+    logger.info(f"Extracting tabular features ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting tabular features (RAW, no scaling)...")
+    sys.stdout.flush()
+    
+    # Extract 7 tabular features
+    tabular_features = []
+    feature_names = [
+        "return_1h",
+        "volume",
+        "funding_rate",
+        "fear_greed_value",
+        "gdelt_econ_volume",
+        "gdelt_econ_tone",
+        "gdelt_conflict_volume",
+    ]
+    
+    for feature_name in feature_names:
+        feature_values = np.array(dataset[feature_name], dtype=np.float32)
+        tabular_features.append(feature_values)
+    
+    # Stack into (total_samples, 7) array
+    tabular_array = np.stack(tabular_features, axis=1).astype(np.float32)
+    logger.info(f"Tabular array shape: {tabular_array.shape}")
+    logger.info(f"Feature ranges (RAW):")
+    for i, name in enumerate(feature_names):
+        logger.info(f"  {name}: [{tabular_array[:, i].min():.4f}, {tabular_array[:, i].max():.4f}]")
+    
+    # Save raw tabular features
+    output_path = output_dir / f"tabular_features_{split}.pt"
+    tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
+    torch.save(tabular_tensor, output_path)
+    logger.info(f"✓ Saved raw tabular features to {output_path}")
+    print(f"[PROGRESS] ✓ Tabular features extracted and saved ({tabular_tensor.shape})")
+    sys.stdout.flush()
+
 
 
 def push_features_to_hf(

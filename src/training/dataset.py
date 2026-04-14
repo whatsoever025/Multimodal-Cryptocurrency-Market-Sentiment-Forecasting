@@ -1,7 +1,8 @@
 """
-Offline Feature Dataset
+Simplified Offline Feature Dataset
 
-Loads pre-extracted text and image embeddings from disk, applies safe sliding window logic.
+Loads ALL data (embeddings + tabular + targets) from pre-extracted Kaggle files.
+No HuggingFace dataset loading. All data is pre-scaled with proper scalers.
 
 CRITICAL: Safe sliding window logic prevents IndexError at dataset boundaries.
 - __len__() returns total_samples - seq_len (to guarantee idx + seq_len exists)
@@ -17,21 +18,6 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
 
-try:
-    from datasets import load_dataset, concatenate_datasets
-except ImportError:
-    raise ImportError("'datasets' package required: pip install datasets")
-
-try:
-    from huggingface_hub import hf_hub_download
-except ImportError:
-    raise ImportError("'huggingface_hub' required: pip install huggingface_hub")
-
-try:
-    from sklearn.preprocessing import StandardScaler
-except ImportError:
-    raise ImportError("'scikit-learn' package required: pip install scikit-learn")
-
 from tqdm import tqdm
 from .utils import format_duration
 
@@ -40,104 +26,75 @@ logger = logging.getLogger(__name__)
 
 class CryptoMultimodalDataset(torch.utils.data.Dataset):
     """
-    Offline multimodal dataset using pre-extracted embeddings.
+    Simplified offline multimodal dataset using pre-extracted and pre-scaled data.
     
-    Loads frozen FinBERT text embeddings and ResNet50 image embeddings from disk.
-    Applies safe sliding window on tabular, text, and image sequences.
+    Loads:
+    - Text embeddings (256-dim, pre-extracted by FinBERT)
+    - Image embeddings (256-dim, pre-extracted by ResNet50)
+    - Tabular features (7 columns, pre-scaled by StandardScaler)
+    - Target scores (pre-scaled by RobustScaler)
+    
+    All data is loaded from Kaggle .pt files. NO HuggingFace dataset loading.
+    All scaling is already done during extraction. NO scaling in training.
+    
+    CRITICAL: Data structure:
+    - text_embeddings: (total_samples, 256)
+    - image_embeddings: (total_samples, 256)
+    - tabular_features: (total_samples, 7) ← pre-scaled by StandardScaler
+    - target_scores: (total_samples,) ← pre-scaled by RobustScaler
     
     Example:
         dataset = CryptoMultimodalDataset(
-            asset="BTC",
             split="train",
             seq_len=24,
-            features_dir="/path/to/features"
+            features_dir="/path/to/kaggle/features"
         )
         sample = dataset[0]
-        # sample["tabular"]: (24, 7)
+        # sample["tabular"]: (24, 7) ← already scaled
         # sample["text_embedding"]: (24, 256)
         # sample["image_embedding"]: (24, 256)
-        # sample["target"]: scalar
+        # sample["target"]: scalar ← already scaled
     """
     
     def __init__(
         self,
-        asset: str = "MULTI",
         split: str = "train",
         seq_len: int = 24,
-        hf_features_repo_id: str = None,
         features_dir: str = None,
         debug: bool = False,
-        scaler: Optional['StandardScaler'] = None,
     ):
         """
-        Initialize offline dataset.
+        Initialize simplified offline dataset.
         
         Args:
-            asset: "BTC", "ETH", or "MULTI" (BTC+ETH)
             split: "train", "validation", or "test_in_domain"
             seq_len: Sliding window length (hours)
-            hf_features_repo_id: HF repo ID for pre-extracted embeddings (e.g., username/crypto-features)
-            features_dir: Local directory containing embeddings (used if hf_features_repo_id not provided)
+            features_dir: Local directory containing pre-extracted Kaggle features
             debug: If True, load only 100 samples for testing
-            scaler: Pre-fitted StandardScaler (prevents data leakage). If provided, this dataset will NOT fit a new scaler.
-                   CRITICAL: Only fit on training split, then pass to val/test!
         
-        Note: Either hf_features_repo_id or features_dir must be provided (HF takes precedence)
+        Note: features_dir should contain:
+            - text_embeddings_{split}.pt
+            - image_embeddings_{split}.pt
+            - tabular_features_scaled_{split}.pt
+            - target_scores_scaled_{split}.pt
         """
-        self.asset = asset
         self.split = split
         self.seq_len = seq_len
-        self.hf_features_repo_id = hf_features_repo_id
         self.features_dir = Path(features_dir) if features_dir else None
         self.debug = debug
-        self.scaler = scaler  # Pre-fitted scaler (prevents data leakage)
         
-        # Validate: must have either HF repo or local directory
-        if not hf_features_repo_id and not features_dir:
-            raise ValueError(
-                "Must provide either hf_features_repo_id or features_dir. "
-                "Example: hf_features_repo_id='username/crypto-features'"
-            )
+        # Validate: must have features directory
+        if not self.features_dir:
+            raise ValueError("Must provide features_dir with pre-extracted Kaggle features")
+        
+        if not self.features_dir.exists():
+            raise FileNotFoundError(f"Features directory not found: {self.features_dir}")
         
         logger.info(
             f"Initializing CryptoMultimodalDataset\n"
-            f"  Asset: {asset}, Split: {split}, Seq Len: {seq_len}"
+            f"  Split: {split}, Seq Len: {seq_len}"
         )
-        print(f"[PROGRESS] Loading dataset ({asset}/{split})...")
-        sys.stdout.flush()
-        
-        # ==================== LOAD DATASET METADATA ====================
-        logger.info("Loading dataset metadata from HuggingFace...")
-        print("[PROGRESS] Loading dataset metadata...")
-        sys.stdout.flush()
-        
-        start_time = time.time()
-        
-        # Load both BTC and ETH, then concatenate
-        try:
-            btc_dataset = load_dataset(
-                "khanh252004/multimodal_crypto_sentiment_btc",
-                split=split,
-                cache_dir="/tmp/huggingface_cache",
-            )
-            eth_dataset = load_dataset(
-                "khanh252004/multimodal_crypto_sentiment_eth",
-                split=split,
-                cache_dir="/tmp/huggingface_cache",
-            )
-            
-            self.dataset = concatenate_datasets([btc_dataset, eth_dataset])
-        except Exception as e:
-            logger.error(f"Failed to load dataset: {e}")
-            raise
-        
-        if debug:
-            self.dataset = self.dataset.select(range(min(100, len(self.dataset))))
-        
-        self.total_samples = len(self.dataset)
-        dataset_time = time.time() - start_time
-        logger.info(f"✓ Loaded {self.total_samples} samples in {format_duration(dataset_time)}")
-        print(f"[PROGRESS] ✓ Dataset loaded ({self.total_samples} samples)")
+        print(f"[PROGRESS] Loading dataset ({split})...")
         sys.stdout.flush()
         
         # ==================== LOAD PRE-EXTRACTED EMBEDDINGS ====================
@@ -146,19 +103,22 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         sys.stdout.flush()
         
         embed_start = time.time()
-        
-        if self.hf_features_repo_id:
-            # Load from Hugging Face
-            logger.info(f"Downloading embeddings from {self.hf_features_repo_id}...")
-            self._load_embeddings_from_hf(split)
-        else:
-            # Load from local disk
-            logger.info(f"Loading embeddings from {self.features_dir}...")
-            self._load_embeddings_from_disk(split)
-        
+        self._load_embeddings_from_disk(split)
         embed_time = time.time() - embed_start
         logger.info(f"✓ Embeddings loaded in {format_duration(embed_time)}")
         print(f"[PROGRESS] ✓ Embeddings loaded ({format_duration(embed_time)})")
+        sys.stdout.flush()
+        
+        # ==================== LOAD PRE-SCALED TABULAR FEATURES ====================
+        logger.info("Loading pre-scaled tabular features...")
+        print("[PROGRESS] Loading pre-scaled tabular features...")
+        sys.stdout.flush()
+        
+        tabular_start = time.time()
+        self._load_tabular_and_targets(split)
+        tabular_time = time.time() - tabular_start
+        logger.info(f"✓ Tabular features and targets loaded in {format_duration(tabular_time)}")
+        print(f"[PROGRESS] ✓ Tabular features and targets loaded")
         sys.stdout.flush()
         
         # ==================== SAFE SLIDING WINDOW ====================
@@ -175,29 +135,10 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             f"(indices 0 to {self.max_valid_idx - 1})"
         )
         
-        # ==================== EXTRACT & PRE-SCALE ALL TABULAR FEATURES ====================
-        logger.info("Extracting and pre-scaling all tabular features...")
-        print("[PROGRESS] Extracting and pre-scaling all tabular features...")
-        sys.stdout.flush()
-        
-        tabular_start = time.time()
-        if self.scaler is None:
-            # TRAINING SPLIT: Fit a new scaler
-            logger.info(f"[FIT MODE] Fitting scaler on {self.split} split (data leakage prevention)")
-            self._extract_fit_and_scale_all_tabular(fit_scaler=True)
-        else:
-            # VALIDATION/TEST SPLITS: Use pre-fitted scaler
-            logger.info(f"[TRANSFORM MODE] Using pre-fitted scaler on {self.split} split (no fitting)")
-            self._extract_fit_and_scale_all_tabular(fit_scaler=False)
-        tabular_time = time.time() - tabular_start
-        logger.info(f"✓ All tabular features pre-scaled in {format_duration(tabular_time)}")
-        print(f"[PROGRESS] ✓ All tabular features pre-scaled")
-        sys.stdout.flush()
-        
         logger.info(f"✓ Dataset ready: {len(self)} valid sequences of length {seq_len}")
     
     def _load_embeddings_from_disk(self, split: str) -> None:
-        """Load embeddings from local disk as contiguous tensors."""
+        """Load pre-extracted embeddings from disk as contiguous tensors."""
         text_embed_path = self.features_dir / f"text_embeddings_{split}.pt"
         image_embed_path = self.features_dir / f"image_embeddings_{split}.pt"
         
@@ -208,159 +149,57 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         
         logger.info(f"Loading text embeddings from {text_embed_path}...")
         text_raw = torch.load(text_embed_path, map_location="cpu")
-        self.text_embeddings = text_raw.contiguous()  # Ensure contiguity for zero-copy slicing
+        self.text_embeddings = text_raw.contiguous()
         logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}, contiguous={self.text_embeddings.is_contiguous()}")
         
         logger.info(f"Loading image embeddings from {image_embed_path}...")
         image_raw = torch.load(image_embed_path, map_location="cpu")
-        self.image_embeddings = image_raw.contiguous()  # Ensure contiguity for zero-copy slicing
+        self.image_embeddings = image_raw.contiguous()
         logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}, contiguous={self.image_embeddings.is_contiguous()}")
         
-        # Validate shapes
-        assert self.text_embeddings.shape[0] == self.total_samples, \
-            f"Text embeddings mismatch: {self.text_embeddings.shape[0]} vs {self.total_samples}"
+        # Store total samples from embeddings shape
+        self.total_samples = self.text_embeddings.shape[0]
+        
+        # Validate shapes match
         assert self.image_embeddings.shape[0] == self.total_samples, \
             f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
     
-    def _load_embeddings_from_hf(self, split: str) -> None:
-        """Download and load embeddings from Hugging Face as contiguous tensors."""
-        import os
+    def _load_tabular_and_targets(self, split: str) -> None:
+        """Load pre-scaled tabular features and target scores from disk."""
+        tabular_path = self.features_dir / f"tabular_features_scaled_{split}.pt"
+        target_path = self.features_dir / f"target_scores_scaled_{split}.pt"
         
-        # Disable symlinks for Kaggle compatibility
-        os.environ['HF_HUB_DISABLE_SYMLINKS'] = '1'
+        if not tabular_path.exists():
+            raise FileNotFoundError(f"Tabular features not found: {tabular_path}")
+        if not target_path.exists():
+            raise FileNotFoundError(f"Target scores not found: {target_path}")
         
-        logger.info(f"Downloading from {self.hf_features_repo_id}...")
+        logger.info(f"Loading tabular features from {tabular_path}...")
+        tabular_raw = torch.load(tabular_path, map_location="cpu")
+        self.tabular_data = tabular_raw.contiguous()
+        logger.info(f"✓ Tabular features: {self.tabular_data.shape}, contiguous={self.tabular_data.is_contiguous()}")
         
-        try:
-            # Download text embeddings
-            text_filename = f"text_embeddings_{split}.pt"
-            logger.info(f"Downloading {text_filename}...")
-            text_path = hf_hub_download(
-                repo_id=self.hf_features_repo_id,
-                filename=text_filename,
-                repo_type="dataset",
-                cache_dir=os.path.expanduser("~/.cache/huggingface/datasets")
-            )
-            text_raw = torch.load(text_path, map_location="cpu")
-            self.text_embeddings = text_raw.contiguous()  # Ensure contiguity
-            logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}, contiguous={self.text_embeddings.is_contiguous()}")
-            
-            # Download image embeddings
-            image_filename = f"image_embeddings_{split}.pt"
-            logger.info(f"Downloading {image_filename}...")
-            image_path = hf_hub_download(
-                repo_id=self.hf_features_repo_id,
-                filename=image_filename,
-                repo_type="dataset",
-                cache_dir=os.path.expanduser("~/.cache/huggingface/datasets")
-            )
-            image_raw = torch.load(image_path, map_location="cpu")
-            self.image_embeddings = image_raw.contiguous()  # Ensure contiguity
-            logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}, contiguous={self.image_embeddings.is_contiguous()}")
-            
-            # Validate shapes
-            assert self.text_embeddings.shape[0] == self.total_samples, \
-                f"Text embeddings mismatch: {self.text_embeddings.shape[0]} vs {self.total_samples}"
-            assert self.image_embeddings.shape[0] == self.total_samples, \
-                f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
+        logger.info(f"Loading target scores from {target_path}...")
+        self.target_scores = torch.load(target_path, map_location="cpu")
+        logger.info(f"✓ Target scores: {self.target_scores.shape}")
         
-        except Exception as e:
-            logger.error(f"Failed to download from HF: {e}", exc_info=True)
-            raise
-    
-    def _extract_fit_and_scale_all_tabular(self, fit_scaler: bool = True):
-        """OPTIMIZED: Extract and scale ALL tabular features once in __init__.
-        
-        CRITICAL DATA LEAKAGE PREVENTION:
-        - If fit_scaler=True (training split): Fit StandardScaler, then transform
-        - If fit_scaler=False (val/test splits): Use pre-fitted scaler, only transform
-        
-        This prevents the validation/test sets from being scaled with different
-        means/stds than the training set (which causes model to see "alien language").
-        
-        CRITICAL PERFORMANCE:
-        - Called ONCE in __init__, never in __getitem__
-        - Iterates through entire dataset split once to collect all 7 tabular features
-        - Creates (total_samples, 7) numpy array
-        - Applies np.log1p ONLY to volume column (index 1)
-        - Fits OR uses pre-fitted StandardScaler (depending on fit_scaler flag)
-        - Transforms all at once (vectorized)
-        - Stores as contiguous torch.float32 tensor self.tabular_data
-        
-        Result: __getitem__ only slices self.tabular_data[idx:idx+seq_len] - O(1) per batch.
-        """
-        logger.info("Extracting all tabular features from dataset...")
-        print("[PROGRESS]   Extracting tabular features...", end="", flush=True)
-        
-        tabular_features_list = []
-        target_scores_list = []
-        
-        # SINGLE PASS: Collect all features once
-        for idx in tqdm(range(self.total_samples), desc="Extracting", unit="samples", leave=False):
-            sample = self.dataset[idx]
-            
-            # Extract 7 tabular features as float32
-            tabular_values = np.array([
-                sample["return_1h"],
-                sample["volume"],
-                sample["funding_rate"],
-                sample["fear_greed_value"],
-                sample["gdelt_econ_volume"],
-                sample["gdelt_econ_tone"],
-                sample["gdelt_conflict_volume"],
-            ], dtype=np.float32)
-            
-            tabular_features_list.append(tabular_values)
-            target_scores_list.append(sample["target_score"])
-        
-        print(" Done!", flush=True)
-        
-        # Stack into (total_samples, 7) numpy array
-        tabular_array = np.stack(tabular_features_list, axis=0)  # Shape: (total_samples, 7)
-        logger.info(f"Stacked tabular array shape: {tabular_array.shape}")
-        
-        # Apply log1p ONLY to volume column (index 1)
-        print("[PROGRESS]   Applying log1p transformation...", flush=True)
-        tabular_array[:, 1] = np.log1p(tabular_array[:, 1])
-        
-        # FIT or USE pre-fitted scaler
-        if fit_scaler:
-            # TRAINING SPLIT: Fit a new scaler
-            print("[PROGRESS]   Fitting StandardScaler on training data...", flush=True)
-            self.scaler = StandardScaler()
-            self.scaler.fit(tabular_array)
-            logger.info(
-                f"StandardScaler FITTED on training data. Means: {self.scaler.mean_}, Stds: {self.scaler.scale_}"
-            )
-        else:
-            # VALIDATION/TEST SPLIT: Use pre-fitted training scaler (NO FITTING)
-            print(f"[PROGRESS]   Using pre-fitted scaler (from training split)...", flush=True)
-            logger.info(
-                f"StandardScaler already fitted. Using training means: {self.scaler.mean_}, stds: {self.scaler.scale_}"
-            )
-        
-        # Transform ALL at once (vectorized operation: O(n) not O(n*seq_len))
-        print("[PROGRESS]   Transforming features...", flush=True)
-        scaled_array = self.scaler.transform(tabular_array)  # Shape: (total_samples, 7)
-        
-        # Convert to torch tensor (float32, contiguous for zero-copy slicing)
-        self.tabular_data = torch.tensor(scaled_array, dtype=torch.float32).contiguous()
-        logger.info(f"✓ Tabular tensor stored: {self.tabular_data.shape}, dtype={self.tabular_data.dtype}, contiguous={self.tabular_data.is_contiguous()}")
-        
-        # Store target scores and timestamps as tensors
-        self.target_scores = torch.tensor(target_scores_list, dtype=torch.float32)
+        # Create timestamps (indices for reference)
         self.timestamps = torch.arange(self.total_samples, dtype=torch.long)
-        logger.info(f"✓ Target scores tensor: {self.target_scores.shape}")
         logger.info(f"✓ Timestamps tensor: {self.timestamps.shape}")
-
+        
+        # Validate shapes match total_samples
+        assert self.tabular_data.shape[0] == self.total_samples, \
+            f"Tabular mismatch: {self.tabular_data.shape[0]} vs {self.total_samples}"
+        assert self.target_scores.shape[0] == self.total_samples, \
+            f"Target mismatch: {self.target_scores.shape[0]} vs {self.total_samples}"
     
     def __len__(self) -> int:
         """
         CRITICAL: Return safe length to prevent IndexError.
         
         Safe formula: total_samples - seq_len
-        Example: 31,133 samples - 24 seq_len = 31,109 valid indices
-        For idx=31,108 (last valid): can fetch target at idx+seq_len=31,132 ✓
+        Example: 62,266 samples - 24 seq_len = 62,242 valid indices
+        For idx=62,241 (last valid): can fetch target at idx+seq_len=62,265 ✓
         """
         return self.max_valid_idx
     
@@ -370,8 +209,8 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         CRITICAL: This method does NOTHING except slice pre-computed tensors.
         - NO dataset iteration
         - NO feature extraction  
-        - NO tensor conversions (torch.tensor() removed)
-        - NO transformations/scalings
+        - NO tensor conversions
+        - NO transformations/scalings (all pre-done)
         - Pure zero-copy view slicing from pre-allocated tensors
         
         Args:
@@ -379,10 +218,10 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         
         Returns:
             Dict with VIEWS (not copies) into pre-computed tensors:
-                - tabular: (seq_len, 7) float32 view - ALREADY SCALED
+                - tabular: (seq_len, 7) float32 view ← ALREADY SCALED
                 - text_embedding: (seq_len, 256) float32 view
                 - image_embedding: (seq_len, 256) float32 view
-                - target: scalar float32 tensor
+                - target: scalar float32 tensor ← ALREADY SCALED
                 - timestamp: scalar int64 tensor
         
         Raises:
@@ -432,7 +271,6 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
 def create_dataloaders(
     config,
     splits: Optional[Tuple[str, str, str]] = ("train", "validation", "test_in_domain"),
-    hf_features_repo_id: str = None,
     features_dir: str = None,
     num_workers: int = 0,  # Always 0 on Kaggle (multi-worker deadlock fix)
     pin_memory: bool = True,
@@ -440,10 +278,7 @@ def create_dataloaders(
     """
     Create DataLoaders for all splits with progress tracking.
     
-    CRITICAL DATA LEAKAGE PREVENTION:
-    - Fit scaler ONLY on training split
-    - Pass fitted scaler to validation/test splits
-    - Ensures all splits use same scaling parameters (training's means/stds)
+    All data is pre-scaled - NO scaling is applied during training.
     
     CRITICAL: DataLoader Optimization
     - num_workers=0: FORCED on Kaggle (multi-worker deadlock issues)
@@ -453,8 +288,7 @@ def create_dataloaders(
     Args:
         config: ExperimentConfig instance
         splits: Tuple of (train_split, val_split, test_split)
-        hf_features_repo_id: HF repo ID for embeddings (takes precedence)
-        features_dir: Local directory with embeddings (fallback)
+        features_dir: Local directory with pre-extracted Kaggle features
         num_workers: Number of data loading workers (IGNORED - always 0 for Kaggle safety)
         pin_memory: Pin memory for faster GPU transfer
     
@@ -465,7 +299,6 @@ def create_dataloaders(
     num_workers = 0
     
     dataloaders = {}
-    train_scaler = None  # Will be set after training dataset is created
     
     overall_start = time.time()
     
@@ -478,19 +311,11 @@ def create_dataloaders(
             
             # Create dataset
             dataset = CryptoMultimodalDataset(
-                asset=config.data.asset,
                 split=split_name,
                 seq_len=config.data.seq_len,
-                hf_features_repo_id=hf_features_repo_id,
                 features_dir=features_dir,
                 debug=config.debug if hasattr(config, "debug") else False,
-                scaler=train_scaler,  # Pass training scaler to val/test (prevents leakage)
             )
-            
-            # After training dataset is created, save its scaler for val/test
-            if split_name == "train":
-                train_scaler = dataset.scaler  # Extract fitted scaler from training dataset
-                logger.info(f"✓ Training scaler extracted for use on validation/test splits")
             
             # Create dataloader
             dataloader = torch.utils.data.DataLoader(
@@ -527,16 +352,16 @@ if __name__ == "__main__":
     config = ExperimentConfig(debug=True)
     
     print("=" * 80)
-    print("Testing CryptoMultimodalDataset")
+    print("Testing CryptoMultimodalDataset (Simplified)")
     print("=" * 80)
     
     # Test dataset initialization
     print("\n1. Loading dataset...")
     try:
         dataset = CryptoMultimodalDataset(
-            asset=config.data.asset,
             split="train",
             seq_len=config.data.seq_len,
+            features_dir="./data/features",
             debug=True,
         )
         print(f"   ✓ Dataset loaded")
@@ -544,7 +369,7 @@ if __name__ == "__main__":
         print(f"   Total samples in split: {dataset.total_samples}")
         print(f"   Max valid index: {dataset.max_valid_idx}")
     except FileNotFoundError as e:
-        print(f"   ⚠ Skipping dataset test (embeddings not found): {e}")
+        print(f"   ⚠ Skipping dataset test (features not found): {e}")
     except Exception as e:
         print(f"   ✗ Error: {e}")
         import traceback

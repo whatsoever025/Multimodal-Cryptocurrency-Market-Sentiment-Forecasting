@@ -592,8 +592,7 @@ def main(args):
     try:
         dataloaders = create_dataloaders(
             config,
-            hf_features_repo_id=args.hf_features_repo,
-            features_dir=args.features_dir if not args.hf_features_repo else None,
+            features_dir=args.features_dir,
             num_workers=0  # CRITICAL: Always 0 on Kaggle
         )
         print("[PROGRESS] ✓ All datasets loaded successfully!")
@@ -606,9 +605,6 @@ def main(args):
     train_loader = dataloaders["train"]
     val_loader = dataloaders["validation"]
     test_loader = dataloaders["test_in_domain"]  # Load test dataloader for final evaluation
-    
-    # Set total steps for scheduler
-    config.training.num_training_steps = len(train_loader) * config.training.max_epochs // config.training.accumulate_steps
     
     # Initialize model
     logger.info("\n" + "-" * 80)
@@ -951,8 +947,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train multimodal crypto sentiment model")
     parser.add_argument("--asset", choices=["MULTI"], default="MULTI", help="Cryptocurrency asset (multi-asset: BTC+ETH combined)")
-    parser.add_argument("--hf-features-repo", type=str, default=None, help="HF repo ID for pre-extracted embeddings (e.g., username/crypto-features)")
-    parser.add_argument("--features-dir", type=str, default="./data/features", help="Local path to extracted embeddings (fallback if --hf-features-repo not provided)")
+    parser.add_argument("--features-dir", type=str, default="./data/features", help="Local path to pre-extracted Kaggle features (contains text_embeddings_*.pt, image_embeddings_*.pt, tabular_features_scaled_*.pt, target_scores_scaled_*.pt)")
     parser.add_argument("--run-name", type=str, default=None, help="W&B run name")
     parser.add_argument("--config", type=str, default=None, help="Config file path (YAML)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
