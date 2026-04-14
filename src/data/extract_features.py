@@ -51,28 +51,10 @@ except ImportError:
     raise ImportError("'kaggle' required: pip install kaggle")
 
 from tqdm import tqdm
+from ..training.utils import setup_logging, format_duration
 
 
 logger = logging.getLogger(__name__)
-
-
-def setup_logging(level=logging.INFO) -> None:
-    """Configure logging."""
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-
-def format_duration(seconds: float) -> str:
-    """Format duration in seconds to human-readable string."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    elif seconds < 3600:
-        return f"{seconds/60:.1f}m"
-    else:
-        return f"{seconds/3600:.1f}h"
 
 
 class FrozenTextEncoder(nn.Module):

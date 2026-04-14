@@ -33,18 +33,9 @@ except ImportError:
     raise ImportError("'scikit-learn' package required: pip install scikit-learn")
 
 from tqdm import tqdm
+from .utils import format_duration
 
 logger = logging.getLogger(__name__)
-
-
-def format_duration(seconds: float) -> str:
-    """Format duration in seconds to human-readable string."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    elif seconds < 3600:
-        return f"{seconds/60:.1f}m"
-    else:
-        return f"{seconds/3600:.1f}h"
 
 
 class CryptoMultimodalDataset(torch.utils.data.Dataset):
@@ -455,7 +446,8 @@ def create_dataloaders(
     - Ensures all splits use same scaling parameters (training's means/stds)
     
     CRITICAL: DataLoader Optimization
-    - num_workers=0: Forced on Kaggle (multi-worker deadlock issues)
+    - num_workers=0: FORCED on Kaggle (multi-worker deadlock issues)
+      Even if config.data.num_workers is set to 4, we override to 0
     - pin_memory=True: Transfer data to GPU via pinned memory (faster)
     
     Args:
@@ -463,12 +455,15 @@ def create_dataloaders(
         splits: Tuple of (train_split, val_split, test_split)
         hf_features_repo_id: HF repo ID for embeddings (takes precedence)
         features_dir: Local directory with embeddings (fallback)
-        num_workers: Number of data loading workers (0 for Kaggle safety)
+        num_workers: Number of data loading workers (IGNORED - always 0 for Kaggle safety)
         pin_memory: Pin memory for faster GPU transfer
     
     Returns:
         Dict with keys "train", "validation", "test" and DataLoader values
     """
+    # CRITICAL: Force num_workers=0 regardless of parameter or config
+    num_workers = 0
+    
     dataloaders = {}
     train_scaler = None  # Will be set after training dataset is created
     
@@ -476,7 +471,7 @@ def create_dataloaders(
     
     with tqdm(total=len(splits), desc="Creating DataLoaders", unit="split") as progress:
         for split_idx, split_name in enumerate(splits, 1):
-            print(f"\n[PROGRESS] Creating DataLoader for {split_name}...")
+            print(f"\n[PROGRESS] Creating DataLoader for {split_name} (num_workers=0, pin_memory={pin_memory})...")
             sys.stdout.flush()
             
             split_start = time.time()

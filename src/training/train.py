@@ -39,9 +39,32 @@ except ImportError:
 from .config import ExperimentConfig, create_config
 from .dataset import CryptoMultimodalDataset, multimodal_collate_fn, create_dataloaders
 from .model import MultimodalFusionNet
+from .utils import setup_logging, format_duration
 
 
 logger = logging.getLogger(__name__)
+
+
+def safe_wandb_log(log_dict: Dict, commit: bool = True) -> bool:
+    """
+    Safely log to W&B with comprehensive error handling.
+    
+    Args:
+        log_dict: Dictionary of metrics to log
+        commit: Whether to commit the log
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if wandb is None or wandb.run is None:
+        return False
+    
+    try:
+        wandb.log(log_dict, commit=commit)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to log to W&B: {e}")
+        return False
 
 
 class Trainer:
@@ -272,7 +295,7 @@ class Trainer:
                             log_dict["gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
                             log_dict["gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
                         
-                        wandb.log(log_dict)
+                        safe_wandb_log(log_dict)
             
             # Accumulate loss for epoch average
             total_loss += loss.item() * self.config.training.accumulate_steps
@@ -516,15 +539,6 @@ class Trainer:
             for old_ckpt in periodic_checkpoints[:-keep_last_n]:
                 old_ckpt.unlink()
                 logger.info(f"  Deleted old checkpoint: {old_ckpt.name}")
-
-
-def setup_logging(level=logging.INFO) -> None:
-    """Configure logging."""
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
 
 def main(args):
