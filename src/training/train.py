@@ -19,6 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+import numpy as np
 import logging
 import json
 import argparse
@@ -77,6 +78,7 @@ class Trainer:
         self.best_epoch = 0
         self.train_losses = []
         self.val_losses = []
+        self.val_metrics_history = []  # Store all validation metrics for comparison
         
         logger.info(f"Trainer initialized (device={device})")
     
@@ -131,11 +133,11 @@ class Trainer:
             logger.info("Scheduler: None (constant LR)")
         logger.info("Pure float32 training (no AMP)")
     
-    def train_epoch(self, train_loader: DataLoader) -> float:
+    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         """
         Run one training epoch with gradient accumulation and explicit gradient clipping.
         Pure float32 implementation (no AMP) for numerical stability.
-        Includes batch-level tqdm progress bar with moving loss average.
+        Collects predictions for comprehensive metric computation.
         
         ============================================================================
         TRAINING LOOP STRUCTURE (Pure Float32 + tqdm)
@@ -170,11 +172,17 @@ class Trainer:
             train_loader: Training DataLoader
         
         Returns:
-            Average training loss
+            Dict with keys: 'loss', 'mse', 'mae', 'rmse', 'r2', 'correlation',
+                          'prediction_error_mean', 'prediction_error_std',
+                          'predictions', 'targets'
         """
         self.model.train()
         total_loss = 0.0
         num_steps = 0
+        
+        # Collect predictions for comprehensive metrics
+        all_predictions = []
+        all_targets = []
         
         # Wrap DataLoader with tqdm for batch-level progress visibility
         pbar = tqdm(
@@ -193,6 +201,10 @@ class Trainer:
             # Standard PyTorch forward pass - all tensors remain float32
             predictions = self.model(batch)  # (batch, 1) shape
             targets = batch["target"].unsqueeze(1)  # (batch, 1) shape
+            
+            # Collect for epoch-level metrics
+            all_predictions.append(predictions.detach().cpu())
+            all_targets.append(targets.detach().cpu())
             
             # Compute MSE loss
             loss = nn.MSELoss()(predictions, targets)
@@ -249,7 +261,7 @@ class Trainer:
                     
                     if wandb is not None and wandb.run is not None:
                         wandb.log({
-                            "train_loss": loss.item(),
+                            "train_step_loss": loss.item(),
                             "learning_rate": current_lr,
                             "global_step": self.global_step,
                         })
@@ -272,24 +284,85 @@ class Trainer:
         avg_loss = total_loss / num_steps
         self.train_losses.append(avg_loss)
         
-        logger.info(f"Epoch {self.epoch+1} completed | Avg Loss: {avg_loss:.6f}")
+        # Compute comprehensive metrics from collected predictions
+        all_predictions = torch.cat(all_predictions, dim=0).squeeze()  # (total_samples,)
+        all_targets = torch.cat(all_targets, dim=0).squeeze()  # (total_samples,)
         
-        return avg_loss
+        # MSE, MAE, RMSE
+        mse = torch.mean((all_predictions - all_targets) ** 2).item()
+        mae = torch.mean(torch.abs(all_predictions - all_targets)).item()
+        rmse = np.sqrt(mse)
+        
+        # R² Score
+        ss_res = torch.sum((all_predictions - all_targets) ** 2).item()
+        ss_tot = torch.sum((all_targets - all_targets.mean()) ** 2).item()
+        r2_score = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        
+        # Correlation
+        pred_mean = all_predictions.mean()
+        target_mean = all_targets.mean()
+        numerator = torch.sum((all_predictions - pred_mean) * (all_targets - target_mean))
+        denom = torch.sqrt(
+            torch.sum((all_predictions - pred_mean) ** 2) * torch.sum((all_targets - target_mean) ** 2)
+        )
+        correlation = (numerator / denom).item() if denom > 0 else 0.0
+        
+        # Prediction error analysis
+        prediction_errors = all_predictions - all_targets
+        prediction_error_mean = prediction_errors.mean().item()
+        prediction_error_std = prediction_errors.std().item()
+        
+        # Min/Max ranges
+        pred_min, pred_max = all_predictions.min().item(), all_predictions.max().item()
+        target_min, target_max = all_targets.min().item(), all_targets.max().item()
+        
+        logger.info(
+            f"Epoch {self.epoch+1} completed | Avg Loss: {avg_loss:.6f} | MSE: {mse:.6f} | "
+            f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | R²: {r2_score:.6f}"
+        )
+        
+        return {
+            "loss": avg_loss,
+            "mse": mse,
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2_score,
+            "correlation": correlation,
+            "prediction_error_mean": prediction_error_mean,
+            "prediction_error_std": prediction_error_std,
+            "pred_min": pred_min,
+            "pred_max": pred_max,
+            "target_min": target_min,
+            "target_max": target_max,
+            "predictions": all_predictions,
+            "targets": all_targets,
+        }
     
-    def validate(self, val_loader: DataLoader) -> Tuple[float, float]:
+    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """
-        Run validation (pure float32, no AMP).
+        Run validation (pure float32, no AMP) with comprehensive metrics collection.
+        
+        Collects predictions and targets for:
+        - Standard metrics: MSE, MAE, RMSE
+        - Statistical metrics: R², correlation, prediction bias, error std
+        - Ground truth vs prediction logging
         
         Args:
             val_loader: Validation DataLoader
         
         Returns:
-            (mse_loss, mae_loss)
+            Dict with keys: 'mse', 'mae', 'rmse', 'r2', 'correlation', 
+                          'prediction_error_mean', 'prediction_error_std',
+                          'predictions', 'targets'
         """
         self.model.eval()
         total_mse = 0.0
         total_mae = 0.0
         num_steps = 0
+        
+        # Collect all predictions and targets for post-hoc analysis
+        all_predictions = []
+        all_targets = []
         
         with torch.no_grad():
             for batch in val_loader:
@@ -307,12 +380,61 @@ class Trainer:
                 total_mse += mse.item()
                 total_mae += mae.item()
                 num_steps += 1
+                
+                # Collect for global metrics
+                all_predictions.append(predictions.cpu())
+                all_targets.append(targets.cpu())
         
+        # Compute per-batch averages
         avg_mse = total_mse / num_steps
         avg_mae = total_mae / num_steps
         self.val_losses.append(avg_mse)
         
-        return avg_mse, avg_mae
+        # Concatenate all predictions and targets
+        all_predictions = torch.cat(all_predictions, dim=0).squeeze()  # (total_samples,)
+        all_targets = torch.cat(all_targets, dim=0).squeeze()  # (total_samples,)
+        
+        # Compute additional metrics
+        rmse = torch.sqrt(torch.tensor(avg_mse)).item()
+        
+        # R² Score: 1 - (SS_res / SS_tot)
+        ss_res = torch.sum((all_predictions - all_targets) ** 2).item()
+        ss_tot = torch.sum((all_targets - all_targets.mean()) ** 2).item()
+        r2_score = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+        
+        # Correlation coefficient between predictions and targets
+        pred_mean = all_predictions.mean()
+        target_mean = all_targets.mean()
+        numerator = torch.sum((all_predictions - pred_mean) * (all_targets - target_mean))
+        denom = torch.sqrt(
+            torch.sum((all_predictions - pred_mean) ** 2) * torch.sum((all_targets - target_mean) ** 2)
+        )
+        correlation = (numerator / denom).item() if denom > 0 else 0.0
+        
+        # Prediction error analysis (bias and std)
+        prediction_errors = all_predictions - all_targets
+        prediction_error_mean = prediction_errors.mean().item()  # Bias
+        prediction_error_std = prediction_errors.std().item()  # Prediction spread
+        
+        # Min/Max of predictions and targets (for range checking)
+        pred_min, pred_max = all_predictions.min().item(), all_predictions.max().item()
+        target_min, target_max = all_targets.min().item(), all_targets.max().item()
+        
+        return {
+            "mse": avg_mse,
+            "mae": avg_mae,
+            "rmse": rmse,
+            "r2": r2_score,
+            "correlation": correlation,
+            "prediction_error_mean": prediction_error_mean,
+            "prediction_error_std": prediction_error_std,
+            "pred_min": pred_min,
+            "pred_max": pred_max,
+            "target_min": target_min,
+            "target_max": target_max,
+            "predictions": all_predictions,
+            "targets": all_targets,
+        }
     
     def save_checkpoint(self, path: Path, is_best: bool = False) -> None:
         """
@@ -459,6 +581,7 @@ def main(args):
         raise
     train_loader = dataloaders["train"]
     val_loader = dataloaders["validation"]
+    test_loader = dataloaders["test_in_domain"]  # Load test dataloader for final evaluation
     
     # Set total steps for scheduler
     config.training.num_training_steps = len(train_loader) * config.training.max_epochs // config.training.accumulate_steps
@@ -517,22 +640,127 @@ def main(args):
         trainer.epoch = epoch
         
         # Train
-        train_loss = trainer.train_epoch(train_loader)
-        logger.info(f"Epoch {epoch+1:3d} | Train Loss {train_loss:.6f}")
+        train_metrics = trainer.train_epoch(train_loader)
+        train_loss = train_metrics["loss"]
+        logger.info(
+            f"Epoch {epoch+1:3d} | "
+            f"Train Loss {train_loss:.6f} | "
+            f"Train MSE {train_metrics['mse']:.6f} | "
+            f"Train RMSE {train_metrics['rmse']:.6f} | "
+            f"Train MAE {train_metrics['mae']:.6f} | "
+            f"Train R² {train_metrics['r2']:.6f}"
+        )
+        
+        # Log training metrics to W&B
+        if wandb is not None and wandb.run is not None:
+            # Core training metrics
+            wandb_train_dict = {
+                "epoch": epoch + 1,
+                "train_loss": train_metrics["loss"],
+                "train_mse": train_metrics["mse"],
+                "train_mae": train_metrics["mae"],
+                "train_rmse": train_metrics["rmse"],
+                "train_r2": train_metrics["r2"],
+                "train_correlation": train_metrics["correlation"],
+                "train_prediction_bias": train_metrics["prediction_error_mean"],
+                "train_prediction_error_std": train_metrics["prediction_error_std"],
+                "train_pred_min": train_metrics["pred_min"],
+                "train_pred_max": train_metrics["pred_max"],
+                "train_target_min": train_metrics["target_min"],
+                "train_target_max": train_metrics["target_max"],
+            }
+            
+            # Create visualizations for training data
+            predictions = train_metrics["predictions"].numpy()
+            targets = train_metrics["targets"].numpy()
+            
+            # Scatter plot (first 500 samples for efficiency)
+            plot_limit = min(500, len(predictions))
+            wandb_plot = wandb.plot.scatter(
+                wandb.Table(data=[
+                    [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                ], columns=["Ground Truth", "Prediction"]),
+                "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
+            )
+            wandb_train_dict["train_predictions_scatter"] = wandb_plot
+            
+            # Error histogram
+            errors = predictions - targets
+            wandb_train_dict["train_prediction_error_histogram"] = wandb.Histogram(errors)
+            
+            # Sample predictions table (first 100)
+            sample_limit = min(100, len(predictions))
+            table_data = [
+                [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
+                for i in range(sample_limit)
+            ]
+            wandb_train_dict["train_predictions_table"] = wandb.Table(
+                data=table_data,
+                columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+            )
+            
+            wandb.log(wandb_train_dict, step=epoch)  # Log with epoch step for alignment
         
         # Validate
         if (epoch + 1) % config.mlops.eval_frequency == 0:
-            val_mse, val_mae = trainer.validate(val_loader)
-            logger.info(f"Epoch {epoch+1:3d} | Val MSE {val_mse:.6f} | Val MAE {val_mae:.6f}")
+            val_metrics = trainer.validate(val_loader)
+            val_mse = val_metrics["mse"]
+            logger.info(
+                f"Epoch {epoch+1:3d} | "
+                f"Val MSE {val_mse:.6f} | "
+                f"Val RMSE {val_metrics['rmse']:.6f} | "
+                f"Val MAE {val_metrics['mae']:.6f} | "
+                f"Val R² {val_metrics['r2']:.6f}"
+            )
             
-            # Log to W&B
+            # Log comprehensive metrics to W&B
             if wandb is not None and wandb.run is not None:
-                wandb.log({
+                # Core metrics
+                wandb_log_dict = {
                     "epoch": epoch + 1,
-                    "train_loss": train_loss,
-                    "val_mse": val_mse,
-                    "val_mae": val_mae,
-                })
+                    "val_mse": val_metrics["mse"],
+                    "val_mae": val_metrics["mae"],
+                    "val_rmse": val_metrics["rmse"],
+                    "val_r2": val_metrics["r2"],
+                    "val_correlation": val_metrics["correlation"],
+                    "val_prediction_bias": val_metrics["prediction_error_mean"],
+                    "val_prediction_error_std": val_metrics["prediction_error_std"],
+                    "val_pred_min": val_metrics["pred_min"],
+                    "val_pred_max": val_metrics["pred_max"],
+                    "val_target_min": val_metrics["target_min"],
+                    "val_target_max": val_metrics["target_max"],
+                }
+                
+                # Create prediction error scatter plot (ground truth vs predictions)
+                predictions = val_metrics["predictions"].numpy()
+                targets = val_metrics["targets"].numpy()
+                
+                # Create scatter plot for first 500 samples (memory efficiency)
+                plot_limit = min(500, len(predictions))
+                wandb_plot = wandb.plot.scatter(
+                    wandb.Table(data=[
+                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                    ], columns=["Ground Truth", "Prediction"]),
+                    "Ground Truth", "Prediction", title="[VAL] Predictions vs Ground Truth"
+                )
+                wandb_log_dict["val_predictions_scatter"] = wandb_plot
+                
+                # Create histogram of prediction errors
+                errors = predictions - targets
+                wandb_log_dict["val_prediction_error_histogram"] = wandb.Histogram(errors)
+                
+                # Log actual values as table for samples (first 100 samples for inspection)
+                sample_limit = min(100, len(predictions))
+                table_data = [
+                    [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
+                    for i in range(sample_limit)
+                ]
+                wandb_log_dict["val_predictions_table"] = wandb.Table(
+                    data=table_data,
+                    columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+                )
+                
+                wandb.log(wandb_log_dict, step=epoch)  # Log with epoch step for alignment
             
             # Save best model
             if val_mse < trainer.best_val_loss:
@@ -548,10 +776,79 @@ def main(args):
             trainer.save_checkpoint(periodic_ckpt_path, is_best=False)
             trainer.cleanup_old_checkpoints()
     
+    # ==================== TEST EVALUATION ====================
+    logger.info("\n" + "=" * 80)
+    logger.info("Evaluating on Test Set...")
+    logger.info("=" * 80)
+    
+    test_metrics = trainer.validate(test_loader)
+    test_mse = test_metrics["mse"]
+    
+    logger.info(
+        f"Test Results:\n"
+        f"  MSE:  {test_metrics['mse']:.6f}\n"
+        f"  RMSE: {test_metrics['rmse']:.6f}\n"
+        f"  MAE:  {test_metrics['mae']:.6f}\n"
+        f"  R²:   {test_metrics['r2']:.6f}\n"
+        f"  Correlation: {test_metrics['correlation']:.6f}\n"
+        f"  Prediction Bias: {test_metrics['prediction_error_mean']:.6f}\n"
+        f"  Prediction Error Std: {test_metrics['prediction_error_std']:.6f}"
+    )
+    
+    # Log comprehensive test metrics to W&B
+    if wandb is not None and wandb.run is not None:
+        # Core metrics
+        wandb_test_dict = {
+            "test_mse": test_metrics["mse"],
+            "test_mae": test_metrics["mae"],
+            "test_rmse": test_metrics["rmse"],
+            "test_r2": test_metrics["r2"],
+            "test_correlation": test_metrics["correlation"],
+            "test_prediction_bias": test_metrics["prediction_error_mean"],
+            "test_prediction_error_std": test_metrics["prediction_error_std"],
+            "test_pred_min": test_metrics["pred_min"],
+            "test_pred_max": test_metrics["pred_max"],
+            "test_target_min": test_metrics["target_min"],
+            "test_target_max": test_metrics["target_max"],
+        }
+        
+        # Create prediction error scatter plot (ground truth vs predictions)
+        predictions = test_metrics["predictions"].numpy()
+        targets = test_metrics["targets"].numpy()
+        
+        # Create scatter plot for first 500 samples (memory efficiency)
+        plot_limit = min(500, len(predictions))
+        wandb_plot = wandb.plot.scatter(
+            wandb.Table(data=[
+                [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+            ], columns=["Ground Truth", "Prediction"]),
+            "Ground Truth", "Prediction", title="[TEST] Predictions vs Ground Truth"
+        )
+        wandb_test_dict["test_predictions_scatter"] = wandb_plot
+        
+        # Create histogram of prediction errors
+        errors = predictions - targets
+        wandb_test_dict["test_prediction_error_histogram"] = wandb.Histogram(errors)
+        
+        # Log actual values as table for samples (first 100 samples for inspection)
+        sample_limit = min(100, len(predictions))
+        table_data = [
+            [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
+            for i in range(sample_limit)
+        ]
+        wandb_test_dict["test_predictions_table"] = wandb.Table(
+            data=table_data,
+            columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+        )
+        
+        wandb.log(wandb_test_dict)
+    
     # Final summary
     logger.info("\n" + "=" * 80)
     logger.info("Training Complete!")
     logger.info(f"Best Val Loss: {trainer.best_val_loss:.6f} (Epoch {trainer.best_epoch})")
+    logger.info(f"Test MSE: {test_metrics['mse']:.6f}")
+    logger.info(f"Test R²: {test_metrics['r2']:.6f}")
     logger.info(f"Best Model Checkpoint: {config.mlops.checkpoint_dir / f'{config.mlops.wandb_run_name}_best.pt'}")
     logger.info("=" * 80)
     
