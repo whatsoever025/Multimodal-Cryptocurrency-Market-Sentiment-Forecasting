@@ -76,6 +76,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         hf_features_repo_id: str = None,
         features_dir: str = None,
         debug: bool = False,
+        scaler: Optional['StandardScaler'] = None,
     ):
         """
         Initialize offline dataset.
@@ -87,6 +88,8 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             hf_features_repo_id: HF repo ID for pre-extracted embeddings (e.g., username/crypto-features)
             features_dir: Local directory containing embeddings (used if hf_features_repo_id not provided)
             debug: If True, load only 100 samples for testing
+            scaler: Pre-fitted StandardScaler (prevents data leakage). If provided, this dataset will NOT fit a new scaler.
+                   CRITICAL: Only fit on training split, then pass to val/test!
         
         Note: Either hf_features_repo_id or features_dir must be provided (HF takes precedence)
         """
@@ -96,6 +99,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         self.hf_features_repo_id = hf_features_repo_id
         self.features_dir = Path(features_dir) if features_dir else None
         self.debug = debug
+        self.scaler = scaler  # Pre-fitted scaler (prevents data leakage)
         
         # Validate: must have either HF repo or local directory
         if not hf_features_repo_id and not features_dir:
@@ -186,7 +190,14 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         sys.stdout.flush()
         
         tabular_start = time.time()
-        self._extract_and_scale_all_tabular()
+        if self.scaler is None:
+            # TRAINING SPLIT: Fit a new scaler
+            logger.info(f"[FIT MODE] Fitting scaler on {self.split} split (data leakage prevention)")
+            self._extract_fit_and_scale_all_tabular(fit_scaler=True)
+        else:
+            # VALIDATION/TEST SPLITS: Use pre-fitted scaler
+            logger.info(f"[TRANSFORM MODE] Using pre-fitted scaler on {self.split} split (no fitting)")
+            self._extract_fit_and_scale_all_tabular(fit_scaler=False)
         tabular_time = time.time() - tabular_start
         logger.info(f"✓ All tabular features pre-scaled in {format_duration(tabular_time)}")
         print(f"[PROGRESS] ✓ All tabular features pre-scaled")
@@ -266,14 +277,22 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.error(f"Failed to download from HF: {e}", exc_info=True)
             raise
     
-    def _extract_and_scale_all_tabular(self):
+    def _extract_fit_and_scale_all_tabular(self, fit_scaler: bool = True):
         """OPTIMIZED: Extract and scale ALL tabular features once in __init__.
         
-        CRITICAL PERFORMANCE: This is called ONCE in __init__, never in __getitem__.
+        CRITICAL DATA LEAKAGE PREVENTION:
+        - If fit_scaler=True (training split): Fit StandardScaler, then transform
+        - If fit_scaler=False (val/test splits): Use pre-fitted scaler, only transform
+        
+        This prevents the validation/test sets from being scaled with different
+        means/stds than the training set (which causes model to see "alien language").
+        
+        CRITICAL PERFORMANCE:
+        - Called ONCE in __init__, never in __getitem__
         - Iterates through entire dataset split once to collect all 7 tabular features
         - Creates (total_samples, 7) numpy array
         - Applies np.log1p ONLY to volume column (index 1)
-        - Fits StandardScaler on the log-transformed array
+        - Fits OR uses pre-fitted StandardScaler (depending on fit_scaler flag)
         - Transforms all at once (vectorized)
         - Stores as contiguous torch.float32 tensor self.tabular_data
         
@@ -313,13 +332,21 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         print("[PROGRESS]   Applying log1p transformation...", flush=True)
         tabular_array[:, 1] = np.log1p(tabular_array[:, 1])
         
-        # Fit StandardScaler on ENTIRE array (prevents data leakage)
-        print("[PROGRESS]   Fitting StandardScaler...", flush=True)
-        self.scaler = StandardScaler()
-        self.scaler.fit(tabular_array)
-        logger.info(
-            f"StandardScaler fitted. Means: {self.scaler.mean_}, Stds: {self.scaler.scale_}"
-        )
+        # FIT or USE pre-fitted scaler
+        if fit_scaler:
+            # TRAINING SPLIT: Fit a new scaler
+            print("[PROGRESS]   Fitting StandardScaler on training data...", flush=True)
+            self.scaler = StandardScaler()
+            self.scaler.fit(tabular_array)
+            logger.info(
+                f"StandardScaler FITTED on training data. Means: {self.scaler.mean_}, Stds: {self.scaler.scale_}"
+            )
+        else:
+            # VALIDATION/TEST SPLIT: Use pre-fitted training scaler (NO FITTING)
+            print(f"[PROGRESS]   Using pre-fitted scaler (from training split)...", flush=True)
+            logger.info(
+                f"StandardScaler already fitted. Using training means: {self.scaler.mean_}, stds: {self.scaler.scale_}"
+            )
         
         # Transform ALL at once (vectorized operation: O(n) not O(n*seq_len))
         print("[PROGRESS]   Transforming features...", flush=True)
@@ -422,6 +449,11 @@ def create_dataloaders(
     """
     Create DataLoaders for all splits with progress tracking.
     
+    CRITICAL DATA LEAKAGE PREVENTION:
+    - Fit scaler ONLY on training split
+    - Pass fitted scaler to validation/test splits
+    - Ensures all splits use same scaling parameters (training's means/stds)
+    
     CRITICAL: DataLoader Optimization
     - num_workers=0: Forced on Kaggle (multi-worker deadlock issues)
     - pin_memory=True: Transfer data to GPU via pinned memory (faster)
@@ -438,6 +470,7 @@ def create_dataloaders(
         Dict with keys "train", "validation", "test" and DataLoader values
     """
     dataloaders = {}
+    train_scaler = None  # Will be set after training dataset is created
     
     overall_start = time.time()
     
@@ -456,7 +489,13 @@ def create_dataloaders(
                 hf_features_repo_id=hf_features_repo_id,
                 features_dir=features_dir,
                 debug=config.debug if hasattr(config, "debug") else False,
+                scaler=train_scaler,  # Pass training scaler to val/test (prevents leakage)
             )
+            
+            # After training dataset is created, save its scaler for val/test
+            if split_name == "train":
+                train_scaler = dataset.scaler  # Extract fitted scaler from training dataset
+                logger.info(f"✓ Training scaler extracted for use on validation/test splits")
             
             # Create dataloader
             dataloader = torch.utils.data.DataLoader(
