@@ -653,8 +653,8 @@ def main(args):
         
         # Log training metrics to W&B
         if wandb is not None and wandb.run is not None:
-            # Core training metrics
-            wandb_train_dict = {
+            # Core training metrics - log simple scalars first
+            wandb.log({
                 "epoch": epoch + 1,
                 "train_loss": train_metrics["loss"],
                 "train_mse": train_metrics["mse"],
@@ -668,7 +668,7 @@ def main(args):
                 "train_pred_max": train_metrics["pred_max"],
                 "train_target_min": train_metrics["target_min"],
                 "train_target_max": train_metrics["target_max"],
-            }
+            }, commit=False)  # Don't commit yet, add visualizations
             
             # Create visualizations for training data
             predictions = train_metrics["predictions"].numpy()
@@ -676,17 +676,23 @@ def main(args):
             
             # Scatter plot (first 500 samples for efficiency)
             plot_limit = min(500, len(predictions))
-            wandb_plot = wandb.plot.scatter(
-                wandb.Table(data=[
-                    [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                ], columns=["Ground Truth", "Prediction"]),
-                "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
-            )
-            wandb_train_dict["train_predictions_scatter"] = wandb_plot
+            try:
+                wandb_plot = wandb.plot.scatter(
+                    wandb.Table(data=[
+                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                    ], columns=["Ground Truth", "Prediction"]),
+                    "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
+                )
+                wandb.log({"train_predictions_scatter": wandb_plot}, commit=False)
+            except Exception as e:
+                logger.warning(f"Failed to log training scatter plot: {e}")
             
             # Error histogram
             errors = predictions - targets
-            wandb_train_dict["train_prediction_error_histogram"] = wandb.Histogram(errors)
+            try:
+                wandb.log({"train_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
+            except Exception as e:
+                logger.warning(f"Failed to log training error histogram: {e}")
             
             # Sample predictions table (first 100)
             sample_limit = min(100, len(predictions))
@@ -694,12 +700,15 @@ def main(args):
                 [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
                 for i in range(sample_limit)
             ]
-            wandb_train_dict["train_predictions_table"] = wandb.Table(
-                data=table_data,
-                columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
-            )
-            
-            wandb.log(wandb_train_dict, step=epoch)  # Log with epoch step for alignment
+            try:
+                wandb.log({
+                    "train_predictions_table": wandb.Table(
+                        data=table_data,
+                        columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+                    )
+                }, commit=True)  # Commit here - this is the final log for this epoch
+            except Exception as e:
+                logger.warning(f"Failed to log training predictions table: {e}")
         
         # Validate
         if (epoch + 1) % config.mlops.eval_frequency == 0:
@@ -715,8 +724,8 @@ def main(args):
             
             # Log comprehensive metrics to W&B
             if wandb is not None and wandb.run is not None:
-                # Core metrics
-                wandb_log_dict = {
+                # Log core metrics first (don't commit yet)
+                wandb.log({
                     "epoch": epoch + 1,
                     "val_mse": val_metrics["mse"],
                     "val_mae": val_metrics["mae"],
@@ -729,7 +738,7 @@ def main(args):
                     "val_pred_max": val_metrics["pred_max"],
                     "val_target_min": val_metrics["target_min"],
                     "val_target_max": val_metrics["target_max"],
-                }
+                }, commit=False)
                 
                 # Create prediction error scatter plot (ground truth vs predictions)
                 predictions = val_metrics["predictions"].numpy()
@@ -737,17 +746,23 @@ def main(args):
                 
                 # Create scatter plot for first 500 samples (memory efficiency)
                 plot_limit = min(500, len(predictions))
-                wandb_plot = wandb.plot.scatter(
-                    wandb.Table(data=[
-                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                    ], columns=["Ground Truth", "Prediction"]),
-                    "Ground Truth", "Prediction", title="[VAL] Predictions vs Ground Truth"
-                )
-                wandb_log_dict["val_predictions_scatter"] = wandb_plot
+                try:
+                    wandb_plot = wandb.plot.scatter(
+                        wandb.Table(data=[
+                            [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                        ], columns=["Ground Truth", "Prediction"]),
+                        "Ground Truth", "Prediction", title="[VAL] Predictions vs Ground Truth"
+                    )
+                    wandb.log({"val_predictions_scatter": wandb_plot}, commit=False)
+                except Exception as e:
+                    logger.warning(f"Failed to log validation scatter plot: {e}")
                 
                 # Create histogram of prediction errors
                 errors = predictions - targets
-                wandb_log_dict["val_prediction_error_histogram"] = wandb.Histogram(errors)
+                try:
+                    wandb.log({"val_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
+                except Exception as e:
+                    logger.warning(f"Failed to log validation error histogram: {e}")
                 
                 # Log actual values as table for samples (first 100 samples for inspection)
                 sample_limit = min(100, len(predictions))
@@ -755,12 +770,15 @@ def main(args):
                     [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
                     for i in range(sample_limit)
                 ]
-                wandb_log_dict["val_predictions_table"] = wandb.Table(
-                    data=table_data,
-                    columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
-                )
-                
-                wandb.log(wandb_log_dict, step=epoch)  # Log with epoch step for alignment
+                try:
+                    wandb.log({
+                        "val_predictions_table": wandb.Table(
+                            data=table_data,
+                            columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+                        )
+                    }, commit=True)  # Commit after validation logging
+                except Exception as e:
+                    logger.warning(f"Failed to log validation predictions table: {e}")
             
             # Save best model
             if val_mse < trainer.best_val_loss:
@@ -797,8 +815,8 @@ def main(args):
     
     # Log comprehensive test metrics to W&B
     if wandb is not None and wandb.run is not None:
-        # Core metrics
-        wandb_test_dict = {
+        # Log core metrics first
+        wandb.log({
             "test_mse": test_metrics["mse"],
             "test_mae": test_metrics["mae"],
             "test_rmse": test_metrics["rmse"],
@@ -810,7 +828,7 @@ def main(args):
             "test_pred_max": test_metrics["pred_max"],
             "test_target_min": test_metrics["target_min"],
             "test_target_max": test_metrics["target_max"],
-        }
+        }, commit=False)
         
         # Create prediction error scatter plot (ground truth vs predictions)
         predictions = test_metrics["predictions"].numpy()
@@ -818,17 +836,23 @@ def main(args):
         
         # Create scatter plot for first 500 samples (memory efficiency)
         plot_limit = min(500, len(predictions))
-        wandb_plot = wandb.plot.scatter(
-            wandb.Table(data=[
-                [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-            ], columns=["Ground Truth", "Prediction"]),
-            "Ground Truth", "Prediction", title="[TEST] Predictions vs Ground Truth"
-        )
-        wandb_test_dict["test_predictions_scatter"] = wandb_plot
+        try:
+            wandb_plot = wandb.plot.scatter(
+                wandb.Table(data=[
+                    [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                ], columns=["Ground Truth", "Prediction"]),
+                "Ground Truth", "Prediction", title="[TEST] Predictions vs Ground Truth"
+            )
+            wandb.log({"test_predictions_scatter": wandb_plot}, commit=False)
+        except Exception as e:
+            logger.warning(f"Failed to log test scatter plot: {e}")
         
         # Create histogram of prediction errors
         errors = predictions - targets
-        wandb_test_dict["test_prediction_error_histogram"] = wandb.Histogram(errors)
+        try:
+            wandb.log({"test_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
+        except Exception as e:
+            logger.warning(f"Failed to log test error histogram: {e}")
         
         # Log actual values as table for samples (first 100 samples for inspection)
         sample_limit = min(100, len(predictions))
@@ -836,12 +860,15 @@ def main(args):
             [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
             for i in range(sample_limit)
         ]
-        wandb_test_dict["test_predictions_table"] = wandb.Table(
-            data=table_data,
-            columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
-        )
-        
-        wandb.log(wandb_test_dict)
+        try:
+            wandb.log({
+                "test_predictions_table": wandb.Table(
+                    data=table_data,
+                    columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+                )
+            }, commit=True)  # Final commit after test evaluation
+        except Exception as e:
+            logger.warning(f"Failed to log test predictions table: {e}")
     
     # Final summary
     logger.info("\n" + "=" * 80)
