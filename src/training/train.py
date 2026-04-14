@@ -199,8 +199,8 @@ class Trainer:
             
             # ========== FORWARD PASS (FLOAT32) ==========
             # Standard PyTorch forward pass - all tensors remain float32
-            predictions = self.model(batch)  # (batch, 1) shape
-            targets = batch["target"].unsqueeze(1)  # (batch, 1) shape
+            predictions = self.model(batch)  # (batch,) shape
+            targets = batch["target"]  # (batch,) shape
             
             # Collect for epoch-level metrics
             all_predictions.append(predictions.detach().cpu())
@@ -260,11 +260,19 @@ class Trainer:
                     )
                     
                     if wandb is not None and wandb.run is not None:
-                        wandb.log({
+                        log_dict = {
                             "train_step_loss": loss.item(),
                             "learning_rate": current_lr,
                             "global_step": self.global_step,
-                        })
+                        }
+                        
+                        # Add GPU memory stats if available
+                        if torch.cuda.is_available():
+                            log_dict["gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
+                            log_dict["gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
+                            log_dict["gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
+                        
+                        wandb.log(log_dict)
             
             # Accumulate loss for epoch average
             total_loss += loss.item() * self.config.training.accumulate_steps
@@ -284,9 +292,9 @@ class Trainer:
         avg_loss = total_loss / num_steps
         self.train_losses.append(avg_loss)
         
-        # Compute comprehensive metrics from collected predictions
-        all_predictions = torch.cat(all_predictions, dim=0).squeeze()  # (total_samples,)
-        all_targets = torch.cat(all_targets, dim=0).squeeze()  # (total_samples,)
+        # Concatenate all predictions and targets
+        all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
+        all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
         
         # MSE, MAE, RMSE
         mse = torch.mean((all_predictions - all_targets) ** 2).item()
@@ -370,8 +378,8 @@ class Trainer:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
                 # Forward pass (pure float32, no AMP)
-                predictions = self.model(batch)  # (batch, 1)
-                targets = batch["target"].unsqueeze(1)  # (batch, 1)
+                predictions = self.model(batch)  # (batch,)
+                targets = batch["target"]  # (batch,)
                 
                 # Compute metrics
                 mse = nn.MSELoss()(predictions, targets)
@@ -391,8 +399,8 @@ class Trainer:
         self.val_losses.append(avg_mse)
         
         # Concatenate all predictions and targets
-        all_predictions = torch.cat(all_predictions, dim=0).squeeze()  # (total_samples,)
-        all_targets = torch.cat(all_targets, dim=0).squeeze()  # (total_samples,)
+        all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
+        all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
         
         # Compute additional metrics
         rmse = torch.sqrt(torch.tensor(avg_mse)).item()
@@ -565,12 +573,14 @@ def main(args):
     sys.stdout.flush()
     # NOTE: num_workers=0 always (Kaggle multi-worker deadlock fix)
     # Multi-worker DataLoader spawns intermittently deadlock on Kaggle
+    # CRITICAL: Enforce num_workers=0 regardless of config
+    logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
     try:
         dataloaders = create_dataloaders(
             config,
             hf_features_repo_id=args.hf_features_repo,
             features_dir=args.features_dir if not args.hf_features_repo else None,
-            num_workers=0
+            num_workers=0  # CRITICAL: Always 0 on Kaggle
         )
         print("[PROGRESS] ✓ All datasets loaded successfully!")
         sys.stdout.flush()
@@ -607,8 +617,24 @@ def main(args):
             config=config.to_dict(),
             tags=config.mlops.wandb_tags,
             notes=config.mlops.wandb_notes,
+            settings=wandb.Settings(
+                # Disable service ping wait to avoid timeout issues
+                _service_wait=0,
+                _disable_stats=False,
+            ),
         )
         logger.info(f"✓ W&B initialized: {config.mlops.wandb_project}/{config.mlops.wandb_run_name}")
+        
+        # Log GPU info
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_props = torch.cuda.get_device_properties(0)
+            gpu_memory_total = gpu_props.total_memory / (1024**3)  # GB
+            logger.info(f"✓ GPU: {gpu_name} ({gpu_memory_total:.1f}GB)")
+            wandb.config.update({
+                "gpu_name": gpu_name,
+                "gpu_memory_gb": gpu_memory_total,
+            })
     
     # Resume from checkpoint if requested
     start_epoch = 0
@@ -654,7 +680,7 @@ def main(args):
         # Log training metrics to W&B
         if wandb is not None and wandb.run is not None:
             # Core training metrics - log simple scalars first
-            wandb.log({
+            train_log_dict = {
                 "epoch": epoch + 1,
                 "train_loss": train_metrics["loss"],
                 "train_mse": train_metrics["mse"],
@@ -668,7 +694,15 @@ def main(args):
                 "train_pred_max": train_metrics["pred_max"],
                 "train_target_min": train_metrics["target_min"],
                 "train_target_max": train_metrics["target_max"],
-            }, commit=False)  # Don't commit yet, add visualizations
+            }
+            
+            # Add GPU memory stats if available
+            if torch.cuda.is_available():
+                train_log_dict["train_gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
+                train_log_dict["train_gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
+                train_log_dict["train_gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
+            
+            wandb.log(train_log_dict, commit=False)  # Don't commit yet, add visualizations
             
             # Create visualizations for training data
             predictions = train_metrics["predictions"].numpy()
@@ -725,7 +759,7 @@ def main(args):
             # Log comprehensive metrics to W&B
             if wandb is not None and wandb.run is not None:
                 # Log core metrics first (don't commit yet)
-                wandb.log({
+                val_log_dict = {
                     "epoch": epoch + 1,
                     "val_mse": val_metrics["mse"],
                     "val_mae": val_metrics["mae"],
@@ -738,7 +772,15 @@ def main(args):
                     "val_pred_max": val_metrics["pred_max"],
                     "val_target_min": val_metrics["target_min"],
                     "val_target_max": val_metrics["target_max"],
-                }, commit=False)
+                }
+                
+                # Add GPU memory stats
+                if torch.cuda.is_available():
+                    val_log_dict["val_gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
+                    val_log_dict["val_gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
+                    val_log_dict["val_gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
+                
+                wandb.log(val_log_dict, commit=False)
                 
                 # Create prediction error scatter plot (ground truth vs predictions)
                 predictions = val_metrics["predictions"].numpy()
@@ -816,7 +858,7 @@ def main(args):
     # Log comprehensive test metrics to W&B
     if wandb is not None and wandb.run is not None:
         # Log core metrics first
-        wandb.log({
+        test_log_dict = {
             "test_mse": test_metrics["mse"],
             "test_mae": test_metrics["mae"],
             "test_rmse": test_metrics["rmse"],
@@ -828,7 +870,15 @@ def main(args):
             "test_pred_max": test_metrics["pred_max"],
             "test_target_min": test_metrics["target_min"],
             "test_target_max": test_metrics["target_max"],
-        }, commit=False)
+        }
+        
+        # Add GPU memory stats
+        if torch.cuda.is_available():
+            test_log_dict["test_gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
+            test_log_dict["test_gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
+            test_log_dict["test_gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
+        
+        wandb.log(test_log_dict, commit=False)
         
         # Create prediction error scatter plot (ground truth vs predictions)
         predictions = test_metrics["predictions"].numpy()

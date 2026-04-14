@@ -40,6 +40,16 @@ try:
 except ImportError:
     raise ImportError("'huggingface_hub' required: pip install huggingface_hub")
 
+try:
+    from sklearn.preprocessing import RobustScaler
+except ImportError:
+    raise ImportError("'scikit-learn' required: pip install scikit-learn")
+
+try:
+    from kaggle.api.kaggle_api_extended import KaggleApi
+except ImportError:
+    raise ImportError("'kaggle' required: pip install kaggle")
+
 from tqdm import tqdm
 
 
@@ -399,6 +409,21 @@ def main(args):
             logger.info(f"Image extraction took {format_duration(elapsed)}")
             print(f"[PROGRESS] Image extraction complete ({format_duration(elapsed)})")
         
+        # Scaled target scores
+        target_output_path = output_dir / f"target_scores_scaled_{split}.pt"
+        if target_output_path.exists() and not args.force:
+            logger.info(f"✓ Scaled target scores already exist: {target_output_path}")
+            print(f"[PROGRESS] Skipping target scaling (file exists)")
+        else:
+            start_time = time.time()
+            extract_and_scale_target_scores(
+                dataset,
+                target_output_path,
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"Target scaling took {format_duration(elapsed)}")
+            print(f"[PROGRESS] Target scaling complete ({format_duration(elapsed)})")
+        
         sys.stdout.flush()
     
     # Verify all files
@@ -409,17 +434,52 @@ def main(args):
     for split in splits:
         text_path = output_dir / f"text_embeddings_{split}.pt"
         image_path = output_dir / f"image_embeddings_{split}.pt"
+        target_path = output_dir / f"target_scores_scaled_{split}.pt"
         
-        if text_path.exists() and image_path.exists():
+        if text_path.exists() and image_path.exists() and target_path.exists():
             text_shape = torch.load(text_path, map_location="cpu").shape
             image_shape = torch.load(image_path, map_location="cpu").shape
-            logger.info(f"✓ {split}: text {text_shape}, image {image_shape}")
-            print(f"[PROGRESS] ✓ {split}: text {text_shape}, image {image_shape}")
+            target_shape = torch.load(target_path, map_location="cpu").shape
+            logger.info(f"✓ {split}: text {text_shape}, image {image_shape}, target {target_shape}")
+            print(f"[PROGRESS] ✓ {split}: text {text_shape}, image {image_shape}, target {target_shape}")
         else:
             logger.warning(f"✗ {split}: Missing files")
             print(f"[PROGRESS] ✗ {split}: Missing files")
     
     print("[PROGRESS] ✓ Feature extraction pipeline complete!")
+    sys.stdout.flush()
+
+
+def extract_and_scale_target_scores(
+    dataset,
+    output_path: Path,
+) -> None:
+    """
+    Extract and scale target_score using RobustScaler. Save to disk.
+    
+    Args:
+        dataset: HuggingFace Dataset with target_score column
+        output_path: Path to save scaled target scores
+    """
+    logger.info(f"Extracting and scaling target_score ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting and scaling target_score...")
+    sys.stdout.flush()
+    
+    # Extract target scores
+    target_scores = np.array(dataset["target_score"], dtype=np.float32).reshape(-1, 1)
+    logger.info(f"Target scores shape: {target_scores.shape}")
+    logger.info(f"Target scores range: [{target_scores.min():.4f}, {target_scores.max():.4f}]")
+    
+    # Apply RobustScaler
+    scaler = RobustScaler()
+    scaled_targets = scaler.fit_transform(target_scores).squeeze()  # (total_samples,)
+    
+    # Save scaled targets
+    target_tensor = torch.tensor(scaled_targets, dtype=torch.float32)
+    torch.save(target_tensor, output_path)
+    logger.info(f"✓ Saved scaled target scores to {output_path}")
+    logger.info(f"Scaled target scores range: [{scaled_targets.min():.4f}, {scaled_targets.max():.4f}]")
+    print(f"[PROGRESS] ✓ Target scores scaled and saved ({target_tensor.shape})")
     sys.stdout.flush()
 
 
@@ -492,6 +552,79 @@ def push_features_to_hf(
         raise
 
 
+def push_features_to_kaggle(
+    output_dir: Path,
+    dataset_name: str,
+    kaggle_username: str,
+    kaggle_key: str,
+    public: bool = False,
+) -> None:
+    """
+    Upload extracted features to Kaggle dataset.
+    
+    Args:
+        output_dir: Directory containing .pt files
+        dataset_name: Kaggle dataset name (e.g., crypto-sentiment-features)
+        kaggle_username: Kaggle API username
+        kaggle_key: Kaggle API key
+        public: Whether to make dataset public
+    """
+    logger.info(f"\nUploading features to Kaggle: {dataset_name}...")
+    print(f"\n[PROGRESS] Uploading features to Kaggle: {dataset_name}...")
+    sys.stdout.flush()
+    
+    try:
+        import json
+        import os
+        
+        # Initialize Kaggle API with credentials
+        # Set environment variables for Kaggle authentication
+        os.environ['KAGGLE_USERNAME'] = kaggle_username
+        os.environ['KAGGLE_KEY'] = kaggle_key
+        
+        api = KaggleApi()
+        api.authenticate()
+        logger.info(f"✓ Kaggle authentication successful")
+        
+        # Create dataset metadata
+        metadata = {
+            "title": dataset_name,
+            "id": f"{kaggle_username}/{dataset_name}",
+            "licenses": [{"name": "cc-by-nc-4"}],
+            "resources": []
+        }
+        
+        # Find all .pt files
+        pt_files = sorted(list(output_dir.glob("*.pt")))
+        logger.info(f"Found {len(pt_files)} .pt files to upload")
+        
+        for pt_file in pt_files:
+            metadata["resources"].append({
+                "path": pt_file.name,
+            })
+        
+        # Save metadata to dataset folder
+        metadata_path = output_dir / "dataset-metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info(f"✓ Metadata created: {metadata_path}")
+        
+        # Create/update dataset on Kaggle
+        logger.info(f"Creating/updating dataset on Kaggle...")
+        api.dataset_create_new(
+            folder=str(output_dir),
+            public=public,
+            quiet=False
+        )
+        logger.info(f"✓ Dataset uploaded successfully")
+        print(f"[PROGRESS] ✓ Features uploaded to Kaggle: {kaggle_username}/{dataset_name}")
+        sys.stdout.flush()
+        
+    except Exception as e:
+        logger.error(f"Kaggle upload failed: {e}", exc_info=True)
+        raise
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Extract and cache FinBERT text and ResNet50 image embeddings"
@@ -540,6 +673,34 @@ if __name__ == "__main__":
         action="store_true",
         help="Make HF repo private",
     )
+    parser.add_argument(
+        "--push-to-kaggle",
+        action="store_true",
+        help="Upload extracted features to Kaggle dataset after extraction",
+    )
+    parser.add_argument(
+        "--kaggle-dataset-name",
+        type=str,
+        default=None,
+        help="Kaggle dataset name (e.g., crypto-sentiment-features)",
+    )
+    parser.add_argument(
+        "--kaggle-username",
+        type=str,
+        default=None,
+        help="Kaggle API username (uses ~/.kaggle/kaggle.json if not provided)",
+    )
+    parser.add_argument(
+        "--kaggle-key",
+        type=str,
+        default=None,
+        help="Kaggle API key (uses ~/.kaggle/kaggle.json if not provided)",
+    )
+    parser.add_argument(
+        "--kaggle-public",
+        action="store_true",
+        help="Make Kaggle dataset public",
+    )
     
     args = parser.parse_args()
     
@@ -557,6 +718,40 @@ if __name__ == "__main__":
             repo_id=args.hf_repo_id,
             token=args.token,
             private=args.private,
+        )
+    
+    # Push to Kaggle if requested
+    if args.push_to_kaggle:
+        if not args.kaggle_dataset_name:
+            print("[ERROR] --kaggle-dataset-name required when --push-to-kaggle is set")
+            sys.exit(1)
+        
+        output_dir = Path(args.output_dir)
+        
+        # Get Kaggle credentials
+        kaggle_username = args.kaggle_username
+        kaggle_key = args.kaggle_key
+        
+        if not kaggle_username or not kaggle_key:
+            # Try to read from ~/.kaggle/kaggle.json
+            import json
+            kaggle_json_path = Path.home() / ".kaggle" / "kaggle.json"
+            if kaggle_json_path.exists():
+                with open(kaggle_json_path) as f:
+                    kaggle_config = json.load(f)
+                    kaggle_username = kaggle_config.get("username")
+                    kaggle_key = kaggle_config.get("key")
+        
+        if not kaggle_username or not kaggle_key:
+            print("[ERROR] Kaggle credentials required. Provide via --kaggle-username and --kaggle-key or ~/.kaggle/kaggle.json")
+            sys.exit(1)
+        
+        push_features_to_kaggle(
+            output_dir=output_dir,
+            dataset_name=args.kaggle_dataset_name,
+            kaggle_username=kaggle_username,
+            kaggle_key=kaggle_key,
+            public=args.kaggle_public,
         )
         
         print("\n" + "=" * 80)

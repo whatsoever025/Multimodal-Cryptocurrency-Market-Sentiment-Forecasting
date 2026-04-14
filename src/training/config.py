@@ -20,7 +20,7 @@ class DataConfig:
     max_text_length: int = 512  # Token sequence length for BERT
     image_size: int = 224  # ResNet50 input size (224x224)
     shuffle_train: bool = True
-    num_workers: int = 4  # Data loading workers
+    num_workers: int = 0  # CRITICAL: Must be 0 on Kaggle (multi-worker deadlock fix)
     pin_memory: bool = True
     prefetch_factor: int = 2
 

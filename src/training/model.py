@@ -276,7 +276,7 @@ class MultimodalFusionNet(nn.Module):
                 - image_embedding: (batch, seq_len, 256) - pre-extracted ResNet50 embeddings
         
         Returns:
-            (batch, 1) - continuous sentiment predictions
+            (batch,) - continuous sentiment predictions
         """
         batch_size, seq_len = batch["tabular"].shape[0], batch["tabular"].shape[1]
         
@@ -306,8 +306,9 @@ class MultimodalFusionNet(nn.Module):
         temporal_output = self.temporal_lstm(fused_features)
         
         # ==================== PREDICTION HEAD ====================
-        # MLP head: (batch, hidden_dim) → (batch, 1)
-        predictions = self.prediction_head(temporal_output)
+        # MLP head: (batch, hidden_dim) → (batch, 1) → squeeze to (batch,)
+        predictions = self.prediction_head(temporal_output)  # (batch, 1)
+        predictions = predictions.squeeze(dim=1)  # (batch,) - match target shape
         
         return predictions
     

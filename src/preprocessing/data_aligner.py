@@ -326,15 +326,15 @@ class DataAligner:
     
     def calculate_continuous_target(self) -> None:
         """
-        Calculate continuous sentiment regression target using Volatility-Adjusted Tanh.
+        Calculate continuous sentiment regression target using raw volatility normalization.
         
         Formula:
             R = (Close_future - Close_current) / Close_current
             sigma = rolling_std(hourly_returns, window=168)
-            target_score = tanh(R / (k * sigma)) * 100, where k=1.5
+            target_score = R / (sigma + 1e-6)
         
         Safely handles edge cases:
-        - When sigma ≈ 0: Uses epsilon (1e-5) to avoid division by zero
+        - When sigma ≈ 0: Uses epsilon (1e-6) to avoid division by zero
         - NaN targets: Drops rows at end of dataset where future close is unavailable
         """
         logger.info("=" * 80)
@@ -360,18 +360,10 @@ class DataAligner:
         future_returns = (future_close - self.df['close']) / self.df['close']
         logger.info(f"  ✓ Calculated future returns (horizon={self.horizon_hours} hours)")
         
-        # Calculate sentiment score using Volatility-Adjusted Tanh
-        k = 1.5
-        epsilon = 1e-5
-        
-        # Avoid division by zero: replace sigma near 0 with epsilon
-        volatility_safe = volatility.copy()
-        volatility_safe = volatility_safe.replace(0, epsilon)
-        volatility_safe = volatility_safe.fillna(epsilon)
-        
-        # Calculate raw score
-        raw_score = future_returns / (k * volatility_safe)
-        target_score = np.tanh(raw_score) * 100
+        # Calculate target score using raw volatility normalization
+        # Raw formula: target_score = future_returns / (volatility + 1e-6)
+        epsilon = 1e-6
+        target_score = future_returns / (volatility + epsilon)
         
         self.df['target_score'] = target_score
         
