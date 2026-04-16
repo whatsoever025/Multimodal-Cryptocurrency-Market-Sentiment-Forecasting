@@ -1,6 +1,6 @@
 """
 Chart Generator for Converting OHLCV Data to Candlestick Chart Images
-Generates professional candlestick charts for deep learning (ViT/ResNet) training.
+Generates professional candlestick charts for deep learning (ViT) training.
 Includes technical indicators (MA7, MA25, RSI, MACD) and uses multiprocessing for optimization.
 Pre-calculates indicators on full dataset to avoid redundant computations.
 """

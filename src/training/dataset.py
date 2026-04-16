@@ -32,7 +32,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
     
     Loads:
     - Text embeddings (256-dim, pre-extracted by FinBERT)
-    - Image embeddings (256-dim, pre-extracted by ResNet50)
+    - Image embeddings (256-dim, pre-extracted by Vision Transformer ViT)
     - Tabular features (7 columns, RAW - will be scaled)
     - Target scores (RAW - will be scaled)
     

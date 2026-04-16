@@ -4,7 +4,7 @@ MultimodalFusionNet: Production-grade multimodal sentiment forecasting architect
 Architecture (Offline Feature Extraction):
 1. Pre-Computed Embeddings (extracted offline via extract_features.py):
    - FinBERT text embeddings: (batch, seq_len, 256)
-   - ResNet50 image embeddings: (batch, seq_len, 256)
+   - Vision Transformer (ViT) image embeddings: (batch, seq_len, 256)
    
 2. Tabular MLP Encoder:
    - MLP encoding of 7 raw tabular features → (batch, seq_len, 256)
@@ -209,7 +209,7 @@ class MultimodalFusionNet(nn.Module):
     Production-grade multimodal fusion network with offline feature extraction.
     
     Architecture:
-    1. Accept pre-extracted embeddings (FinBERT text & ResNet50 images)
+    1. Accept pre-extracted embeddings (FinBERT text & ViT images)
     2. Encode tabular features with lightweight MLP (output: 256D to match embeddings)
     3. Stack modality representations and apply cross-modal attention (all 256D)
     4. Apply temporal LSTM for temporal dynamics (256D hidden state)
@@ -277,7 +277,7 @@ class MultimodalFusionNet(nn.Module):
             batch: Dict with keys:
                 - tabular: (batch, seq_len, 7) - raw tabular features
                 - text_embedding: (batch, seq_len, 256) - pre-extracted FinBERT embeddings
-                - image_embedding: (batch, seq_len, 256) - pre-extracted ResNet50 embeddings
+                - image_embedding: (batch, seq_len, 256) - pre-extracted ViT embeddings
         
         Returns:
             (batch,) - continuous sentiment predictions

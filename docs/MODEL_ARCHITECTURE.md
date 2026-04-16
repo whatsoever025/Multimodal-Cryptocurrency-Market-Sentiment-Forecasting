@@ -8,12 +8,12 @@
 
 ## Overview
 
-**MultimodalFusionNet** is a production-grade multimodal sentiment forecasting architecture with **offline feature extraction**. It accepts pre-computed text and image embeddings (extracted via frozen FinBERT and ResNet50 backbones) and fuses them with tabular features using cross-modal attention and temporal LSTM for continuous sentiment score prediction.
+**MultimodalFusionNet** is a production-grade multimodal sentiment forecasting architecture with **offline feature extraction**. It accepts pre-computed text and image embeddings (extracted via frozen FinBERT and Vision Transformer backbones) and fuses them with tabular features using cross-modal attention and temporal LSTM for continuous sentiment score prediction.
 
 **Purpose:** Forecast cryptocurrency sentiment on a continuous scale (-100 to +100) using combined textual, visual, and numerical market data with **zero I/O bottlenecks and zero float16 NaN issues**.
 
 **Pipeline:**
-1. **Offline Phase** (run once): Extract FinBERT text embeddings & ResNet50 image embeddings → save as `.pt` files
+1. **Offline Phase** (run once): Extract FinBERT text embeddings & Vision Transformer (ViT) image embeddings → save as `.pt` files
 2. **Training Phase** (fast & stable): Load pre-extracted embeddings + apply TabularEncoder, CrossModalAttention, LSTM, PredictionHead
 
 ---
@@ -28,11 +28,11 @@
 |----------|-------|------|--------|-------------|
 | **Tabular (SCALED)** | (batch, seq_len, 7) | float32 | StandardScaler | Market features: return_1h, volume, funding_rate, fear_greed, gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume (normalized: mean=0, std=1) |
 | **Text Embedding** | (batch, seq_len, 256) | float32 | Offline extracted | FinBERT [CLS] token embeddings (pre-computed) |
-| **Image Embedding** | (batch, seq_len, 256) | float32 | Offline extracted | ResNet50 avgpool embeddings (pre-computed) |
+| **Image Embedding** | (batch, seq_len, 256) | float32 | Offline extracted | Vision Transformer (ViT) embeddings (pre-computed) |
 | **Target (SCALED)** | (batch,) | float32 | RobustScaler | Sentiment scores [-100, +100] normalized (median=0, IQR=1) |
 
 **seq_len (sequence length):** 24 hours (default)  
-**Embedding Dimension:** 256 (FinBERT 768 → 256, ResNet50 2048 → 256)  
+**Embedding Dimension:** 256 (FinBERT 768 → 256, ViT 768 → 256)  
 **Scaling Strategy:** StandardScaler for tabular (learned on train split only), RobustScaler for targets (learned on train split only)
 
 ---
@@ -89,7 +89,7 @@
    ↓ Save as text_embeddings_{split}.pt: (n_samples, 256)
 
 2. Image: (n_samples, 3, 224, 224) pixels
-   ↓ ResNet50 Backbone (frozen) + avgpool
+   ↓ Vision Transformer (ViT) Backbone (frozen) + [CLS] token
    ↓ Linear Projection (2048 → 256)
    ↓ Save as image_embeddings_{split}.pt: (n_samples, 256)
 ```
@@ -228,7 +228,7 @@ asset: "MULTI"                          # "BTC", "ETH", or "MULTI" (combined)
 seq_len: 24                             # 24-hour sliding window
 batch_size: 128                         # Per-GPU batch size for training
 max_text_length: 512                    # BERT token sequence length
-image_size: 224                         # ResNet50 input size
+image_size: 224                         # ViT input size
 shuffle_train: True
 num_workers: 0                          # Kaggle compatibility (no multiprocessing)
 pin_memory: True
@@ -245,11 +245,11 @@ mha_dropout: 0.1                        # Attention layer dropout
 encoder_dropout: 0.2                    # TabularEncoder dropout
 head_dropout: 0.2                       # Prediction head dropout
 grad_clip: 1.0                          # Gradient norm clipping (L2)
-frozen_backbones: True                  # Freeze FinBERT & ResNet50
+frozen_backbones: True                  # Freeze FinBERT & ViT
 use_gradient_checkpointing: True        # Memory optimization for 16GB VRAM
 ```
 
-**Design Note:** `hidden_dim=256` is **intentionally set to match** the 256D pre-extracted embeddings (FinBERT & ResNet50 projections). This ensures all 3 modalities (text, image, tabular) have identical feature dimensions for proper stacking in CrossModalAttention.
+**Design Note:** `hidden_dim=256` is **intentionally set to match** the 256D pre-extracted embeddings (FinBERT & ViT projections). This ensures all 3 modalities (text, image, tabular) have identical feature dimensions for proper stacking in CrossModalAttention.
 
 ### TrainingConfig
 ```python
@@ -281,7 +281,7 @@ growth_interval: 2000                   # Steps between growth checks
 
 ### Parameter Counts (Offline Version)
 - **FinBERT:** 109M (extracted offline, NOT in model)
-- **ResNet50:** 24M (extracted offline, NOT in model)
+- **Vision Transformer (ViT):** 86M (extracted offline, NOT in model)
 - **Trainable Components:**
   - TabularEncoder: ~50K
   - CrossModalAttention: ~600K
@@ -370,7 +370,7 @@ Text Pipeline:
   → Save: text_embeddings_train.pt, text_embeddings_val.pt, text_embeddings_test.pt
 
 Image Pipeline:
-  (30K, 3, 224, 224) pixels → ResNet50 Backbone → (30K, 2048) avgpool 
+  (30K, 3, 224, 224) pixels → Vision Transformer Backbone → (30K, 768) [CLS] token 
   → Linear Projection (2048 → 256) → (30K, 256)
   → Save: image_embeddings_train.pt, image_embeddings_val.pt, image_embeddings_test.pt
 
@@ -489,7 +489,7 @@ Load from memory (cached during epoch start):
 - All 3 modalities now have identical dimensions (256D)
 - `torch.stack()` in CrossModalAttentionLayer now succeeds
 - No dimension mismatches in forward pass
-- Embeddings remain at 256D from offline extraction (FinBERT & ResNet50 projections)
+- Embeddings remain at 256D from offline extraction (FinBERT & ViT projections)
 - TabularEncoder final layer explicitly outputs 256D
 
 **Code Change:**
@@ -507,7 +507,7 @@ hidden_dim: int = 256  # MUST match embedding dimensions (256D)
 
 ## Other Limitations
 
-1. **Offline Embeddings:** Cannot fine-tune FinBERT/ResNet50 (frozen by design)
+1. **Offline Embeddings:** Cannot fine-tune FinBERT/ViT (frozen by design)
    - *Workaround:* Re-run `extract_features.py` if need different backbone versions
 
 2. **Single Modality Fusion:** No explicit per-modality attention weights
@@ -557,7 +557,7 @@ hidden_dim: int = 256  # MUST match embedding dimensions (256D)
 ## References
 
 - **FinBERT:** https://huggingface.co/ProsusAI/finbert
-- **ResNet50:** https://pytorch.org/vision/stable/models.html
+- **Vision Transformer (ViT):** https://huggingface.co/google/vit-base-patch16-224
 - **Gradient Clipping:** https://pytorch.org/docs/stable/generated/torch.nn.utils.clip_grad_norm_.html
 - **Gradient Accumulation:** https://arxiv.org/abs/1711.00141
 - **Offline Feature Extraction Pattern:** Common in production ML pipelines for reduced I/O + computational efficiency
@@ -568,7 +568,7 @@ hidden_dim: int = 256  # MUST match embedding dimensions (256D)
 **Author:** Multimodal Crypto Sentiment Team  
 **Key Changes in v2.0:**
 - **Offline extraction:** Pre-compute embeddings once, train many times
-- **Removed backbones:** FinBERT (109M) and ResNet50 (24M) not in training model
+- **Removed backbones:** FinBERT (109M) and Vision Transformer (86M) not in training model
 - **Mixed precision:** float16 activations + float32 weights with GradScaler (NOT pure float32)
 - **Automatic loss scaling:** GradScaler prevents gradient underflow/overflow
 - **Explicit gradient clipping:** L2 norm ≤ 1.0 before optimizer.step()

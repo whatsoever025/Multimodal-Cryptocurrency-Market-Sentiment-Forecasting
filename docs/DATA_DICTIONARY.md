@@ -476,7 +476,7 @@ Timeline (Chronological):
    - **MACD:** Moving Average Convergence Divergence with signal line
 
 #### Use Cases:
-- Training computer vision models (ResNet, ViT, CNN)
+- Training computer vision models (ViT, CNN)
 - Multimodal prediction model input (combined with text sentiment)
 - Pattern recognition and technical analysis
 - Visualization of price action with indicators

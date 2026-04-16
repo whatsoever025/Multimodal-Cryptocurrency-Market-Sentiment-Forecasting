@@ -194,7 +194,7 @@ from transformers import AutoTokenizer, AutoModel
 import torchvision.models as models
 
 class MultimodalSentimentModel(nn.Module):
-    """Fuses LSTM (tabular) + BERT (text) + ResNet (images)."""
+    """Fuses LSTM (tabular) + BERT (text) + ViT (images)."""
     
     def __init__(self):
         super().__init__()
@@ -206,10 +206,10 @@ class MultimodalSentimentModel(nn.Module):
         self.bert = AutoModel.from_pretrained("distilbert-base-uncased")
         self.text_fc = nn.Linear(768, 64)
         
-        # Branch 3: Visual encoder (ResNet50)
-        resnet = models.resnet50(pretrained=True)
-        self.visual = nn.Sequential(*list(resnet.children())[:-1])  # Remove classification head
-        self.visual_fc = nn.Linear(2048, 64)
+        # Branch 3: Visual encoder (Vision Transformer)
+        vit = AutoModel.from_pretrained("google/vit-base-patch16-224")
+        self.visual = vit
+        self.visual_fc = nn.Linear(768, 64)
         
         # Fusion: Concatenate all branches → MLP head
         self.fusion = nn.Sequential(
@@ -229,8 +229,9 @@ class MultimodalSentimentModel(nn.Module):
         # Text: embeddings from BERT → (B, 64)
         text_feat = self.text_fc(text_embeddings)
         
-        # Visual: ResNet50 → (B, 2048) → (B, 64)
-        visual_feat = self.visual(images).squeeze(-1).squeeze(-1)
+        # Visual: ViT → (B, 768) → (B, 64)
+        visual_outputs = self.visual(images)
+        visual_feat = visual_outputs.last_hidden_state[:, 0, :]  # [CLS] token
         visual_feat = self.visual_fc(visual_feat)
         
         # Concatenate all modalities
@@ -332,12 +333,12 @@ import torchvision.transforms as transforms
 
 dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_btc")
 
-# ResNet50 for image-based sentiment
+# Vision Transformer for image-based sentiment
 class ImageSentimentModel(nn.Module):
     def __init__(self):
         super().__init__()
-        resnet = models.resnet50(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        vit = AutoModel.from_pretrained("google/vit-base-patch16-224")
+        self.backbone = vit
         self.head = nn.Linear(2048, 1)
     
     def forward(self, x):
@@ -430,7 +431,7 @@ Train a CNN to predict sentiment from candlestick charts:
 - **Input:** 224×224 candlestick chart images
 - **Output:** Continuous sentiment score
 - **Use case:** Pure technical analysis, ablation studies
-- **Recommended:** ResNet, EfficientNet, Vision Transformer
+- **Recommended:** Vision Transformer (ViT), EfficientNet
 
 ### 4. **Tabular-Only Models**
 Use only market data signals (7 features):

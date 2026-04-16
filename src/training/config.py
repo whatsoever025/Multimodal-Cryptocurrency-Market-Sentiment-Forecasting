@@ -18,7 +18,7 @@ class DataConfig:
     seq_len: int = 24  # Sliding window length in hours
     batch_size: int = 128  # Per-GPU batch size
     max_text_length: int = 512  # Token sequence length for BERT
-    image_size: int = 224  # ResNet50 input size (224x224)
+    image_size: int = 224  # ViT input size (224x224)
     shuffle_train: bool = True
     num_workers: int = 0  # CRITICAL: Must be 0 on Kaggle (multi-worker deadlock fix)
     pin_memory: bool = True
@@ -49,7 +49,7 @@ class ModelConfig:
     encoder_dropout: float = 0.2
     head_dropout: float = 0.2
     grad_clip: float = 1.0
-    frozen_backbones: bool = True  # Freeze BERT & ResNet50
+    frozen_backbones: bool = True  # Freeze BERT & ViT
     use_gradient_checkpointing: bool = True  # Mandatory for 16GB VRAM
     init_weights: bool = True
 

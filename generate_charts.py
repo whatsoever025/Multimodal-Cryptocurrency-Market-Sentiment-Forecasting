@@ -29,7 +29,7 @@ def main():
     # Initialize generator
     generator = ChartGenerator(
         window_size=24,        # 24-hour lookback window
-        image_size=(224, 224), # Standard ViT/ResNet input size
+        image_size=(224, 224), # Standard ViT input size
         output_path='data/processed/images'
     )
     

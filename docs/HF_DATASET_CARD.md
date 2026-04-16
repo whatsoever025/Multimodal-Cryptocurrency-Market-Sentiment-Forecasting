@@ -226,7 +226,7 @@ Tabular (7) ──→ LSTM(64) ──‐┐
                               ├─→ Concat ──→ MLP ──→ Sentiment (-100 to +100)
 Text ──→ BERT ──→ FC(64) ────┤
                               ├──→
-Images ──→ ResNet50 ──→ FC(64) ┘
+Images ──→ ViT ──→ FC(64) ┘
 ```
 - Input: All 11 columns
 - Recommended: For maximum performance (papers, production)
@@ -244,7 +244,7 @@ Images ──→ ResNet50 ──→ FC(64) ┘
 
 ### 3. Technical Analysis Only
 ```
-Images (224×224 PNG) ──→ ResNet50/ViT ──→ Regression head ──→ Sentiment
+Images (224×224 PNG) ──→ ViT ──→ Regression head ──→ Sentiment
 ```
 - Input: Chart images only
 - Recommended: For ablation studies, pure technical analysis
@@ -264,7 +264,7 @@ Images (224×224 PNG) ──→ ResNet50/ViT ──→ Regression head ──→
 |------|-------|---------------------|-------------|
 | Multimodal forecast | All 10 features | LSTM+BERT+CNN | R² ~0.62 |
 | LLM sentiment | Text + meta | Fine-tuned GPT-2 | MAE ~15 |
-| Technical analysis | Images + tabular | ResNet50+MLP | R² ~0.55 |
+| Technical analysis | Images + tabular | ViT+MLP | R² ~0.55 |
 | Market sentiment | Tabular only | XGBoost | R² ~0.48 |
 
 *Preliminary benchmarks from v3 validation split. Use for reference only—results vary by architecture, hyperparameters, and random seed.

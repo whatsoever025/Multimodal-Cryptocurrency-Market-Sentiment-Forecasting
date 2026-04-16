@@ -11,9 +11,9 @@ This document describes the refactored offline pipeline: extract ALL data locall
 │  1. Download raw datasets from HF                                       │
 │     (khanh252004/multimodal_crypto_sentiment_btc/eth)                   │
 │                                                                          │
-│  2. Extract embeddings offline (frozen FinBERT + ResNet50)              │
+│  2. Extract embeddings offline (frozen FinBERT + ViT)              │
 │     - Text: 768-dim → 256-dim projection                                │
-│     - Image: 2048-dim → 256-dim projection                              │
+│     - Image: 768-dim → 256-dim projection                              │
 │                                                                          │
 │  3. Extract & scale TABULAR FEATURES (7 columns)                        │
 │     - StandardScaler: fit on TRAIN split, apply to ALL splits           │
@@ -91,10 +91,10 @@ python src/data/extract_features.py \
 **What happens:**
 1. Downloads raw data from HF (BTC + ETH)
 2. Loads frozen FinBERT (ProsusAI/finbert)
-3. Loads frozen ResNet50 (ImageNet1K weights)
+3. Loads frozen Vision Transformer (ViT) (ImageNet1K pre-trained via HF)
 4. For each split (train/validation/test_in_domain):
    - Extracts text embeddings: [CLS] token → MLP → 256-dim
-   - Extracts image embeddings: avgpool → MLP → 256-dim
+   - Extracts image embeddings: [CLS] token → MLP → 256-dim
    - **Extracts 7 tabular features** ← NEW
    - **Fits StandardScaler on TRAIN, applies to all splits** ← NEW (prevents data leakage)
    - **Scales target_score with RobustScaler** ← EXISTING
@@ -229,7 +229,7 @@ Use in training with:
 2. Loads pre-scaled tabular features (StandardScaler already applied)
 3. Loads pre-scaled target scores (RobustScaler already applied)
 4. **NO HuggingFace dataset loading** ✅
-5. **NO FinBERT or ResNet50 downloads** ✅
+5. **NO FinBERT or ViT downloads** ✅
 6. **NO scaling operations in training** ✅
 7. Creates dataloaders with pre-scaled data
 8. Trains lightweight fusion network
@@ -325,7 +325,7 @@ The dataset automatically validates that all shapes match:
 **3. No Network Overhead**
 - Zero HuggingFace dataset loading on Kaggle
 - Instant data loading from local Kaggle cache
-- No FinBERT/ResNet50 model downloads
+- No FinBERT/ViT model downloads
 - Bandwidth savings: 6.3 GB → 182 MB
 
 **4. Simplified Training**
@@ -447,7 +447,7 @@ Should see ~6-8GB usage. If more, check:
 
 **✅ Phase 1 Complete (Local Machine)**
 - Extracts: 62,266 train + 13,342 validation + 13,250 test samples
-- All modalities: Text (FinBERT) + Image (ResNet50) embeddings + Tabular features + Target scores
+- All modalities: Text (FinBERT) + Image (ViT) embeddings + Tabular features + Target scores
 - All features: Pre-scaled with proper train/val/test split handling
 - Total time: ~52 minutes on RTX 4050 Laptop GPU
 - Upload to Kaggle: Ready to push

@@ -1,7 +1,7 @@
 """
 Offline Feature Extraction Pipeline
 
-Extracts embeddings from frozen FinBERT and ResNet50 once, saves to disk.
+Extracts embeddings from frozen FinBERT and Vision Transformer (ViT) once, saves to disk.
 Eliminates per-batch backbone computations and I/O overhead during training.
 
 Usage:
@@ -28,7 +28,7 @@ except ImportError:
 try:
     import torchvision.models as models
 except ImportError:
-    raise ImportError("'torchvision' package required: pip install torchvision")
+    logger.warning("'torchvision' package not required (using ViT instead of ResNet)")
 
 try:
     from datasets import load_dataset, concatenate_datasets
@@ -97,7 +97,7 @@ class FrozenTextEncoder(nn.Module):
 
 class FrozenImageEncoder(nn.Module):
     """
-    Frozen ResNet50 encoder for extracting image embeddings.
+    Frozen Vision Transformer (ViT) encoder for extracting image embeddings.
     
     Input: (batch, 3, 224, 224) RGB images (normalized [0, 1])
     Output: (batch, 256) embeddings
@@ -107,18 +107,18 @@ class FrozenImageEncoder(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        logger.info("Loading ResNet50...")
-        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        logger.info("Loading Vision Transformer (ViT)...")
+        vit = AutoModel.from_pretrained("google/vit-base-patch16-224")
         
         # Freeze backbone
-        for param in resnet.parameters():
+        for param in vit.parameters():
             param.requires_grad = False
         
-        # Remove classification head, keep backbone + avgpool
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])  # Up to avgpool
+        self.backbone = vit
         
-        # Project avgpool output (2048) to hidden_dim
-        self.projection = nn.Linear(2048, hidden_dim)
+        # Project ViT output (768D) to hidden_dim (256D)
+        vit_hidden_size = 768  # google/vit-base-patch16-224 output dimension
+        self.projection = nn.Linear(vit_hidden_size, hidden_dim)
         nn.init.xavier_uniform_(self.projection.weight)
         self.dropout = nn.Dropout(0.2)
     
@@ -131,9 +131,10 @@ class FrozenImageEncoder(nn.Module):
             (batch, hidden_dim)
         """
         with torch.no_grad():
-            features = self.backbone(images)  # (batch, 2048, 1, 1)
+            outputs = self.backbone(images, return_dict=True)
+            # ViT returns [CLS] token at position 0
+            features = outputs.last_hidden_state[:, 0, :]  # (batch, 768)
         
-        features = features.squeeze(-1).squeeze(-1)  # (batch, 2048)
         projected = self.projection(features)  # (batch, hidden_dim)
         return self.dropout(projected)
 
@@ -261,7 +262,7 @@ def extract_image_embeddings(
         encoder: FrozenImageEncoder
         output_path: Path to save embeddings
         batch_size: Batch size for processing
-        image_size: ResNet50 input size
+        image_size: ViT input size
         device: "cuda" or "cpu"
     """
     logger.info(f"Extracting image embeddings ({len(dataset)} samples)...")
@@ -680,7 +681,7 @@ def push_features_to_kaggle(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract and cache FinBERT text and ResNet50 image embeddings"
+        description="Extract and cache FinBERT text and ViT image embeddings"
     )
     parser.add_argument(
         "--asset",
