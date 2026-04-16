@@ -354,13 +354,6 @@ class Trainer:
                             "learning_rate": current_lr,
                             "global_step": self.global_step,
                         }
-                        
-                        # Add GPU memory stats if available
-                        if torch.cuda.is_available():
-                            log_dict["gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
-                            log_dict["gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
-                            log_dict["gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
-                        
                         safe_wandb_log(log_dict)
             
             # Accumulate loss for epoch average
@@ -724,17 +717,6 @@ def main(args):
             ),
         )
         logger.info(f"✓ W&B initialized: {config.mlops.wandb_project}/{config.mlops.wandb_run_name}")
-        
-        # Log GPU info
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_props = torch.cuda.get_device_properties(0)
-            gpu_memory_total = gpu_props.total_memory / (1024**3)  # GB
-            logger.info(f"✓ GPU: {gpu_name} ({gpu_memory_total:.1f}GB)")
-            wandb.config.update({
-                "gpu_name": gpu_name,
-                "gpu_memory_gb": gpu_memory_total,
-            })
     
     # Resume from checkpoint if requested
     start_epoch = 0
@@ -801,32 +783,7 @@ def main(args):
                 "train_target_min": train_metrics["target_min"],
                 "train_target_max": train_metrics["target_max"],
             }
-            
-            # Add GPU memory stats if available
-            if torch.cuda.is_available():
-                train_log_dict["train_gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
-                train_log_dict["train_gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
-                train_log_dict["train_gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
-            
-            wandb.log(train_log_dict, commit=False)  # Don't commit yet, add visualizations
-            
-            # Create visualizations for training data
-            predictions = train_metrics["predictions"].numpy()
-            targets = train_metrics["targets"].numpy()
-            
-            # Scatter plot (first 500 samples for efficiency)
-            plot_limit = min(500, len(predictions))
-            try:
-                wandb_plot = wandb.plot.scatter(
-                    wandb.Table(data=[
-                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                    ], columns=["Ground Truth", "Prediction"]),
-                    "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
-                )
-                wandb.log({"train_predictions_scatter": wandb_plot}, commit=False)
-            except Exception as e:
-                logger.warning(f"Failed to log training scatter plot: {e}")
-            
+
             # Error histogram
             errors = predictions - targets
             try:
@@ -881,14 +838,6 @@ def main(args):
                     "val_target_max": val_metrics["target_max"],
                     "val_is_denormalized": val_metrics.get("is_denormalized", False),
                 }
-                
-                # Add GPU memory stats
-                if torch.cuda.is_available():
-                    val_log_dict["val_gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
-                    val_log_dict["val_gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
-                    val_log_dict["val_gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
-                
-                wandb.log(val_log_dict, commit=False)
                 
                 # Create prediction error scatter plot (ground truth vs predictions)
                 predictions = val_metrics["predictions"].numpy()
@@ -991,14 +940,6 @@ def main(args):
             "test_target_max": test_metrics["target_max"],
             "test_is_denormalized": test_metrics.get("is_denormalized", False),
         }
-        
-        # Add GPU memory stats
-        if torch.cuda.is_available():
-            test_log_dict["test_gpu_memory_allocated_mb"] = torch.cuda.memory_allocated() / (1024**2)
-            test_log_dict["test_gpu_memory_reserved_mb"] = torch.cuda.memory_reserved() / (1024**2)
-            test_log_dict["test_gpu_memory_percent"] = (torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory) * 100
-        
-        wandb.log(test_log_dict, commit=False)
         
         # Create prediction error scatter plot (ground truth vs predictions)
         predictions = test_metrics["predictions"].numpy()
