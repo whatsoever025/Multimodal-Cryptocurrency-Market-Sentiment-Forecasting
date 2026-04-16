@@ -67,6 +67,66 @@ def safe_wandb_log(log_dict: Dict, commit: bool = True) -> bool:
         return False
 
 
+class EarlyStopping:
+    """
+    Early stopping callback to prevent overfitting.
+    Stops training if validation loss doesn't improve for N consecutive epochs.
+    """
+    
+    def __init__(self, patience: int = 7, verbose: bool = True):
+        """
+        Args:
+            patience: Number of epochs with no improvement after which training will be stopped
+            verbose: Whether to log early stopping events
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+    
+    def __call__(self, val_loss: float) -> bool:
+        """
+        Check if training should be stopped.
+        
+        Args:
+            val_loss: Current validation loss
+        
+        Returns:
+            True if training should stop, False otherwise
+        """
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            return False
+        
+        if val_loss < self.best_loss:
+            # Improvement detected
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.verbose:
+                logger.info(f"✓ Early Stopping: Validation loss improved to {val_loss:.6f}")
+            return False
+        else:
+            # No improvement
+            self.counter += 1
+            if self.verbose:
+                logger.info(
+                    f"⚠ Early Stopping: No improvement for {self.counter}/{self.patience} epochs "
+                    f"(best: {self.best_loss:.6f}, current: {val_loss:.6f})"
+                )
+            
+            if self.counter >= self.patience:
+                if self.verbose:
+                    logger.warning(
+                        f"🛑 Early Stopping triggered! No improvement for {self.patience} consecutive epochs. "
+                        f"Stopping training to prevent overfitting."
+                    )
+                self.early_stop = True
+                return True
+        
+        return False
+
+
 class Trainer:
     """
     Training orchestrator with state management, checkpointing, and MLOps integration.
@@ -77,6 +137,7 @@ class Trainer:
         config: ExperimentConfig,
         model: nn.Module,
         device: str = "cuda",
+        target_scaler=None,
     ):
         """
         Initialize trainer.
@@ -85,10 +146,12 @@ class Trainer:
             config: ExperimentConfig instance
             model: MultimodalFusionNet or similar
             device: "cuda" or "cpu"
+            target_scaler: Fitted RobustScaler for inverse transforms on test/val metrics (optional)
         """
         self.config = config
         self.model = model.to(device)
         self.device = device
+        self.target_scaler = target_scaler  # For denormalizing predictions/targets
         
         # Optimizer & scheduler
         self.optimizer = None
@@ -104,6 +167,8 @@ class Trainer:
         self.val_metrics_history = []  # Store all validation metrics for comparison
         
         logger.info(f"Trainer initialized (device={device})")
+        if self.target_scaler is not None:
+            logger.info("✓ Target scaler loaded for inverse transforms on validation/test")
     
     def setup_optimizer(self) -> None:
         """
@@ -229,8 +294,9 @@ class Trainer:
             all_predictions.append(predictions.detach().cpu())
             all_targets.append(targets.detach().cpu())
             
-            # Compute MSE loss
-            loss = nn.MSELoss()(predictions, targets)
+            # Compute HuberLoss (robust to outliers)
+            # More stable than MSE for noisy market data with outliers
+            loss = nn.HuberLoss(delta=1.0)(predictions, targets)
             
             # Scale loss for gradient accumulation
             # Prevents accumulated gradients from growing too large
@@ -378,13 +444,16 @@ class Trainer:
         - Statistical metrics: R², correlation, prediction bias, error std
         - Ground truth vs prediction logging
         
+        If target_scaler is available: applies inverse transforms to report metrics in original scale.
+        Otherwise: reports metrics in normalized scale.
+        
         Args:
             val_loader: Validation DataLoader
         
         Returns:
             Dict with keys: 'mse', 'mae', 'rmse', 'r2', 'correlation', 
                           'prediction_error_mean', 'prediction_error_std',
-                          'predictions', 'targets'
+                          'predictions', 'targets', 'is_denormalized'
         """
         self.model.eval()
         total_mse = 0.0
@@ -404,7 +473,7 @@ class Trainer:
                 predictions = self.model(batch)  # (batch,)
                 targets = batch["target"]  # (batch,)
                 
-                # Compute metrics
+                # Compute metrics (on normalized scale for loss)
                 mse = nn.MSELoss()(predictions, targets)
                 mae = nn.L1Loss()(predictions, targets)
                 
@@ -416,14 +485,31 @@ class Trainer:
                 all_predictions.append(predictions.cpu())
                 all_targets.append(targets.cpu())
         
+        # Concatenate all predictions and targets
+        all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
+        all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
+        
+        # Apply inverse transform if scaler is available
+        is_denormalized = False
+        if self.target_scaler is not None:
+            logger.debug("Applying inverse transform to predictions and targets...")
+            # RobustScaler inverse_transform expects (n_samples, 1) shape
+            all_predictions_denorm = self.target_scaler.inverse_transform(
+                all_predictions.numpy().reshape(-1, 1)
+            ).squeeze()
+            all_targets_denorm = self.target_scaler.inverse_transform(
+                all_targets.numpy().reshape(-1, 1)
+            ).squeeze()
+            
+            all_predictions = torch.from_numpy(all_predictions_denorm).float()
+            all_targets = torch.from_numpy(all_targets_denorm).float()
+            is_denormalized = True
+            logger.debug("✓ Inverse transform applied (metrics computed on original scale)")
+        
         # Compute per-batch averages
         avg_mse = total_mse / num_steps
         avg_mae = total_mae / num_steps
         self.val_losses.append(avg_mse)
-        
-        # Concatenate all predictions and targets
-        all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
-        all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
         
         # Compute additional metrics
         rmse = torch.sqrt(torch.tensor(avg_mse)).item()
@@ -465,6 +551,7 @@ class Trainer:
             "target_max": target_max,
             "predictions": all_predictions,
             "targets": all_targets,
+            "is_denormalized": is_denormalized,
         }
     
     def save_checkpoint(self, path: Path, is_best: bool = False) -> None:
@@ -590,7 +677,7 @@ def main(args):
     # CRITICAL: Enforce num_workers=0 regardless of config
     logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
     try:
-        dataloaders = create_dataloaders(
+        dataloaders, scalers_dict = create_dataloaders(
             config,
             features_dir=args.features_dir,
             num_workers=0  # CRITICAL: Always 0 on Kaggle
@@ -606,6 +693,9 @@ def main(args):
     val_loader = dataloaders["validation"]
     test_loader = dataloaders["test_in_domain"]  # Load test dataloader for final evaluation
     
+    # Extract scalers for inverse transforms
+    target_scaler = scalers_dict.get("target_scaler", None)
+    
     # Initialize model
     logger.info("\n" + "-" * 80)
     logger.info("Initializing model...")
@@ -613,7 +703,7 @@ def main(args):
     logger.info(f"Model device: {next(model.parameters()).device}")
     
     # Initialize trainer
-    trainer = Trainer(config, model, device=device)
+    trainer = Trainer(config, model, device=device, target_scaler=target_scaler)
     trainer.setup_optimizer()
     
     # W&B initialization
@@ -671,6 +761,12 @@ def main(args):
     logger.info("-" * 80 + "\n")
     print("[PROGRESS] ✓ Setup complete, training begins now...")
     sys.stdout.flush()
+    
+    # ==================== EARLY STOPPING INITIALIZATION ====================
+    early_stopping = EarlyStopping(
+        patience=config.training.early_stopping_patience,
+        verbose=True
+    )
     
     for epoch in range(start_epoch, config.training.max_epochs):
         trainer.epoch = epoch
@@ -758,12 +854,13 @@ def main(args):
         if (epoch + 1) % config.mlops.eval_frequency == 0:
             val_metrics = trainer.validate(val_loader)
             val_mse = val_metrics["mse"]
+            denorm_status = " (denormalized)" if val_metrics.get("is_denormalized", False) else ""
             logger.info(
                 f"Epoch {epoch+1:3d} | "
                 f"Val MSE {val_mse:.6f} | "
                 f"Val RMSE {val_metrics['rmse']:.6f} | "
                 f"Val MAE {val_metrics['mae']:.6f} | "
-                f"Val R² {val_metrics['r2']:.6f}"
+                f"Val R² {val_metrics['r2']:.6f}{denorm_status}"
             )
             
             # Log comprehensive metrics to W&B
@@ -782,6 +879,7 @@ def main(args):
                     "val_pred_max": val_metrics["pred_max"],
                     "val_target_min": val_metrics["target_min"],
                     "val_target_max": val_metrics["target_max"],
+                    "val_is_denormalized": val_metrics.get("is_denormalized", False),
                 }
                 
                 # Add GPU memory stats
@@ -839,6 +937,16 @@ def main(args):
                 
                 checkpoint_path = config.mlops.checkpoint_dir / f"{config.mlops.wandb_run_name}_best.pt"
                 trainer.save_checkpoint(checkpoint_path, is_best=True)
+            
+            # Check early stopping
+            if early_stopping(val_mse):
+                logger.info(
+                    f"\n{'='*80}\n"
+                    f"🛑 EARLY STOPPING: Training stopped at epoch {epoch+1}\n"
+                    f"Best validation loss: {trainer.best_val_loss:.6f} (epoch {trainer.best_epoch})\n"
+                    f"{'='*80}\n"
+                )
+                break  # Exit the epoch loop
         
         # Save periodic checkpoint
         if (epoch + 1) % config.mlops.save_frequency == 0:
@@ -853,9 +961,10 @@ def main(args):
     
     test_metrics = trainer.validate(test_loader)
     test_mse = test_metrics["mse"]
+    denorm_status = " (denormalized to original scale)" if test_metrics.get("is_denormalized", False) else " (normalized scale)"
     
     logger.info(
-        f"Test Results:\n"
+        f"Test Results{denorm_status}:\n"
         f"  MSE:  {test_metrics['mse']:.6f}\n"
         f"  RMSE: {test_metrics['rmse']:.6f}\n"
         f"  MAE:  {test_metrics['mae']:.6f}\n"
@@ -880,6 +989,7 @@ def main(args):
             "test_pred_max": test_metrics["pred_max"],
             "test_target_min": test_metrics["target_min"],
             "test_target_max": test_metrics["target_max"],
+            "test_is_denormalized": test_metrics.get("is_denormalized", False),
         }
         
         # Add GPU memory stats

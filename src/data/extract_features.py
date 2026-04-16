@@ -1,7 +1,7 @@
 """
 Offline Feature Extraction Pipeline
 
-Extracts embeddings from frozen FinBERT and Vision Transformer (ViT) once, saves to disk.
+Extracts embeddings from frozen FinBERT and ResNet50 once, saves to disk.
 Eliminates per-batch backbone computations and I/O overhead during training.
 
 Usage:
@@ -28,7 +28,7 @@ except ImportError:
 try:
     import torchvision.models as models
 except ImportError:
-    logger.warning("'torchvision' package not required (using ViT instead of ResNet)")
+    raise ImportError("'torchvision' package required: pip install torchvision")
 
 try:
     from datasets import load_dataset, concatenate_datasets
@@ -41,11 +41,6 @@ except ImportError:
     raise ImportError("'huggingface_hub' required: pip install huggingface_hub")
 
 # Scalers removed - will be applied during training in Kaggle, not during extraction
-
-try:
-    from kaggle.api.kaggle_api_extended import KaggleApi
-except ImportError:
-    raise ImportError("'kaggle' required: pip install kaggle")
 
 from tqdm import tqdm
 from ..training.utils import setup_logging, format_duration
@@ -262,7 +257,7 @@ def extract_image_embeddings(
         encoder: FrozenImageEncoder
         output_path: Path to save embeddings
         batch_size: Batch size for processing
-        image_size: ViT input size
+        image_size: ResNet50 input size
         device: "cuda" or "cpu"
     """
     logger.info(f"Extracting image embeddings ({len(dataset)} samples)...")
@@ -614,31 +609,24 @@ def push_features_to_kaggle(
     public: bool = False,
 ) -> None:
     """
-    Upload extracted features to Kaggle dataset.
+    Prepare extracted features for Kaggle dataset upload via CLI.
+    
+    Creates metadata file. Use Kaggle CLI for actual upload:
+    $ kaggle datasets version -m "message" -p .
     
     Args:
         output_dir: Directory containing .pt files
         dataset_name: Kaggle dataset name (e.g., crypto-sentiment-features)
-        kaggle_username: Kaggle API username
-        kaggle_key: Kaggle API key
-        public: Whether to make dataset public
+        kaggle_username: Kaggle API username (for metadata reference)
+        kaggle_key: Kaggle API key (unused, kept for backward compatibility)
+        public: Whether to make dataset public (for future use)
     """
-    logger.info(f"\nUploading features to Kaggle: {dataset_name}...")
-    print(f"\n[PROGRESS] Uploading features to Kaggle: {dataset_name}...")
+    logger.info(f"\nPreparing features for Kaggle upload: {dataset_name}...")
+    print(f"\n[PROGRESS] Preparing features for Kaggle upload: {dataset_name}...")
     sys.stdout.flush()
     
     try:
         import json
-        import os
-        
-        # Initialize Kaggle API with credentials
-        # Set environment variables for Kaggle authentication
-        os.environ['KAGGLE_USERNAME'] = kaggle_username
-        os.environ['KAGGLE_KEY'] = kaggle_key
-        
-        api = KaggleApi()
-        api.authenticate()
-        logger.info(f"✓ Kaggle authentication successful")
         
         # Create dataset metadata
         metadata = {
@@ -650,7 +638,7 @@ def push_features_to_kaggle(
         
         # Find all .pt files
         pt_files = sorted(list(output_dir.glob("*.pt")))
-        logger.info(f"Found {len(pt_files)} .pt files to upload")
+        logger.info(f"Found {len(pt_files)} .pt files")
         
         for pt_file in pt_files:
             metadata["resources"].append({
@@ -663,15 +651,11 @@ def push_features_to_kaggle(
             json.dump(metadata, f, indent=2)
         logger.info(f"✓ Metadata created: {metadata_path}")
         
-        # Create/update dataset on Kaggle
-        logger.info(f"Creating/updating dataset on Kaggle...")
-        api.dataset_create_new(
-            folder=str(output_dir),
-            public=public,
-            quiet=False
-        )
-        logger.info(f"✓ Dataset uploaded successfully")
-        print(f"[PROGRESS] ✓ Features uploaded to Kaggle: {kaggle_username}/{dataset_name}")
+        # Instructions for CLI upload
+        logger.info(f"\nTo upload to Kaggle, use the CLI:")
+        logger.info(f"  cd {output_dir}")
+        logger.info(f"  kaggle datasets version -m 'Updated features' -p .")
+        print(f"[PROGRESS] ✓ Metadata ready. Use CLI to upload: kaggle datasets version -p .")
         sys.stdout.flush()
         
     except Exception as e:
@@ -681,7 +665,7 @@ def push_features_to_kaggle(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract and cache FinBERT text and ViT image embeddings"
+        description="Extract and cache FinBERT text and ResNet50 image embeddings"
     )
     parser.add_argument(
         "--asset",

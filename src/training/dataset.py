@@ -347,7 +347,7 @@ def create_dataloaders(
     features_dir: str = None,
     num_workers: int = 0,  # Always 0 on Kaggle (multi-worker deadlock fix)
     pin_memory: bool = True,
-) -> Dict[str, torch.utils.data.DataLoader]:
+) -> Tuple[Dict[str, torch.utils.data.DataLoader], Dict[str, Any]]:
     """
     Create DataLoaders for all splits with progress tracking.
     
@@ -366,12 +366,15 @@ def create_dataloaders(
         pin_memory: Pin memory for faster GPU transfer
     
     Returns:
-        Dict with keys "train", "validation", "test" and DataLoader values
+        Tuple of (dataloaders_dict, scalers_dict) where:
+        - dataloaders_dict: Dict with keys "train", "validation", "test" and DataLoader values
+        - scalers_dict: Dict with keys "tabular_scaler" and "target_scaler" for inverse transforms
     """
     # CRITICAL: Force num_workers=0 regardless of parameter or config
     num_workers = 0
     
     dataloaders = {}
+    scalers_dict = {}  # Store scalers from datasets for inverse transforms
     
     overall_start = time.time()
     
@@ -389,6 +392,12 @@ def create_dataloaders(
                 features_dir=features_dir,
                 debug=config.debug if hasattr(config, "debug") else False,
             )
+            
+            # Store scalers from train split for inverse transforms
+            if split_name == "train":
+                scalers_dict["tabular_scaler"] = dataset.tabular_scaler
+                scalers_dict["target_scaler"] = dataset.target_scaler
+                logger.info("✓ Scalers extracted from training dataset")
             
             # Create dataloader
             dataloader = torch.utils.data.DataLoader(
@@ -415,7 +424,7 @@ def create_dataloaders(
     print(f"\n[PROGRESS] ✓ All dataloaders created! Total time: {format_duration(total_time)}")
     sys.stdout.flush()
     
-    return dataloaders
+    return dataloaders, scalers_dict
 
 
 if __name__ == "__main__":

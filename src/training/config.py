@@ -41,8 +41,10 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     """Architecture configuration."""
-    hidden_dim: int = 256  # Hidden dimension in encoders/LSTM - MUST match embedding dimensions (256D)
-    lstm_layers: int = 2
+    hidden_dim: int = 256  # Hidden dimension in encoders/attention - MUST match embedding dimensions (256D)
+    bottleneck_dim: int = 64  # Bottleneck layer: 256 -> 64 (compression before LSTM)
+    lstm_layers: int = 1  # Simplified: reduced from 2 to 1
+    lstm_hidden_dim: int = 64  # Simplified: reduced from 256 to 64
     lstm_dropout: float = 0.2
     attention_heads: int = 4
     mha_dropout: float = 0.1
@@ -72,13 +74,14 @@ class TrainingConfig:
     """Training loop configuration."""
     max_epochs: int = 60  # Increased from 50 (more capacity needs more training)
     learning_rate: float = 5e-5  # Conservative for multimodal fine-tuning with AMP
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-3  # Increased from 1e-5 for stronger L2 regularization
     accumulate_steps: int = 2  # Gradient accumulation for 16GB VRAM
     warmup_steps: int = 800  # Increased warmup for larger model (was 500)
     warmup_proportion: float = 0.1  # Alternate: warmup as % of total steps
     use_warmup: bool = True
     scheduler_type: str = "cosine"  # "cosine" or "constant"
     num_training_steps: Optional[int] = None  # Set during training loop
+    early_stopping_patience: int = 7  # Stop if no improvement for 7 epochs
 
     def __post_init__(self):
         """Validate training config."""
@@ -92,6 +95,8 @@ class TrainingConfig:
             raise ValueError(f"accumulate_steps must be > 0, got {self.accumulate_steps}")
         if self.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
+        if self.early_stopping_patience <= 0:
+            raise ValueError(f"early_stopping_patience must be > 0, got {self.early_stopping_patience}")
 
 
 @dataclass
