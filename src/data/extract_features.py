@@ -1,7 +1,7 @@
 """
 Offline Feature Extraction Pipeline
 
-Extracts embeddings from frozen FinBERT and ResNet50 once, saves to disk.
+Extracts embeddings from frozen FinBERT and Vision Transformer (ViT) once, saves to disk.
 Eliminates per-batch backbone computations and I/O overhead during training.
 
 Usage:
@@ -257,7 +257,7 @@ def extract_image_embeddings(
         encoder: FrozenImageEncoder
         output_path: Path to save embeddings
         batch_size: Batch size for processing
-        image_size: ResNet50 input size
+        image_size: Vision Transformer (ViT) input size
         device: "cuda" or "cpu"
     """
     logger.info(f"Extracting image embeddings ({len(dataset)} samples)...")
@@ -665,7 +665,7 @@ def push_features_to_kaggle(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract and cache FinBERT text and ResNet50 image embeddings"
+        description="Extract and cache FinBERT text and Vision Transformer image embeddings"
     )
     parser.add_argument(
         "--asset",
