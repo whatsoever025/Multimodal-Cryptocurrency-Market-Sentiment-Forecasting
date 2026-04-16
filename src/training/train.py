@@ -783,6 +783,25 @@ def main(args):
                 "train_target_min": train_metrics["target_min"],
                 "train_target_max": train_metrics["target_max"],
             }
+            
+            wandb.log(train_log_dict, commit=False)  # Don't commit yet, add visualizations
+            
+            # Create visualizations for training data
+            predictions = train_metrics["predictions"].numpy()
+            targets = train_metrics["targets"].numpy()
+            
+            # Scatter plot (first 500 samples for efficiency)
+            plot_limit = min(500, len(predictions))
+            try:
+                wandb_plot = wandb.plot.scatter(
+                    wandb.Table(data=[
+                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                    ], columns=["Ground Truth", "Prediction"]),
+                    "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
+                )
+                wandb.log({"train_predictions_scatter": wandb_plot}, commit=False)
+            except Exception as e:
+                logger.warning(f"Failed to log training scatter plot: {e}")
 
             # Error histogram
             errors = predictions - targets
@@ -838,6 +857,8 @@ def main(args):
                     "val_target_max": val_metrics["target_max"],
                     "val_is_denormalized": val_metrics.get("is_denormalized", False),
                 }
+                
+                wandb.log(val_log_dict, commit=False)
                 
                 # Create prediction error scatter plot (ground truth vs predictions)
                 predictions = val_metrics["predictions"].numpy()
@@ -940,6 +961,8 @@ def main(args):
             "test_target_max": test_metrics["target_max"],
             "test_is_denormalized": test_metrics.get("is_denormalized", False),
         }
+        
+        wandb.log(test_log_dict, commit=False)
         
         # Create prediction error scatter plot (ground truth vs predictions)
         predictions = test_metrics["predictions"].numpy()
