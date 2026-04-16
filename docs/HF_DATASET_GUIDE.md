@@ -66,14 +66,18 @@ target_score: float  # Continuous sentiment (-100 to +100)
 
 ---
 
-## 📥 Loading the Datasets
+## 📥 Loading the Datasets (For Local Extraction Only)
+
+> ⚠️ **IMPORTANT:** These HuggingFace datasets are used **ONLY for offline feature extraction** on your local machine (via `src/data/extract_features.py`). 
+>
+> **During training on Kaggle, load ONLY from Kaggle .pt files** — NOT from HuggingFace. See [PIPELINE.md](./PIPELINE.md) for details.
 
 ### Quick Start
 
 ```python
 from datasets import load_dataset
 
-# Load BTC dataset
+# Load BTC dataset (for LOCAL EXTRACTION ONLY)
 dataset_btc = load_dataset("khanh252004/multimodal_crypto_sentiment_btc")
 
 # Access splits
@@ -88,6 +92,8 @@ print(sample.keys())
 #          'gdelt_econ_volume', 'gdelt_econ_tone', 'gdelt_conflict_volume',
 #          'text_content', 'image_path', 'target_score']
 ```
+
+**After extraction, upload all .pt files to Kaggle, then use Kaggle dataset for training (see [PIPELINE.md Phase 2](./PIPELINE.md#phase-2-kaggle-training)).**
 
 ### Accessing Different Modalities
 

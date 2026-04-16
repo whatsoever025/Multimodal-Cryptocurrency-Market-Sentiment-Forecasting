@@ -28,25 +28,31 @@ This document describes the refactored offline pipeline: extract ALL data locall
 │  Files on Kaggle:                                                        │
 │    text_embeddings_{train,validation,test_in_domain}.pt                 │
 │    image_embeddings_{train,validation,test_in_domain}.pt                │
-│    tabular_features_scaled_{train,validation,test_in_domain}.pt         │
-│    target_scores_scaled_{train,validation,test_in_domain}.pt            │
+│    tabular_features_{train,validation,test_in_domain}.pt                │
+│    target_scores_{train,validation,test_in_domain}.pt                   │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  PHASE 2: Kaggle Training (NO HuggingFace loading, NO scaling)         │
+│  PHASE 2: Kaggle Training (NO HuggingFace loading during training)     │
 │                                                                          │
 │  1. Clone repo on Kaggle                                                │
-│  2. pip install -r requirements.txt                                     │
-│  3. Load ALL data from Kaggle .pt files (local disk)                    │
-│  4. Data is ALREADY SCALED - use as-is in training                      │
-│  5. Train lightweight fusion network                                    │
-│     - Tabular MLP + Cross-modal Attention + Temporal LSTM               │
-│     - 13MB model vs 6GB (vs 6.3GB if online)                            │
-│     - 6-8GB VRAM (vs 12-13GB if online)                                 │
-│     - 3-5x faster training                                              │
+│  2. Add Kaggle dataset as input (crypto-sentiment-features)             │
+│  3. pip install -r requirements.txt                                     │
+│  4. Load ALL data from Kaggle .pt files (local disk, instant)           │
+│  5. Apply StandardScaler (train statistics) to tabular features         │
+│  6. Apply RobustScaler (train statistics) to target scores              │
+│  7. Train lightweight fusion network                                    │
+│     - FinBERT (frozen) + ViT (frozen) + TabularEncoder                  │
+│     - CrossModalAttention + Temporal LSTM + PredictionHead              │
+│     - 13MB model ⚡ (vs 6GB backbones)                                   │
+│     - 6-8GB VRAM ⚡ (vs 12-13GB with online loading)                      │
+│     - 3-5x faster training ⚡ (vs extracting + streaming from HF)        │
 │                                                                          │
-│  ADVANTAGE: Zero network overhead, no HF dataset loading                │
-│            All data cached locally on Kaggle                            │
+│  ADVANTAGES:                                                             │
+│  ✓ Zero HuggingFace I/O overhead during training                        │
+│  ✓ All data locally cached on Kaggle                                    │
+│  ✓ Pre-extracted embeddings (no FinBERT/ViT inference needed)           │
+│  ✓ Proper data leakage prevention (scalers fit on train only)           │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 

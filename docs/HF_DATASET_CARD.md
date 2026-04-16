@@ -135,13 +135,17 @@ target_score: float  # Continuous sentiment (-100 to +100)
 
 ---
 
-## Loading the Dataset
+## Loading the Dataset (For Extraction Only)
+
+> ⚠️ **IMPORTANT:** This dataset is used **ONLY for offline feature extraction** via `src/data/extract_features.py` on your local machine.
+>
+> **Training uses Kaggle dataset** (pre-extracted .pt files), NOT HuggingFace. See [PIPELINE.md](./PIPELINE.md).
 
 ### Quick Start
 ```python
 from datasets import load_dataset
 
-# Load Bitcoin dataset
+# Load Bitcoin dataset (for LOCAL EXTRACTION ONLY)
 dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_btc")
 
 # Access splits
@@ -155,6 +159,10 @@ print(sample.keys())
 # ['timestamp', 'return_1h', 'volume', 'funding_rate', 'fear_greed_value',
 #  'gdelt_econ_volume', 'gdelt_econ_tone', 'gdelt_conflict_volume',
 #  'text_content', 'image_path', 'target_score']
+
+# After loading, run extraction to save .pt files:
+# python src/data/extract_features.py --asset MULTI
+# Then upload to Kaggle for training.
 ```
 
 ### Access by Modality
@@ -322,6 +330,29 @@ Testing Phase:
 
 ---
 
+## Training Pipeline
+
+This HuggingFace dataset is **sourced for local extraction only**. For training:
+
+1. **Extract locally** (1-2 hours):
+   ```bash
+   python src/data/extract_features.py --asset MULTI --force
+   ```
+   Outputs: `data/features/*.pt` (text/image embeddings, tabular, targets)
+
+2. **Upload to Kaggle** (optional):
+   ```bash
+   python src/data/extract_features.py --asset MULTI --kaggle-upload
+   ```
+
+3. **Train on Kaggle** (zero HuggingFace dependencies):
+   ```bash
+   # In Kaggle notebook with crypto-sentiment-features dataset added as input
+   python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-features
+   ```
+
+See [PIPELINE.md](./PIPELINE.md) for complete instructions.
+
 ## Citation
 
 ```bibtex
@@ -332,7 +363,7 @@ Testing Phase:
   month={March},
   url={https://huggingface.co/datasets/khanh252004/multimodal_crypto_sentiment_btc},
   doi={},
-  note={BTC & ETH datasets with 10-field multimodal structure, 24-hour embargo embargo splits}
+  note={BTC & ETH datasets with 10-field multimodal structure, used for offline extraction to Kaggle}
 }
 ```
 

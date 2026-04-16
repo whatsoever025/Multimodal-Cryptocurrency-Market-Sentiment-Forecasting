@@ -10,11 +10,11 @@
 
 **MultimodalFusionNet** is a production-grade multimodal sentiment forecasting architecture with **offline feature extraction**. It accepts pre-computed text and image embeddings (extracted via frozen FinBERT and Vision Transformer backbones) and fuses them with tabular features using cross-modal attention and temporal LSTM for continuous sentiment score prediction.
 
-**Purpose:** Forecast cryptocurrency sentiment on a continuous scale (-100 to +100) using combined textual, visual, and numerical market data with **zero I/O bottlenecks and zero float16 NaN issues**.
+**Purpose:** Forecast cryptocurrency sentiment on a continuous scale (-100 to +100) using combined textual, visual, and numerical market data with **zero I/O bottlenecks, lightweight architecture (~330K params), and pure float32 stability**.
 
 **Pipeline:**
 1. **Offline Phase** (run once): Extract FinBERT text embeddings & Vision Transformer (ViT) image embeddings → save as `.pt` files
-2. **Training Phase** (fast & stable): Load pre-extracted embeddings + apply TabularEncoder, CrossModalAttention, LSTM, PredictionHead
+2. **Training Phase** (fast & stable): Load pre-extracted embeddings + apply TabularEncoder, [FUSION] token detector, CrossModalAttention, Temporalor, CrossModalAttention, TemporalLSTM, PredictionHead
 
 ---
 
@@ -107,7 +107,7 @@
 
 #### B. TabularEncoder (Only Trainable Encoder)
 ```
-Input: (batch, seq_len, 7) numeric features (ALREADY SCALED by StandardScaler)
+Input: (batch, seq_len, 7) numeric features (StandardScaler normalized, mean=0, std=1)
        ↓
 Linear (7 → 64) + ReLU + Dropout (0.2)
        ↓
@@ -121,24 +121,26 @@ Output: (batch, seq_len, 256)
 - Activation: ReLU (applied after both linear layers)
 - Weight Initialization: Xavier uniform on all linear layers
 - Trainable: ✅ Yes (only encoder with learnable parameters)
-- Input Preprocessing: Receives StandardScaler-normalized features (mean=0, std=1)
+- Input Preprocessing: StandardScaler-normalized features (applied during dataset initialization, fit on train split only)
 - **Output Dimension: 256** (matches text & image embedding dimensions)
 - Dropout: 0.2 (after each layer)
-- Note: Input is PRE-SCALED by StandardScaler (fit on training split) before reaching this encoder
 - **Critical Design:** Output must be exactly 256D to match pre-extracted embeddings for modality stacking
 
 ---
 
-### 3. **Cross-Modal Attention Layer**
+### 3. **Learnable [FUSION] Token + Cross-Modal Attention**
 
 ```
-Input: (batch, seq_len, 3, 256)  [Stack: text (256) + image (256) + tabular (256)]
+Learnable [FUSION] Token: (1, 1, 256) → expands to (batch, seq_len, 256)
+  ↓ (detector token for cross-modal information)
+
+Input: (batch, seq_len, 4, 256)  [Stack: [FUSION] + text (256) + image (256) + tabular (256)]
        ↓
-       All modalities MUST have matching dimensions (256D) ✓
+       All tokens are 256D ✓
        ↓
-Reshape to (batch*seq_len, 3, 256)  [Treat 3 modalities as sequence]
+Reshape to (batch*seq_len, 4, 256)  [Treat 4 tokens as sequence]
        ↓
-Multi-Head Self-Attention (3 modalities attend to each other)
+Multi-Head Self-Attention (4 tokens attend to each other)
        ├─ embed_dim: 256
        ├─ num_heads: 4
        ├─ dropout: 0.1
@@ -146,77 +148,108 @@ Multi-Head Self-Attention (3 modalities attend to each other)
        ↓
 Residual Connection + LayerNorm
        ↓
-Mean Pooling across modality dimension (average 3 modalities)
-       → (batch*seq_len, 256)
+Extract [FUSION] Token Only (position 0, no mean pooling)
+       → (batch*seq_len, 256)  [learnable fusion representation]
        ↓
 Reshape back to (batch, seq_len, 256)
        ↓
-Output: (batch, seq_len, 256)  [fused representation]
+Output: (batch, seq_len, 256)  [fused representation from [FUSION] detector]
 ```
 
 **Key Properties:**
 - Attention Type: Multi-Head Self-Attention using `torch.nn.MultiheadAttention`
-- Number of Heads: 4 (configurable via `config.model.attention_heads`)
+- Number of Heads: 4
 - Attention Dimension: 256 (matches embedding dimension)
-- Dropout: 0.1 (configurable via `config.model.mha_dropout`)
-- Modalities Treated As: Sequence of length 3 (text, image, tabular)
-- Modality Fusion Strategy: Mean pooling across modality dimension (dim=1 after reshape)
+- Dropout: 0.1
+- Tokens: 4 ([FUSION] detector + 3 modalities: text, image, tabular)
+- Fusion Strategy: **Learnable [FUSION] token extraction** (replaces mean pooling)
 - Residual Connection: Added before LayerNorm for gradient flow
-- **Dimension Consistency:** All 3 modalities are 256D, ensuring proper attention computation
-
----
-
-### 4. **Temporal LSTM Layer**
+- **Innovation:** [FUSION] token learns to extract relevant cross-modal information
+- **Dimension Consistency:** All 4 tokens: text, image, tabular)
+- Fusion Strategy: **Learnable [FUSION] token extraction** (replaces mean pooling)
+- Residual Connection: Added before LayerNorm for gradient flow
+- **Innovation:** [FUSION] token learns to extract relevant cross-modal information
+- **DimenBottleneck Layer**
 
 ```
-Input: (batch, seq_len, 256)  [Fused embeddings from cross-modal attention]
+Input: (batch, seq_len, 256)  [Fused embeddings from [FUSION] token]
        ↓
-LSTM Cell (2 layers, batch-first)
-├─ Input Size: 256
-├─ Hidden Size: 256
-├─ Num Layers: 2
-├─ Batch First: True
-└─ Dropout: 0.2 (between layers, layer 1 → layer 2)
+Linear Projection: 256 → 64
+       ↓
+Output: (batch, seq_len, 64)  [compressed representation]
+```
+
+**Key Properties:**
+- Type: Linear layer (dimensionality reduction)
+- Input Dimension: 256 (from [FUSION] token)
+- Output Dimension: 64 (bottleneck)
+- Purpose: Compress fused features before LSTM (remove redundancy)
+- Reduces parameters in LSTM by 4x
+
+### 5. **Temporal LSTM Layer**
+
+```
+Input: (batch, seq_len, 64)  [Compressed fused embeddings]
+       ↓
+LSTM Cell (1 layer, batch-first)
+├─ Input Size: 64
+├─ Hidden Size: 64
+├─ Num Layers: 1
+└─ Batch First: True
        ↓
 Capture Temporal Dynamics (seq_len timesteps)
        ↓
-Extract Final Hidden State h_n[-1]: (batch, 256)
+Extract Final Hidden State h_n[-1]: (batch, 64)
        ↓
-Output: (batch, 256)
+Output: (batch, 64)
 ```
 
 **Key Properties:**
 - Type: Unidirectional LSTM (left-to-right temporal modeling)
-- Layers: 2
-- Input/Hidden Dimension: 256 (fixed to embedding dimension)
-- Dropout Between Layers: 0.2
-- Output Selection: Final hidden state from last (2nd) layer
-- Purpose: Capture temporal dynamics & market trends across 24-hour window
-
----
-
-### 5. **Prediction Head (MLP)**
+- Layers: 1 (simplified)
+- Input/Hidden Dimension: 64 (from bottleneck)
+- Output Selection: Final hidden state
+       ↓
+LSTM Cell (1 layer, batch-first)
+├─ Input Size: 64
+├─ Hidden Size: 64
+├─ N6. **Prediction Head (MLP)**
 
 ```
-Input: (batch, 256)  [LSTM final hidden state]
+Input: (batch, 64)  [LSTM final hidden state]
        ↓
-Linear (256 → 128) + ReLU + Dropout (0.2)
+Linear (64 → 16) + ReLU + Dropout (0.4)
        ↓
-Linear (128 → 64) + ReLU + Dropout (0.2)
-       ↓
-Linear (64 → 1)
+Linear (16 → 1)
        ↓
 Output: (batch, 1)  [continuous sentiment score]
 ```
 
 **Key Properties:**
-- Architecture: 3-layer MLP
-- Hidden Dimensions: 256 → 128 → 64 → 1
+- Architecture: 2-layer MLP (simplified)
+- Hidden Dimensions: 64 → 16 → 1
 - Activation Functions: ReLU (hidden layers), None (output)
-- Dropout: 0.2 (hidden layers)
+- Dropout: 0.4 (hidden layer)
 - Output Range: Unrestricted float (model learns to predict [-100, +100] range)
 - Weight Initialization: Xavier uniform on all linear layers
-- Loss Function: MSE (Mean Squared Error)
+- Loss Function: HuberLoss (robust to outliers
+Input: (batch, 64)  [LSTM final hidden state]
+       ↓
+Linear (64 → 16) + ReLU + Dropout (0.4)
+       ↓
+Linear (16 → 1)
+       ↓
+Output: (batch, 1)  [continuous sentiment score]
+```
+
+**Key Properties:**
+- Architecture: 2-layer MLP (simplified)
+- Hidden Dimensions: 64 → 16 → 1
+- Activation Functions: ReLU (hidden layers), None (output)
+- Dropout: 0.4 (hidden layer)
+- Output Range: Unrestricted float (model learns to predict [-100, +100] range)
+- Weight Initialization: Xavier uniform on all linear layers
+- Loss Function: HuberLoss (robust to outliers)
 
 ---
 
@@ -226,37 +259,40 @@ Output: (batch, 1)  [continuous sentiment score]
 ```python
 asset: "MULTI"                          # "BTC", "ETH", or "MULTI" (combined)
 seq_len: 24                             # 24-hour sliding window
-batch_size: 128                         # Per-GPU batch size for training
+batch_size: 128                         # Default batch size (reduce to 8 on Kaggle 16GB GPU)
 max_text_length: 512                    # BERT token sequence length
-image_size: 224                         # ViT input size
+image_size: 224                         # ViT input size (224x224 pixels)
 shuffle_train: True
-num_workers: 0                          # Kaggle compatibility (no multiprocessing)
+num_workers: 0                          # CRITICAL: Kaggle compatibility (no multiprocessing)
 pin_memory: True
 prefetch_factor: 2
 ```
 
+**Note:** On Kaggle 16GB GPU, use `batch_size=8` with `accumulate_steps=2` (effective BS=16) for stable training.
+
 ### ModelConfig
 ```python
-hidden_dim: 256                         # Internal embedding dimension (MUST match embedding dimensions)
-lstm_layers: 2                          # Temporal LSTM layers
+hidden_dim: 256                         # Internal embedding dimension (MUST match 256D embeddings)
+lstm_layers: 1                          # Temporal LSTM layers (simplified v2.0)
+lstm_hidden_dim: 64                     # LSTM hidden dimension (simplified v2.0)
 lstm_dropout: 0.2                       # Dropout between LSTM layers
 attention_heads: 4                      # Cross-modal attention heads
 mha_dropout: 0.1                        # Attention layer dropout
 encoder_dropout: 0.2                    # TabularEncoder dropout
 head_dropout: 0.2                       # Prediction head dropout
 grad_clip: 1.0                          # Gradient norm clipping (L2)
-frozen_backbones: True                  # Freeze FinBERT & ViT
+frozen_backbones: True                  # Freeze FinBERT & ViT (not included in model)
 use_gradient_checkpointing: True        # Memory optimization for 16GB VRAM
 ```
 
-**Design Note:** `hidden_dim=256` is **intentionally set to match** the 256D pre-extracted embeddings (FinBERT & ViT projections). This ensures all 3 modalities (text, image, tabular) have identical feature dimensions for proper stacking in CrossModalAttention.
+**Design Note:** `hidden_dim=256` matches the 256D pre-extracted embeddings (FinBERT & ViT projections). This ensures all 3 modalities (text, image, tabular) have identical feature dimensions for proper stacking in CrossModalAttention.
 
 ### TrainingConfig
 ```python
 max_epochs: 60                          # Training epochs
-learning_rate: 5e-5                     # Conservative for multimodal + AMP
+learning_rate: 1e-4                     # Conservative for multimodal + frozen backbones
 weight_decay: 1e-5                      # L2 regularization
-accumulate_steps: 2                     # Gradient accumulation (BS 128 → eff BS 256)
+accumulate_steps: 2                     # Gradient accumulation (BS 8 → eff BS 16)
 warmup_steps: 800                       # Steps for learning rate warmup
 use_warmup: True                        # Enable learning rate warmup
 scheduler_type: "cosine"                # Cosine annealing with warmup
@@ -264,42 +300,46 @@ scheduler_type: "cosine"                # Cosine annealing with warmup
 
 ### OptimizationConfig
 ```python
-mixed_precision: True                   # ✅ Enable torch.cuda.amp.autocast
-dtype: "float16"                        # "float16" or "bfloat16" precision
-use_scaler: True                        # GradScaler for mixed precision
-init_scale: 65536.0                     # Initial loss scale for GradScaler
-growth_factor: 2.0                      # Loss scale growth factor
-backoff_factor: 0.5                     # Loss scale backoff factor
-growth_interval: 2000                   # Steps between growth checks
+training_precision: "float32"           # ✅ Pure float32 (no mixed precision)
+acc_type: "float32"                     # Accumulation in float32
+use_scaler: False                       # No GradScaler (not needed for float32)
+grad_clip: 1.0                          # L2 gradient clipping for LSTM stability
 ```
 
-**Note:** v2.0 uses mixed precision (float16 + float32) with GradScaler, NOT pure float32. Mixed precision reduces VRAM while maintaining stability through automatic loss scaling.
+**Rationale:** v2.0 uses pure float32 training (no AMP) for:
+- Numerical stability in LSTM and attention layers
+- Direct gradient magnitudes (easier debugging)
+- Sufficient VRAM on Kaggle 16GB GPU (BS=8, seq_len=24)
+- No mixed precision complexity (no underflow/overflow concerns)
+- Gradient clipping handles temporal instability
 
 ---
 
 ## Model Statistics
 
-### Parameter Counts (Offline Version)
+### Parameter Counts (Simplified Offline Version v2.0)
 - **FinBERT:** 109M (extracted offline, NOT in model)
 - **Vision Transformer (ViT):** 86M (extracted offline, NOT in model)
 - **Trainable Components:**
-  - TabularEncoder: ~50K
-  - CrossModalAttention: ~600K
-  - TemporalLSTM: ~2.5M
-  - PredictionHead: ~150K
-  - **Total Trainable:** ~3.3M
-- **Model Size:** Only ~13MB (vs ~6GB with backbones)
+  - [FUSION] Token: 256
+  - TabularEncoder: ~17K
+  - CrossModalAttention: ~262K (MultiheadAttention 256D, 4 heads)
+  - Bottleneck Layer: ~16K (256 → 64)
+  - TemporalLSTM (1 layer, 64D): ~33K
+  - PredictionHead (64 → 16 → 1): ~1K
+  - **Total Trainable:** ~330K (10x smaller than v1.0!)
+- **Model Size:** ~1.3MB (vs 13MB in v1.0, vs 6GB with backbones)
 
-### Memory Usage (Kaggle 16GB with AMP)
-- Model Parameters: ~13MB
-- Optimizer States (AdamW): ~26MB
-- Batch (BS=128, seq_len=24, float16 activations): ~6-8GB (embeddings + tabular)
-- Pre-loaded Embeddings: ~2-3GB (text + image for split)
-- GradScaler State: ~1MB
-- **Total: ~10-12GB** (vs 12-13GB without offline extraction)
-- **Headroom:** 4-6GB available for other operations ✅
+### Memory Usage (Kaggle 16GB GPU with Pure Float32)
+- Model Parameters: ~1.3MB
+- Optimizer States (AdamW): ~2.6MB
+- Batch (BS=8, seq_len=24, float32 activations): ~1-2GB
+- Pre-loaded Embeddings (cached during epoch): ~2-3GB (text + image for split)
+- Gradient Storage: ~2.6MB
+- **Total: ~5-6GB** (very comfortable on 16GB GPU)
+- **Headroom:** 10-11GB available for other operations ✅
 
-**Note:** Larger batch size (128 vs 8) requires mixed precision to fit in 16GB.
+**Advantage:** Lightweight model (330K params) leaves plenty of headroom for larger batch sizes, deeper checkpointing, or multi-GPU training.
 
 ---
 
@@ -314,11 +354,11 @@ Note: Targets are continuous sentiment scores [-100, +100]
 ### Optimizer
 ```python
 AdamW Optimizer:
-  - Learning Rate: 1e-4 (higher than online version, only trainable layers)
+  - Learning Rate: 1e-4 (conservative for multimodal + frozen backbones)
   - Weight Decay: 1e-5 (L2 regularization)
   - Betas: (0.9, 0.999) (Adam standard)
   - Epsilon: 1e-8 (numerical stability)
-Note: Applied only to ~3.3M trainable parameters
+Note: Applied only to ~330K trainable parameters
 ```
 
 ### Learning Rate Schedule
@@ -333,23 +373,44 @@ Total Training Steps: len(train_loader) × max_epochs / accumulate_steps
 Example: ~8000 batches × 60 epochs / 2 = ~240K steps
 ```
 
-### Gradient Management (Mixed Precision)
+### Gradient Management (Pure Float32, No AMP)
 ```
-Training Precision: float16 (activations) + float32 (weights)
+Training Precision: float32 throughout (no mixed precision complexity)
 Gradient Accumulation: 2 steps
-  → Effective batch size: 128 × 2 = 256
-  → Enables larger accumulation without float16 underflow
-
-Automatic Loss Scaling (GradScaler):
-  → Initial scale: 65536.0
-  → Growth: ×2 every 2000 steps (if no NaNs)
-  → Backoff: ÷2 if gradient overflow detected
-  → Prevents float16 gradient underflow
+  → Effective batch size: 8 × 2 = 16
+  → Larger effective batch without float16 underflow concerns
 
 Gradient Clipping: L2 norm ≤ 1.0
+  → Prevents explosion in LSTM and attention layers
   → Applied BEFORE optimizer.step()
-  → Prevents explosion in LSTM/Attention
-  → torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+  → No loss scaling needed (native float32)
+
+---
+
+## Key Innovation: [FUSION] Token vs Mean Pooling
+
+### v1.0 (Deprecated):
+```
+text (256) \
+ image (256) → Concat → Mean Pooling → (batch, seq_len, 256)
+ tabular (256) /
+```
+- Fixed pooling operation (no learnable parameters)
+- Equal weight to all modalities
+
+### v2.0 (Current - Superior):
+```
+Learnable [FUSION] Token (256D detector)
+         |
+         ↓
+[FUSION] + text (256) + image (256) + tabular (256) → MultiheadAttention → Extract [FUSION] → (batch, seq_len, 256)
+```
+- **Learnable fusion mechanism** ([FUSION] token learns to extract relevant information)
+- **Adaptive weighting** (attention learns importance of each modality per timestep)
+- **No fixed pooling** (token-based fusion is more flexible)
+- **Parameter efficient** (detector token is only 256 params, attention is efficient)
+
+**Result:** Better fusion quality with **10x fewer parameters** and more interpretability
 
 Optimizer: AdamW (mixed precision compatible)
   → Gradients computed in float16
