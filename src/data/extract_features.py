@@ -740,7 +740,7 @@ def push_features_to_kaggle(
     
     Args:
         output_dir: Directory containing .pt files
-        dataset_name: Kaggle dataset name (e.g., crypto-sentiment-features)
+        dataset_name: Kaggle dataset name (e.g., crypto-sentiment-embeddings)
         kaggle_username: Kaggle API username (for metadata reference)
         kaggle_key: Kaggle API key (unused, kept for backward compatibility)
         public: Whether to make dataset public (for future use)
@@ -844,7 +844,7 @@ if __name__ == "__main__":
         "--kaggle-dataset-name",
         type=str,
         default=None,
-        help="Kaggle dataset name (e.g., crypto-sentiment-features)",
+        help="Kaggle dataset name (e.g., crypto-sentiment-embeddings)",
     )
     parser.add_argument(
         "--kaggle-username",

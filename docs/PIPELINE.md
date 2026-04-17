@@ -23,7 +23,7 @@ This document describes the refactored offline pipeline: extract ALL data locall
 │     - RobustScaler: scale training target_score                         │
 │                                                                          │
 │  5. Upload ALL .pt files to Kaggle                                      │
-│     (username/crypto-sentiment-features)                                │
+│     (username/crypto-sentiment-embeddings)                              │
 │                                                                          │
 │  Files on Kaggle:                                                        │
 │    text_embeddings_{train,validation,test_in_domain}.pt                 │
@@ -36,7 +36,7 @@ This document describes the refactored offline pipeline: extract ALL data locall
 │  PHASE 2: Kaggle Training (NO HuggingFace loading during training)     │
 │                                                                          │
 │  1. Clone repo on Kaggle                                                │
-│  2. Add Kaggle dataset as input (crypto-sentiment-features)             │
+│  2. Add Kaggle dataset as input (crypto-sentiment-embeddings)           │
 │  3. pip install -r requirements.txt                                     │
 │  4. Load ALL data from Kaggle .pt files (local disk, instant)           │
 │  5. Apply StandardScaler (train statistics) to tabular features         │
@@ -184,13 +184,13 @@ python src/data/extract_features.py \
   --asset MULTI \
   --output_dir ./data/features \
   --push-to-kaggle \
-  --kaggle-dataset-name crypto-sentiment-features
+  --kaggle-dataset-name crypto-sentiment-embeddings
 ```
 
 **What happens:**
 1. Runs complete feature extraction (as above)
 2. After extraction completes, uploads all .pt files to Kaggle
-3. Creates dataset on Kaggle: `https://www.kaggle.com/datasets/username/crypto-sentiment-features`
+3. Creates dataset on Kaggle: `https://www.kaggle.com/datasets/username/crypto-sentiment-embeddings`
 4. Files are cached for fast re-download
 
 **Output:**
@@ -198,11 +198,11 @@ python src/data/extract_features.py \
 Creating/updating dataset on Kaggle...
 Processing Files (18 / 18)      : 100%|█████████████|  182MB /  182MB, 4.13MB/s
 ✓ Dataset uploaded successfully
-  ID: username/crypto-sentiment-features
-  URL: https://www.kaggle.com/datasets/username/crypto-sentiment-features
+  ID: username/crypto-sentiment-embeddings
+  URL: https://www.kaggle.com/datasets/username/crypto-sentiment-embeddings
   
 Use in training with:
-  python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-features
+  python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-embeddings
 ```
 
 ---
@@ -226,7 +226,7 @@ Use in training with:
 ```bash
 !cd /kaggle/working/Multimodal-Cryptocurrency-Market-Sentiment-Forecasting && \
   python src/training/train.py \
-    --features-dir /kaggle/input/crypto-sentiment-features \
+    --features-dir /kaggle/input/crypto-sentiment-embeddings \
     --run-name btc_kaggle_run_001
 ```
 
@@ -380,7 +380,7 @@ scaled_targets = scaler.fit_transform(train_target_scores)
 
 **Check 1**: Features directory exists
 ```bash
-ls -la /kaggle/input/crypto-sentiment-features/
+ls -la /kaggle/input/crypto-sentiment-embeddings/
 # Should show: text_embeddings_train.pt, image_embeddings_train.pt, etc.
 ```
 
@@ -427,13 +427,13 @@ Should see ~6-8GB usage. If more, check:
 - [ ] Activate venv: `. ./.venv/bin/activate`
 - [ ] Extract all features: `python src/data/extract_features.py --asset MULTI --output_dir ./data/features --force`
 - [ ] Setup Kaggle credentials: Download api key, place in ~/.kaggle/kaggle.json
-- [ ] Upload to Kaggle: `python src/data/extract_features.py --asset MULTI --output_dir ./data/features --push-to-kaggle --kaggle-dataset-name crypto-sentiment-features`
+- [ ] Upload to Kaggle: `python src/data/extract_features.py --asset MULTI --output_dir ./data/features --push-to-kaggle --kaggle-dataset-name crypto-sentiment-embeddings`
 - [ ] Git commit: `git add -A && git commit -m "Refactored: Extract all data locally, scale properly, upload to Kaggle" && git push`
 
 ### Kaggle Notebook
-- [ ] Add dataset as input: `crypto-sentiment-features` (your username/dataset-name)
+- [ ] Add dataset as input: `crypto-sentiment-embeddings` (your username/dataset-name)
 - [ ] Clone repo & install deps
-- [ ] Train: `python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-features --run-name exp_001`
+- [ ] Train: `python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-embeddings --run-name exp_001`
 
 ---
 

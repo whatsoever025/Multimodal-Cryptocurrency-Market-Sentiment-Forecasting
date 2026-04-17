@@ -347,8 +347,8 @@ This HuggingFace dataset is **sourced for local extraction only**. For training:
 
 3. **Train on Kaggle** (zero HuggingFace dependencies):
    ```bash
-   # In Kaggle notebook with crypto-sentiment-features dataset added as input
-   python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-features
+   # In Kaggle notebook with crypto-sentiment-embeddings dataset added as input
+   python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-embeddings
    ```
 
 See [PIPELINE.md](./PIPELINE.md) for complete instructions.
