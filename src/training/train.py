@@ -47,7 +47,7 @@ except ImportError:
     wandb = None
 
 from .config import ExperimentConfig, create_config
-from .dataset import CryptoMultimodalDataset, multimodal_collate_fn, create_dataloaders, create_walk_forward_dataloaders
+from .dataset import multimodal_collate_fn, create_walk_forward_dataloaders
 from .model import MultimodalFusionNet
 from .utils import setup_logging, format_duration
 
@@ -99,81 +99,6 @@ def check_gradients(model: nn.Module, batch_idx: int) -> bool:
                 logger.warning(f"⚠ Batch {batch_idx}: Extreme gradients in {name} (max: {param.grad.abs().max():.2e})")
     
     return has_issues
-
-
-def _log_metrics_to_wandb(phase: str, metrics: Dict, config) -> None:
-    """
-    Log phase-specific metrics to W&B with visualizations.
-    
-    Creates scatter plot and error histogram for predictions vs ground truth.
-    
-    Args:
-        phase: Phase name ('train', 'val', or 'test')
-        metrics: Dictionary with 'predictions', 'targets', and metric values
-        config: Experiment config
-    """
-    if wandb is None or wandb.run is None:
-        return
-    
-    # Prepare core metrics for logging
-    log_dict = {
-        f"{phase}_mse": metrics["mse"],
-        f"{phase}_mae": metrics["mae"],
-        f"{phase}_rmse": metrics["rmse"],
-        f"{phase}_r2": metrics["r2"],
-        f"{phase}_correlation": metrics["correlation"],
-        f"{phase}_prediction_bias": metrics["prediction_error_mean"],
-        f"{phase}_prediction_error_std": metrics["prediction_error_std"],
-        f"{phase}_pred_min": metrics["pred_min"],
-        f"{phase}_pred_max": metrics["pred_max"],
-        f"{phase}_target_min": metrics["target_min"],
-        f"{phase}_target_max": metrics["target_max"],
-    }
-    
-    if "is_denormalized" in metrics:
-        log_dict[f"{phase}_is_denormalized"] = metrics["is_denormalized"]
-    
-    wandb.log(log_dict, commit=False)
-    
-    # Extract predictions and targets
-    predictions = metrics["predictions"].numpy()
-    targets = metrics["targets"].numpy()
-    
-    # Create scatter plot (first 500 samples for memory efficiency)
-    plot_limit = min(500, len(predictions))
-    try:
-        wandb_plot = wandb.plot.scatter(
-            wandb.Table(data=[
-                [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-            ], columns=["Ground Truth", "Prediction"]),
-            "Ground Truth", "Prediction", title=f"[{phase.upper()}] Predictions vs Ground Truth"
-        )
-        wandb.log({f"{phase}_predictions_scatter": wandb_plot}, commit=False)
-    except Exception as e:
-        logger.warning(f"Failed to log {phase} scatter plot: {e}")
-    
-    # Create error histogram
-    errors = predictions - targets
-    try:
-        wandb.log({f"{phase}_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
-    except Exception as e:
-        logger.warning(f"Failed to log {phase} error histogram: {e}")
-    
-    # Log sample predictions table (first 100 samples)
-    sample_limit = min(100, len(predictions))
-    table_data = [
-        [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
-        for i in range(sample_limit)
-    ]
-    try:
-        wandb.log({
-            f"{phase}_predictions_table": wandb.Table(
-                data=table_data,
-                columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
-            )
-        }, commit=True)  # Commit after each phase
-    except Exception as e:
-        logger.warning(f"Failed to log {phase} predictions table: {e}")
 
 
 def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
@@ -230,29 +155,6 @@ def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[s
         "target_min": target_min,
         "target_max": target_max,
     }
-
-
-def safe_wandb_log(log_dict: Dict, commit: bool = True) -> bool:
-    """
-    Safely log to W&B with comprehensive error handling.
-    
-    Args:
-        log_dict: Dictionary of metrics to log
-        commit: Whether to commit the log
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    if wandb is None or wandb.run is None:
-        return False
-    
-    try:
-        wandb.log(log_dict, commit=commit)
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to log to W&B: {e}")
-        return False
-
 
 class EarlyStopping:
     """
@@ -586,14 +488,6 @@ class Trainer:
                         f"Epoch {self.epoch+1} | Step {self.global_step} | "
                         f"Loss {loss.item():.6f} | LR {current_lr:.2e}"
                     )
-                    
-                    if wandb is not None and wandb.run is not None:
-                        log_dict = {
-                            "train_step_loss": loss.item(),
-                            "learning_rate": current_lr,
-                            "global_step": self.global_step,
-                        }
-                        safe_wandb_log(log_dict)
             
             # Accumulate loss for epoch average
             total_loss += loss.item() * self.config.training.accumulate_steps
@@ -847,7 +741,7 @@ def main(args):
     logger.info(f"Using WALK-FORWARD VALIDATION with {num_folds} folds")
     logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
     
-    # Will iterate through folds in training loop
+    # Create walk-forward validation generator
     walk_forward_generator = create_walk_forward_dataloaders(
         config,
         features_dir=features_dir,
@@ -859,8 +753,8 @@ def main(args):
     # Also load test set once for final evaluation
     logger.info("Also loading test set for final evaluation...")
     try:
-        from .dataset import CryptoMultimodalDataset
-        test_dataset = CryptoMultimodalDataset(
+        from .dataset import CryptoMultimodalDataset as CryptoDataset
+        test_dataset = CryptoDataset(
             split="test_in_domain",
             seq_len=config.data.seq_len,
             features_dir=features_dir,
@@ -971,13 +865,6 @@ def main(args):
             train_metrics = trainer.train_epoch(train_loader)
             train_loss = train_metrics["loss"]
             
-            # Log training metrics to wandb (per-epoch)
-            _log_metrics_to_wandb(
-                phase=f"fold{fold_num}_train",
-                metrics=train_metrics,
-                config=config
-            )
-            
             logger.info(
                 f"Fold {fold_num} Epoch {epoch+1:3d} | "
                 f"Train Loss {train_loss:.6f} | "
@@ -988,13 +875,6 @@ def main(args):
             if (epoch + 1) % config.mlops.eval_frequency == 0:
                 val_metrics = trainer.validate(val_loader)
                 val_loss = val_metrics["mse"]
-                
-                # Log validation metrics to wandb (per-epoch with charts)
-                _log_metrics_to_wandb(
-                    phase=f"fold{fold_num}_val",
-                    metrics=val_metrics,
-                    config=config
-                )
                 
                 logger.info(
                     f"Fold {fold_num} Epoch {epoch+1:3d} | "
@@ -1017,13 +897,6 @@ def main(args):
         logger.info(f"\nFinal validation for Fold {fold_num}...")
         final_val_metrics = trainer.validate(val_loader)
         
-        # Log final fold validation metrics to wandb
-        _log_metrics_to_wandb(
-            phase=f"fold{fold_num}_final_val",
-            metrics=final_val_metrics,
-            config=config
-        )
-        
         fold_results[fold_num] = {
             "val_r2": final_val_metrics["r2"],
             "val_mse": final_val_metrics["mse"],
@@ -1034,29 +907,45 @@ def main(args):
         
         logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}")
     
-    # Log fold summary
+    # Log fold summary with simple line plots
     logger.info("\n" + "=" * 80)
     logger.info("WALK-FORWARD VALIDATION SUMMARY")
     logger.info("=" * 80)
     
-    r2_scores = [fold_results[i]["val_r2"] for i in sorted(fold_results.keys())]
-    mse_scores = [fold_results[i]["val_mse"] for i in sorted(fold_results.keys())]
-    rmse_scores = [fold_results[i]["val_rmse"] for i in sorted(fold_results.keys())]
+    # Collect metrics across folds
+    fold_numbers = sorted(fold_results.keys())
+    r2_scores = [fold_results[i]["val_r2"] for i in fold_numbers]
+    rmse_scores = [fold_results[i]["val_rmse"] for i in fold_numbers]
+    mae_scores = [fold_results[i]["val_mae"] for i in fold_numbers]
+    corr_scores = [fold_results[i]["val_correlation"] for i in fold_numbers]
     
     logger.info(f"Mean R²: {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
-    logger.info(f"Mean MSE: {np.mean(mse_scores):.6f} ± {np.std(mse_scores):.6f}")
     logger.info(f"Mean RMSE: {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
+    logger.info(f"Mean MAE: {np.mean(mae_scores):.6f} ± {np.std(mae_scores):.6f}")
+    logger.info(f"Mean Correlation: {np.mean(corr_scores):.6f} ± {np.std(corr_scores):.6f}")
     
-    for fold_num in sorted(fold_results.keys()):
-        logger.info(f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}")
+    for fold_num in fold_numbers:
+        logger.info(f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}, RMSE={fold_results[fold_num]['val_rmse']:.6f}, MAE={fold_results[fold_num]['val_mae']:.6f}, Corr={fold_results[fold_num]['val_correlation']:.6f}")
     
+    # Log 4 line plots to wandb (fold number on x-axis)
     if wandb is not None and wandb.run is not None:
-        wandb.log({
-            "walk_forward/mean_r2": np.mean(r2_scores),
-            "walk_forward/std_r2": np.std(r2_scores),
-            "walk_forward/mean_mse": np.mean(mse_scores),
-            "walk_forward/mean_rmse": np.mean(rmse_scores),
-        })
+        # Plot 1: R² vs Fold
+        r2_table = wandb.Table(data=[[fold, r2] for fold, r2 in zip(fold_numbers, r2_scores)], columns=["Fold", "R²"])
+        wandb.log({"fold_r2_plot": wandb.plot.line(r2_table, "Fold", "R²", title="R² Across Folds")})
+        
+        # Plot 2: RMSE vs Fold
+        rmse_table = wandb.Table(data=[[fold, rmse] for fold, rmse in zip(fold_numbers, rmse_scores)], columns=["Fold", "RMSE"])
+        wandb.log({"fold_rmse_plot": wandb.plot.line(rmse_table, "Fold", "RMSE", title="RMSE Across Folds")})
+        
+        # Plot 3: MAE vs Fold
+        mae_table = wandb.Table(data=[[fold, mae] for fold, mae in zip(fold_numbers, mae_scores)], columns=["Fold", "MAE"])
+        wandb.log({"fold_mae_plot": wandb.plot.line(mae_table, "Fold", "MAE", title="MAE Across Folds")})
+        
+        # Plot 4: Correlation vs Fold
+        corr_table = wandb.Table(data=[[fold, corr] for fold, corr in zip(fold_numbers, corr_scores)], columns=["Fold", "Correlation"])
+        wandb.log({"fold_correlation_plot": wandb.plot.line(corr_table, "Fold", "Correlation", title="Correlation Across Folds")})
+        
+        logger.info("✓ Logged 4 fold comparison plots to wandb")
     
     # ==================== TEST EVALUATION ====================
     logger.info("\n" + "=" * 80)

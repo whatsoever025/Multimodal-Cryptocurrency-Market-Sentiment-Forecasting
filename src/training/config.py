@@ -20,12 +20,6 @@ class DataConfig:
     asset: str = "MULTI"  # "MULTI" for BTC+ETH combined, or single "BTC"/"ETH"
     seq_len: int = 24  # Sliding window length in hours
     batch_size: int = 128  # Per-GPU batch size
-    max_text_length: int = 512  # Token sequence length for BERT
-    image_size: int = 224  # ViT input size (224x224)
-    shuffle_train: bool = True
-    num_workers: int = 0  # CRITICAL: Must be 0 on Kaggle (multi-worker deadlock fix)
-    pin_memory: bool = True
-    prefetch_factor: int = 2
 
     def __post_init__(self):
         """Validate data config."""
@@ -35,10 +29,6 @@ class DataConfig:
             raise ValueError(f"seq_len must be > 0, got {self.seq_len}")
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
-        if self.max_text_length <= 0:
-            raise ValueError(f"max_text_length must be > 0, got {self.max_text_length}")
-        if self.image_size <= 0:
-            raise ValueError(f"image_size must be > 0, got {self.image_size}")
 
 
 @dataclass
@@ -56,8 +46,6 @@ class ModelConfig:
     head_dropout: float = 0.4  # INCREASED: Strong regularization in prediction head (safe from NaN, only MLPs)
     grad_clip: float = 1.0
     frozen_backbones: bool = True  # Freeze BERT & ViT
-    use_gradient_checkpointing: bool = True  # Mandatory for 16GB VRAM
-    init_weights: bool = True
 
     def __post_init__(self):
         """Validate model config."""
@@ -71,36 +59,23 @@ class ModelConfig:
             raise ValueError(f"attention_heads must be > 0, got {self.attention_heads}")
         if self.grad_clip < 0:
             raise ValueError(f"grad_clip must be >= 0, got {self.grad_clip}")
-        # CRITICAL: Attention dropout must be ≤0.1 for numerical stability
         if self.mha_dropout > 0.1:
             raise ValueError(
-                f"mha_dropout must be ≤0.1 for numerical stability in backward pass, got {self.mha_dropout}. "
-                "Use higher dropout in encoder_dropout and head_dropout instead (safe from NaN)."
-            )
-        # CRITICAL: Do NOT use attention dropout - it's disabled in the layer to prevent NaN in backward
-        # If you need regularization, use weight decay and MLP dropout instead
-        if self.mha_dropout > 0:
-            logger.warning(
-                "⚠ WARNING: mha_dropout is set to >0, but dropout is DISABLED inside MultiheadAttention "
-                "layer for numerical stability. Dropout is applied after residual instead. "
-                "To prevent this warning, set mha_dropout=0 in config."
+                f"mha_dropout must be ≤0.1 for numerical stability in backward pass, got {self.mha_dropout}"
             )
 
 
 @dataclass
 class TrainingConfig:
     """Training loop configuration."""
-    max_epochs: int = 60  # Increased from 50 (more capacity needs more training)
-    learning_rate: float = 1e-5  # DECREASED: Slower, more stable (was 5e-5) - prevents overconfident predictions
-    weight_decay: float = 1e-2  # STRONG L2 REGULARIZATION (0.01): Primary anti-overfitting mechanism (was 5e-3)
-                                 # Replaces excessive attention dropout which causes NaN
-    accumulate_steps: int = 2  # Gradient accumulation for 16GB VRAM
-    warmup_steps: int = 800  # Increased warmup for larger model (was 500)
-    warmup_proportion: float = 0.1  # Alternate: warmup as % of total steps
+    max_epochs: int = 60
+    learning_rate: float = 1e-5
+    weight_decay: float = 1e-2
+    accumulate_steps: int = 2
+    warmup_steps: int = 800
     use_warmup: bool = True
-    scheduler_type: str = "cosine"  # "cosine" or "constant"
-    num_training_steps: Optional[int] = None  # Set during training loop
-    early_stopping_patience: int = 7  # Stop if no improvement for 7 epochs
+    num_training_steps: Optional[int] = None
+    early_stopping_patience: int = 7
 
     def __post_init__(self):
         """Validate training config."""
@@ -119,36 +94,11 @@ class TrainingConfig:
 
 
 @dataclass
-class OptimizationConfig:
-    """Mixed precision and optimization settings."""
-    mixed_precision: bool = False  # DISABLED (2025-04-17): Training uses pure float32, not mixed precision
-    dtype: str = "float32"  # Using pure float32 for numerical stability
-    use_scaler: bool = False  # Not using GradScaler (pure float32 training)
-    init_scale: float = 65536.0
-    growth_factor: float = 2.0
-    backoff_factor: float = 0.5
-    growth_interval: int = 2000
-
-    def __post_init__(self):
-        """Validate optimization config."""
-        if self.dtype not in ("float16", "bfloat16", "float32"):
-            raise ValueError(f"dtype must be 'float16', 'bfloat16', or 'float32', got {self.dtype}")
-
-
-@dataclass
 class MLOpsConfig:
     """Weights & Biases and artifact management."""
     wandb_project: str = "crypto-sentiment-forecasting"
-    wandb_entity: Optional[str] = None
     wandb_run_name: str = field(default_factory=lambda: f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    wandb_tags: list = field(default_factory=list)
-    wandb_notes: str = ""
     use_wandb: bool = True
-    
-    # HuggingFace Hub configuration
-    hf_repo_name: str = "crypto-sentiment-model"
-    hf_repo_type: str = "model"
-    hf_push_to_hub: bool = False
     
     # Checkpointing
     checkpoint_dir: Path = field(default_factory=lambda: Path(
@@ -160,8 +110,8 @@ class MLOpsConfig:
     keep_last_n: int = 3  # Keep only last N checkpoints
     
     # Logging
-    log_frequency: int = 100  # Log metrics every N steps
-    eval_frequency: int = 1  # Evaluate every N epochs
+    log_frequency: int = 100
+    eval_frequency: int = 1
 
     def __post_init__(self):
         """Validate MLOps config."""
@@ -173,20 +123,8 @@ class MLOpsConfig:
             raise ValueError(f"save_frequency must be > 0, got {self.save_frequency}")
         if self.log_frequency <= 0:
             raise ValueError(f"log_frequency must be > 0, got {self.log_frequency}")
-
-
-@dataclass
-class InferenceConfig:
-    """Inference and evaluation settings."""
-    device: str = "cuda"
-    inference_batch_size: int = 32
-    use_amp: bool = True
-    num_inference_workers: int = 4
-
-    def __post_init__(self):
-        """Validate inference config."""
-        if self.inference_batch_size <= 0:
-            raise ValueError(f"inference_batch_size must be > 0, got {self.inference_batch_size}")
+        if self.eval_frequency <= 0:
+            raise ValueError(f"eval_frequency must be > 0, got {self.eval_frequency}")
 
 
 @dataclass
@@ -195,9 +133,7 @@ class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     mlops: MLOpsConfig = field(default_factory=MLOpsConfig)
-    inference: InferenceConfig = field(default_factory=InferenceConfig)
     
     # Global settings
     seed: int = 42
@@ -215,10 +151,9 @@ class ExperimentConfig:
         
         # For 16GB VRAM, enforce conservative settings
         if self.data.batch_size > 8:
-            if not self.model.frozen_backbones or not self.model.use_gradient_checkpointing:
+            if not self.model.frozen_backbones:
                 raise ValueError(
-                    f"batch_size > 8 with VRAM constraint requires "
-                    f"frozen_backbones=True AND use_gradient_checkpointing=True"
+                    f"batch_size > 8 with VRAM constraint requires frozen_backbones=True"
                 )
 
     def to_dict(self) -> dict:
@@ -227,9 +162,7 @@ class ExperimentConfig:
             "data": self.data.__dict__,
             "model": self.model.__dict__,
             "training": {k: v for k, v in self.training.__dict__.items() if v is not None},
-            "optimization": self.optimization.__dict__,
             "mlops": {k: v for k, v in self.mlops.__dict__.items() if not isinstance(v, Path)},
-            "inference": self.inference.__dict__,
             "seed": self.seed,
             "device": self.device,
             "debug": self.debug,
