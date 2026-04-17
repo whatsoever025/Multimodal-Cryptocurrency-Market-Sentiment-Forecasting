@@ -74,6 +74,14 @@ class ModelConfig:
                 f"mha_dropout must be ≤0.1 for numerical stability in backward pass, got {self.mha_dropout}. "
                 "Use higher dropout in encoder_dropout and head_dropout instead (safe from NaN)."
             )
+        # CRITICAL: Do NOT use attention dropout - it's disabled in the layer to prevent NaN in backward
+        # If you need regularization, use weight decay and MLP dropout instead
+        if self.mha_dropout > 0:
+            logger.warning(
+                "⚠ WARNING: mha_dropout is set to >0, but dropout is DISABLED inside MultiheadAttention "
+                "layer for numerical stability. Dropout is applied after residual instead. "
+                "To prevent this warning, set mha_dropout=0 in config."
+            )
 
 
 @dataclass

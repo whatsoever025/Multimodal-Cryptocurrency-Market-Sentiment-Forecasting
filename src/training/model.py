@@ -88,11 +88,12 @@ class CrossModalAttentionLayer(nn.Module):
     Treats [FUSION] token + 3 modalities (4 total) as a sequence and applies multi-head attention.
     At each timestep, all 4 tokens attend to each other, then extracts only [FUSION] token output.
     
-    STABILITY FIX (2025-04-17):
+    STABILITY FIX (2025-04-17, v2):
     - Pre-LN structure: LayerNorm BEFORE attention (not after residual)
-    - Dropout applied AFTER residual (not inside attention)
-    - Prevents gradient explosion in backward pass through attention
-    - Essential for stability with 4-head attention on 256D embeddings
+    - NO dropout INSIDE attention mechanism (mha_dropout=0)
+    - Dropout applied ONLY AFTER residual (safer path)
+    - Prevents NaN in scaled dot-product attention backward pass
+    - Essential for stability: dropout inside attention can cause extreme gradients
     
     Input: (batch, seq_len, 4, hidden_dim)
     Output: (batch, seq_len, hidden_dim) - [FUSION] token representation only (no mean pooling)
@@ -107,15 +108,16 @@ class CrossModalAttentionLayer(nn.Module):
         self.layer_norm_input = nn.LayerNorm(hidden_dim)
         
         # Multi-head attention treating modalities as sequence (4 tokens)
-        # REDUCED DROPOUT: 0.1 instead of 0.3 for backward stability
+        # CRITICAL: dropout=0 inside attention (no dropout in backward pass of attention)
+        # Dropout applied after residual instead (numerically safer)
         self.mha = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
-            dropout=0.1,  # Conservative: prevents gradient amplification
+            dropout=0.0,  # DISABLED: No dropout inside attention backward to prevent NaN
             batch_first=True,  # (batch, seq, dim)
         )
         
-        # Dropout applied AFTER residual (safer than before)
+        # Dropout applied AFTER residual (safe, clean gradient flow)
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, modality_stack: torch.Tensor) -> torch.Tensor:
@@ -133,18 +135,19 @@ class CrossModalAttentionLayer(nn.Module):
         # Treat 4 tokens as sequence
         modality_flat = modality_stack.reshape(batch_size * seq_len, num_modalities, hidden_dim)
         
-        # ===== PRE-LN RESIDUAL STRUCTURE (STABLE) =====
+        # ===== PRE-LN RESIDUAL STRUCTURE (NUMERICALLY STABLE) =====
         # 1. Normalize input first (Pre-LN, not Post-LN)
         modality_norm = self.layer_norm_input(modality_flat)  # (batch*seq_len, 4, hidden_dim)
         
-        # 2. Self-attention on normalized tokens
+        # 2. Self-attention on normalized tokens (NO DROPOUT inside attention)
         attended, _ = self.mha(
             modality_norm, modality_norm, modality_norm,
             need_weights=False
         )
         
         # 3. Residual connection (stable because attention operates on normalized input)
-        # 4. Dropout applied AFTER residual (not inside attention)
+        # 4. Dropout applied AFTER residual (not inside attention backward)
+        # This prevents NaN from dropout creating sparse extreme gradients in attention backward
         output = modality_flat + self.dropout(attended)  # (batch*seq_len, 4, hidden_dim)
         
         # Extract only [FUSION] token (position 0): (batch*seq_len, hidden_dim)

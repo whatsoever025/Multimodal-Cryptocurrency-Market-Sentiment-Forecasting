@@ -477,19 +477,36 @@ class Trainer:
             predictions = self.model(batch)  # (batch,) shape
             targets = batch["target"]  # (batch,) shape
             
-            # Collect for epoch-level metrics
-            all_predictions.append(predictions.detach().cpu())
+            # ========== NUMERICAL STABILITY: CLAMP PREDICTIONS ==========
+            # Prevent extreme values that can cause NaN in loss backward
+            # Sentiment range is typically [-100, 100], clamp to [-150, 150] for safety
+            predictions_clamped = torch.clamp(predictions, min=-150, max=150)
+            
+            # Collect for epoch-level metrics (using clamped predictions)
+            all_predictions.append(predictions_clamped.detach().cpu())
             all_targets.append(targets.detach().cpu())
             
             # Compute HuberLoss (robust to outliers)
             # More stable than MSE for noisy market data with outliers
-            loss = nn.HuberLoss(delta=1.0)(predictions, targets)
+            loss = nn.HuberLoss(delta=1.0)(predictions_clamped, targets)
             
             # ========== NaN CHECK BEFORE BACKWARD ==========
             # Detect numerical issues early
-            if check_for_nan(loss, batch_idx, predictions, targets):
+            if check_for_nan(loss, batch_idx, predictions_clamped, targets):
                 logger.warning(f"⚠ Skipping batch {batch_idx} due to NaN/Inf in predictions or loss")
                 self.optimizer.zero_grad()  # Clear any accumulated gradients
+                continue
+            
+            # ========== LOSS MAGNITUDE CHECK ==========
+            # Catch exploding loss that would cause NaN in backward
+            if loss.item() > 1000:
+                logger.error(
+                    f"✗ Batch {batch_idx}: Loss is extremely large ({loss.item():.2f}). "
+                    f"This indicates numerical instability and will likely cause NaN in backward. "
+                    f"Predictions: min={predictions_clamped.min():.2f}, max={predictions_clamped.max():.2f}, "
+                    f"mean={predictions_clamped.mean():.2f}"
+                )
+                self.optimizer.zero_grad()
                 continue
             
             # Scale loss for gradient accumulation
