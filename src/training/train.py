@@ -903,6 +903,17 @@ def main(args):
         }
         
         logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}")
+        
+        # Log per-fold metrics to W&B
+        if wandb is not None and wandb.run is not None:
+            fold_log_dict = {
+                f"fold_{fold_num}/val_r2": final_val_metrics["r2"],
+                f"fold_{fold_num}/val_rmse": final_val_metrics["rmse"],
+                f"fold_{fold_num}/val_mae": final_val_metrics["mae"],
+                f"fold_{fold_num}/val_correlation": final_val_metrics["correlation"],
+            }
+            wandb.log(fold_log_dict)
+            logger.info(f"✓ Logged Fold {fold_num} metrics to W&B")
     
     # Log fold summary with simple line plots
     logger.info("\n" + "=" * 80)
@@ -923,6 +934,21 @@ def main(args):
     
     for fold_num in fold_numbers:
         logger.info(f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}, RMSE={fold_results[fold_num]['val_rmse']:.6f}, MAE={fold_results[fold_num]['val_mae']:.6f}, Corr={fold_results[fold_num]['val_correlation']:.6f}")
+    
+    # Log fold summary statistics to W&B
+    if wandb is not None and wandb.run is not None:
+        summary_log = {
+            "fold_summary/mean_r2": np.mean(r2_scores),
+            "fold_summary/std_r2": np.std(r2_scores),
+            "fold_summary/mean_rmse": np.mean(rmse_scores),
+            "fold_summary/std_rmse": np.std(rmse_scores),
+            "fold_summary/mean_mae": np.mean(mae_scores),
+            "fold_summary/std_mae": np.std(mae_scores),
+            "fold_summary/mean_correlation": np.mean(corr_scores),
+            "fold_summary/std_correlation": np.std(corr_scores),
+        }
+        wandb.log(summary_log)
+        logger.info("✓ Logged fold summary statistics to W&B")
     
     # Log 4 line plots to wandb (fold number on x-axis)
     if wandb is not None and wandb.run is not None:
