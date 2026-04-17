@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -128,8 +131,8 @@ class OptimizationConfig:
 
     def __post_init__(self):
         """Validate optimization config."""
-        if self.dtype not in ("float16", "bfloat16"):
-            raise ValueError(f"dtype must be 'float16' or 'bfloat16', got {self.dtype}")
+        if self.dtype not in ("float16", "bfloat16", "float32"):
+            raise ValueError(f"dtype must be 'float16', 'bfloat16', or 'float32', got {self.dtype}")
 
 
 @dataclass
