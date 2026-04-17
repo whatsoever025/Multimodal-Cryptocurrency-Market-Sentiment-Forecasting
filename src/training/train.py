@@ -797,10 +797,7 @@ def main(args):
         wandb.init(
             project=config.mlops.wandb_project,
             name=config.mlops.wandb_run_name,
-            entity=config.mlops.wandb_entity,
             config=config.to_dict(),
-            tags=config.mlops.wandb_tags,
-            notes=config.mlops.wandb_notes,
             settings=wandb.Settings(
                 # Disable service ping wait to avoid timeout issues
                 _service_wait=0,
