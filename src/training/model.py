@@ -88,6 +88,12 @@ class CrossModalAttentionLayer(nn.Module):
     Treats [FUSION] token + 3 modalities (4 total) as a sequence and applies multi-head attention.
     At each timestep, all 4 tokens attend to each other, then extracts only [FUSION] token output.
     
+    STABILITY FIX (2025-04-17):
+    - Pre-LN structure: LayerNorm BEFORE attention (not after residual)
+    - Dropout applied AFTER residual (not inside attention)
+    - Prevents gradient explosion in backward pass through attention
+    - Essential for stability with 4-head attention on 256D embeddings
+    
     Input: (batch, seq_len, 4, hidden_dim)
     Output: (batch, seq_len, hidden_dim) - [FUSION] token representation only (no mean pooling)
     """
@@ -97,14 +103,19 @@ class CrossModalAttentionLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         
-        # Multi-head attention treating modalities as sequence (seq_len=3)
+        # Pre-LN: Normalize BEFORE attention (not after)
+        self.layer_norm_input = nn.LayerNorm(hidden_dim)
+        
+        # Multi-head attention treating modalities as sequence (4 tokens)
+        # REDUCED DROPOUT: 0.1 instead of 0.3 for backward stability
         self.mha = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
-            dropout=dropout,
+            dropout=0.1,  # Conservative: prevents gradient amplification
             batch_first=True,  # (batch, seq, dim)
         )
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+        # Dropout applied AFTER residual (safer than before)
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, modality_stack: torch.Tensor) -> torch.Tensor:
@@ -122,18 +133,23 @@ class CrossModalAttentionLayer(nn.Module):
         # Treat 4 tokens as sequence
         modality_flat = modality_stack.reshape(batch_size * seq_len, num_modalities, hidden_dim)
         
-        # Self-attention on all tokens: (batch*seq_len, 4, hidden_dim) -> (batch*seq_len, 4, hidden_dim)
+        # ===== PRE-LN RESIDUAL STRUCTURE (STABLE) =====
+        # 1. Normalize input first (Pre-LN, not Post-LN)
+        modality_norm = self.layer_norm_input(modality_flat)  # (batch*seq_len, 4, hidden_dim)
+        
+        # 2. Self-attention on normalized tokens
         attended, _ = self.mha(
-            modality_flat, modality_flat, modality_flat,
+            modality_norm, modality_norm, modality_norm,
             need_weights=False
         )
         
-        # Add residual + layer norm
-        attended = self.layer_norm(modality_flat + self.dropout(attended))
+        # 3. Residual connection (stable because attention operates on normalized input)
+        # 4. Dropout applied AFTER residual (not inside attention)
+        output = modality_flat + self.dropout(attended)  # (batch*seq_len, 4, hidden_dim)
         
         # Extract only [FUSION] token (position 0): (batch*seq_len, hidden_dim)
         # No mean pooling - [FUSION] token is the only output
-        fused = attended[:, 0, :]  # First token is [FUSION]
+        fused = output[:, 0, :]  # First token is [FUSION]
         
         # Reshape back: (batch, seq_len, hidden_dim)
         return fused.reshape(batch_size, seq_len, hidden_dim)

@@ -45,11 +45,12 @@ class ModelConfig:
     bottleneck_dim: int = 64  # Bottleneck layer: 256 -> 64 (compression before LSTM)
     lstm_layers: int = 1  # Simplified: reduced from 2 to 1
     lstm_hidden_dim: int = 64  # Simplified: reduced from 256 to 64
-    lstm_dropout: float = 0.5  # INCREASED: Kill temporal memorization (was 0.2)
+    lstm_dropout: float = 0.5  # AGGRESSIVE: Kill temporal memorization (prevents overfitting on sequences)
     attention_heads: int = 4
-    mha_dropout: float = 0.3  # INCREASED: Stronger attention dropout (was 0.1)
-    encoder_dropout: float = 0.3  # INCREASED: Stronger encoder dropout (was 0.2)
-    head_dropout: float = 0.4  # INCREASED: Stronger head dropout (was 0.2)
+    mha_dropout: float = 0.1  # CRITICAL (2025-04-17): Must stay ≤0.1 for numerical stability in scaled dot-product backward
+                               # Attention is already regularized by its structure - no higher dropout needed
+    encoder_dropout: float = 0.3  # INCREASED: Strong regularization in tabular encoder MLP (safe from NaN)
+    head_dropout: float = 0.4  # INCREASED: Strong regularization in prediction head (safe from NaN, only MLPs)
     grad_clip: float = 1.0
     frozen_backbones: bool = True  # Freeze BERT & ViT
     use_gradient_checkpointing: bool = True  # Mandatory for 16GB VRAM
@@ -67,6 +68,12 @@ class ModelConfig:
             raise ValueError(f"attention_heads must be > 0, got {self.attention_heads}")
         if self.grad_clip < 0:
             raise ValueError(f"grad_clip must be >= 0, got {self.grad_clip}")
+        # CRITICAL: Attention dropout must be ≤0.1 for numerical stability
+        if self.mha_dropout > 0.1:
+            raise ValueError(
+                f"mha_dropout must be ≤0.1 for numerical stability in backward pass, got {self.mha_dropout}. "
+                "Use higher dropout in encoder_dropout and head_dropout instead (safe from NaN)."
+            )
 
 
 @dataclass
@@ -74,7 +81,8 @@ class TrainingConfig:
     """Training loop configuration."""
     max_epochs: int = 60  # Increased from 50 (more capacity needs more training)
     learning_rate: float = 1e-5  # DECREASED: Slower, more stable (was 5e-5) - prevents overconfident predictions
-    weight_decay: float = 5e-3  # INCREASED: Stronger L2 regularization (was 1e-3) - penalize complex solutions
+    weight_decay: float = 1e-2  # STRONG L2 REGULARIZATION (0.01): Primary anti-overfitting mechanism (was 5e-3)
+                                 # Replaces excessive attention dropout which causes NaN
     accumulate_steps: int = 2  # Gradient accumulation for 16GB VRAM
     warmup_steps: int = 800  # Increased warmup for larger model (was 500)
     warmup_proportion: float = 0.1  # Alternate: warmup as % of total steps
@@ -102,9 +110,9 @@ class TrainingConfig:
 @dataclass
 class OptimizationConfig:
     """Mixed precision and optimization settings."""
-    mixed_precision: bool = True  # Use torch.cuda.amp.autocast
-    dtype: str = "float16"  # "float16" or "bfloat16"
-    use_scaler: bool = True  # Use GradScaler with mixed precision
+    mixed_precision: bool = False  # DISABLED (2025-04-17): Training uses pure float32, not mixed precision
+    dtype: str = "float32"  # Using pure float32 for numerical stability
+    use_scaler: bool = False  # Not using GradScaler (pure float32 training)
     init_scale: float = 65536.0
     growth_factor: float = 2.0
     backoff_factor: float = 0.5

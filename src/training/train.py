@@ -3,11 +3,22 @@ Production training loop with VRAM management, W&B integration, and best model c
 
 Key Features:
 - Trainer class with full state management (save/load/train/validate)
-- Pure float32 training for numerical stability
+- Pure float32 training for numerical stability (no mixed precision)
 - Gradient accumulation configured via config.training.accumulate_steps
 - Gradient clipping via config.model.grad_clip
 - W&B integration per-branch via wandb_run_name
 - Best model checkpointing with experiment naming
+- NaN detection and diagnostics (2025-04-17):
+  * Pre-backward check: Validates loss and predictions are finite
+  * Post-backward check: Validates gradients are finite and not extreme
+  * Problematic batches are saved for offline analysis
+  * Early detection prevents silent NaN propagation
+
+Stability Improvements (2025-04-17):
+- Fixed attention layer to use Pre-LN structure (normalize before attention, not after)
+- Reduced attention dropout from 0.3 to 0.1 for backward stability
+- Moved dropout outside residual path in attention layer
+- Enhanced gradient monitoring throughout training loop
 """
 
 import torch
@@ -42,6 +53,52 @@ from .utils import setup_logging, format_duration
 
 
 logger = logging.getLogger(__name__)
+
+
+def check_for_nan(loss: torch.Tensor, batch_idx: int, predictions: torch.Tensor, targets: torch.Tensor) -> bool:
+    """
+    Check for NaN/Inf in loss and predictions before backward pass.
+    Returns True if NaN/Inf detected (should skip this batch).
+    """
+    if torch.isnan(loss).any():
+        logger.error(f"✗ Batch {batch_idx}: Loss is NaN")
+        logger.error(f"  Predictions - Min: {predictions.min():.6e}, Max: {predictions.max():.6e}, Mean: {predictions.mean():.6e}")
+        logger.error(f"  Targets - Min: {targets.min():.6e}, Max: {targets.max():.6e}, Mean: {targets.mean():.6e}")
+        return True
+    
+    if torch.isinf(loss).any():
+        logger.error(f"✗ Batch {batch_idx}: Loss is Inf")
+        return True
+    
+    if torch.isnan(predictions).any():
+        logger.error(f"✗ Batch {batch_idx}: Predictions contain NaN ({torch.isnan(predictions).sum()} values)")
+        return True
+    
+    if torch.isinf(predictions).any():
+        logger.error(f"✗ Batch {batch_idx}: Predictions contain Inf ({torch.isinf(predictions).sum()} values)")
+        return True
+    
+    return False
+
+
+def check_gradients(model: nn.Module, batch_idx: int) -> bool:
+    """
+    Check for NaN/Inf in gradients after backward pass.
+    Returns True if issues found.
+    """
+    has_issues = False
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param.grad).any():
+                logger.error(f"✗ Batch {batch_idx}: Gradient NaN in {name}")
+                has_issues = True
+            elif torch.isinf(param.grad).any():
+                logger.error(f"✗ Batch {batch_idx}: Gradient Inf in {name}")
+                has_issues = True
+            elif (torch.abs(param.grad) > 1e4).any():
+                logger.warning(f"⚠ Batch {batch_idx}: Extreme gradients in {name} (max: {param.grad.abs().max():.2e})")
+    
+    return has_issues
 
 
 def _log_metrics_to_wandb(phase: str, metrics: Dict, config) -> None:
@@ -428,13 +485,48 @@ class Trainer:
             # More stable than MSE for noisy market data with outliers
             loss = nn.HuberLoss(delta=1.0)(predictions, targets)
             
+            # ========== NaN CHECK BEFORE BACKWARD ==========
+            # Detect numerical issues early
+            if check_for_nan(loss, batch_idx, predictions, targets):
+                logger.warning(f"⚠ Skipping batch {batch_idx} due to NaN/Inf in predictions or loss")
+                self.optimizer.zero_grad()  # Clear any accumulated gradients
+                continue
+            
             # Scale loss for gradient accumulation
             # Prevents accumulated gradients from growing too large
             loss = loss / self.config.training.accumulate_steps
             
             # ========== BACKWARD PASS (STANDARD) ==========
             # Standard PyTorch backward - gradients computed in float32
-            loss.backward()
+            try:
+                loss.backward()
+            except RuntimeError as e:
+                if "nan" in str(e).lower():
+                    logger.error(f"✗ Batch {batch_idx}: NaN detected in backward pass!")
+                    logger.error(f"  Error: {e}")
+                    logger.error(f"  Loss value: {loss.item():.6e}")
+                    logger.error(f"  Predictions range: [{predictions.min():.6e}, {predictions.max():.6e}]")
+                    # Save problematic batch for analysis
+                    batch_path = self.config.mlops.checkpoint_dir / f"problematic_batch_{batch_idx}.pt"
+                    torch.save({
+                        "batch_idx": batch_idx,
+                        "epoch": self.epoch,
+                        "batch": {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()},
+                        "predictions": predictions.detach().cpu(),
+                        "loss": loss.detach().cpu(),
+                    }, batch_path)
+                    logger.error(f"  Saved problematic batch to: {batch_path}")
+                    self.optimizer.zero_grad()
+                    raise
+                else:
+                    raise
+            
+            # ========== GRADIENT ANOMALY CHECK ==========
+            # Check for NaN/Inf in gradients after backward
+            if check_gradients(self.model, batch_idx):
+                logger.error(f"✗ Batch {batch_idx}: Anomalous gradients detected!")
+                self.optimizer.zero_grad()
+                raise RuntimeError(f"Gradient anomaly in batch {batch_idx}")
             
             # ========== GRADIENT ACCUMULATION CHECK ==========
             # Only update weights every accumulate_steps batches
