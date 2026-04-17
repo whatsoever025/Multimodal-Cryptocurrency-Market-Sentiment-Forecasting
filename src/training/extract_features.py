@@ -43,7 +43,7 @@ except ImportError:
 # Scalers removed - will be applied during training in Kaggle, not during extraction
 
 from tqdm import tqdm
-from ..training.utils import setup_logging, format_duration
+from .utils import setup_logging, format_duration
 
 
 logger = logging.getLogger(__name__)
