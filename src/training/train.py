@@ -596,16 +596,17 @@ class Trainer:
             is_denormalized = True
             logger.debug("✓ Inverse transform applied (metrics computed on original scale)")
         
-        # Compute per-batch averages
+        # Compute per-batch averages (on normalized scale for loss tracking)
         avg_mse = total_mse / num_steps
         avg_mae = total_mae / num_steps
         self.val_losses.append(avg_mse)
         
-        # Compute metrics using shared helper
+        # Compute metrics using shared helper (this recomputes MSE/RMSE on current scale)
         metrics = _compute_metrics(all_predictions, all_targets)
-        metrics["mse"] = avg_mse  # Override with per-batch average
-        metrics["mae"] = avg_mae  # Override with per-batch average
+        # Don't override metrics["mse"] or metrics["mae"] - use values computed on correct scale
         metrics["is_denormalized"] = is_denormalized
+        metrics["predictions"] = all_predictions
+        metrics["targets"] = all_targets
         
         return metrics
     
@@ -902,7 +903,15 @@ def main(args):
             "val_correlation": final_val_metrics["correlation"],
         }
         
-        logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}")
+        logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}, MAE={final_val_metrics['mae']:.6f}")
+        
+        # Sanity check: Display first 5 predictions vs actual values
+        logger.info("\nSanity Check - First 5 Predictions vs Actual:")
+        predictions = final_val_metrics.get("predictions", None)
+        targets = final_val_metrics.get("targets", None)
+        if predictions is not None and targets is not None:
+            for i in range(min(5, len(predictions))):
+                logger.info(f"  [{i+1}] Predicted: {predictions[i].item():.4f} | Actual: {targets[i].item():.4f} | Error: {abs(predictions[i].item() - targets[i].item()):.4f}")
         
         # Log per-fold metrics to W&B
         if wandb is not None and wandb.run is not None:
