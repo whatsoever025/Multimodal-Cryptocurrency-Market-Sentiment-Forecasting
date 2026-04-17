@@ -971,6 +971,13 @@ def main(args):
             train_metrics = trainer.train_epoch(train_loader)
             train_loss = train_metrics["loss"]
             
+            # Log training metrics to wandb (per-epoch)
+            _log_metrics_to_wandb(
+                phase=f"fold{fold_num}_train",
+                metrics=train_metrics,
+                config=config
+            )
+            
             logger.info(
                 f"Fold {fold_num} Epoch {epoch+1:3d} | "
                 f"Train Loss {train_loss:.6f} | "
@@ -981,6 +988,13 @@ def main(args):
             if (epoch + 1) % config.mlops.eval_frequency == 0:
                 val_metrics = trainer.validate(val_loader)
                 val_loss = val_metrics["mse"]
+                
+                # Log validation metrics to wandb (per-epoch with charts)
+                _log_metrics_to_wandb(
+                    phase=f"fold{fold_num}_val",
+                    metrics=val_metrics,
+                    config=config
+                )
                 
                 logger.info(
                     f"Fold {fold_num} Epoch {epoch+1:3d} | "
@@ -1002,6 +1016,13 @@ def main(args):
         # Validate on full validation set for this fold
         logger.info(f"\nFinal validation for Fold {fold_num}...")
         final_val_metrics = trainer.validate(val_loader)
+        
+        # Log final fold validation metrics to wandb
+        _log_metrics_to_wandb(
+            phase=f"fold{fold_num}_final_val",
+            metrics=final_val_metrics,
+            config=config
+        )
         
         fold_results[fold_num] = {
             "val_r2": final_val_metrics["r2"],
