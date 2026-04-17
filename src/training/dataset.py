@@ -81,11 +81,20 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         - RobustScaler: Fit on training split target scores, applied to all splits
         - If split != "train": Load scalers from training data first
         
-        Note: features_dir should contain:
+        Note: features_dir should contain one of:
+        
+        Option 1 - Per-split files (legacy):
             - text_embeddings_{split}.pt
             - image_embeddings_{split}.pt
             - tabular_features_{split}.pt (RAW, no scaling)
             - target_scores_{split}.pt (RAW, no scaling)
+        
+        Option 2 - Consolidated files (new, from Kaggle dataset):
+            - text_embeddings.pt (all samples)
+            - image_embeddings.pt (all samples)
+            - tabular_features.pt (all samples)
+            - target_scores.pt (all samples)
+            - split_metadata.json (defines train/val/test boundaries)
         """
         self.split = split
         self.seq_len = seq_len
@@ -147,34 +156,100 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         logger.info(f"✓ Dataset ready: {len(self)} valid sequences of length {seq_len}")
     
     def _load_embeddings_from_disk(self, split: str) -> None:
-        """Load pre-extracted embeddings from disk as contiguous tensors."""
+        """Load pre-extracted embeddings from disk as contiguous tensors.
+        
+        Supports two formats:
+        1. Per-split files (legacy): text_embeddings_{split}.pt, image_embeddings_{split}.pt
+        2. Consolidated files: text_embeddings.pt, image_embeddings.pt + split_metadata.json
+        """
+        import json
+        
+        # Try to load per-split files first (backward compatibility)
         text_embed_path = self.features_dir / f"text_embeddings_{split}.pt"
         image_embed_path = self.features_dir / f"image_embeddings_{split}.pt"
         
-        if not text_embed_path.exists():
-            raise FileNotFoundError(f"Text embeddings not found: {text_embed_path}")
-        if not image_embed_path.exists():
-            raise FileNotFoundError(f"Image embeddings not found: {image_embed_path}")
-        
-        logger.info(f"Loading text embeddings from {text_embed_path}...")
-        text_raw = torch.load(text_embed_path, map_location="cpu")
-        self.text_embeddings = text_raw.contiguous()
-        logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}, contiguous={self.text_embeddings.is_contiguous()}")
-        
-        logger.info(f"Loading image embeddings from {image_embed_path}...")
-        image_raw = torch.load(image_embed_path, map_location="cpu")
-        self.image_embeddings = image_raw.contiguous()
-        logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}, contiguous={self.image_embeddings.is_contiguous()}")
-        
-        # Store total samples from embeddings shape
-        self.total_samples = self.text_embeddings.shape[0]
-        
-        # Validate shapes match
-        assert self.image_embeddings.shape[0] == self.total_samples, \
-            f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
+        if text_embed_path.exists() and image_embed_path.exists():
+            # Per-split format
+            logger.info(f"[Per-split format] Loading text embeddings from {text_embed_path}...")
+            text_raw = torch.load(text_embed_path, map_location="cpu")
+            self.text_embeddings = text_raw.contiguous()
+            logger.info(f"✓ Text embeddings: {self.text_embeddings.shape}, contiguous={self.text_embeddings.is_contiguous()}")
+            
+            logger.info(f"[Per-split format] Loading image embeddings from {image_embed_path}...")
+            image_raw = torch.load(image_embed_path, map_location="cpu")
+            self.image_embeddings = image_raw.contiguous()
+            logger.info(f"✓ Image embeddings: {self.image_embeddings.shape}, contiguous={self.image_embeddings.is_contiguous()}")
+            
+            # Store total samples from embeddings shape
+            self.total_samples = self.text_embeddings.shape[0]
+            
+            # Validate shapes match
+            assert self.image_embeddings.shape[0] == self.total_samples, \
+                f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
+        else:
+            # Try consolidated format with split_metadata.json
+            metadata_path = self.features_dir / "split_metadata.json"
+            text_embed_path = self.features_dir / "text_embeddings.pt"
+            image_embed_path = self.features_dir / "image_embeddings.pt"
+            
+            if not metadata_path.exists():
+                raise FileNotFoundError(
+                    f"Split metadata not found: {metadata_path}. "
+                    f"Expected either per-split files (text_embeddings_{split}.pt) or "
+                    f"consolidated files (text_embeddings.pt + split_metadata.json)"
+                )
+            
+            if not text_embed_path.exists():
+                raise FileNotFoundError(f"Text embeddings not found: {text_embed_path}")
+            if not image_embed_path.exists():
+                raise FileNotFoundError(f"Image embeddings not found: {image_embed_path}")
+            
+            # Load split metadata
+            logger.info(f"[Consolidated format] Loading split metadata from {metadata_path}...")
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            
+            # Determine slice indices for this split
+            if split == "train":
+                start_idx = 0
+                end_idx = metadata["train_end_idx"]
+            elif split == "validation":
+                start_idx = metadata["train_end_idx"]
+                end_idx = metadata["val_end_idx"]
+            elif split == "test_in_domain":
+                start_idx = metadata["val_end_idx"]
+                end_idx = metadata["test_end_idx"]
+            else:
+                raise ValueError(f"Unknown split: {split}. Must be 'train', 'validation', or 'test_in_domain'")
+            
+            logger.info(f"✓ Split metadata: {split} uses indices [{start_idx}:{end_idx}]")
+            
+            # Load full consolidated embeddings
+            logger.info(f"[Consolidated format] Loading text embeddings from {text_embed_path}...")
+            text_full = torch.load(text_embed_path, map_location="cpu")
+            logger.info(f"  Full shape: {text_full.shape}")
+            self.text_embeddings = text_full[start_idx:end_idx].contiguous()
+            logger.info(f"✓ Text embeddings ({split}): {self.text_embeddings.shape}, contiguous={self.text_embeddings.is_contiguous()}")
+            
+            logger.info(f"[Consolidated format] Loading image embeddings from {image_embed_path}...")
+            image_full = torch.load(image_embed_path, map_location="cpu")
+            logger.info(f"  Full shape: {image_full.shape}")
+            self.image_embeddings = image_full[start_idx:end_idx].contiguous()
+            logger.info(f"✓ Image embeddings ({split}): {self.image_embeddings.shape}, contiguous={self.image_embeddings.is_contiguous()}")
+            
+            # Store total samples from embeddings shape
+            self.total_samples = self.text_embeddings.shape[0]
+            
+            # Validate shapes match
+            assert self.image_embeddings.shape[0] == self.total_samples, \
+                f"Image embeddings mismatch: {self.image_embeddings.shape[0]} vs {self.total_samples}"
     
     def _load_tabular_and_targets(self, split: str) -> None:
         """Load RAW tabular features and target scores, then apply scalers.
+        
+        Supports two formats:
+        1. Per-split files (legacy): tabular_features_{split}.pt, target_scores_{split}.pt
+        2. Consolidated files: tabular_features.pt, target_scores.pt + split_metadata.json
         
         Scaling Strategy:
         - For 'train' split: Fit StandardScaler and RobustScaler on raw data, apply in-place
@@ -184,21 +259,71 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         - Training: Learn scaler statistics from train data
         - Validation/Test: Use train statistics to scale val/test data
         """
+        import json
+        
+        # Try to load per-split files first (backward compatibility)
         tabular_path = self.features_dir / f"tabular_features_{split}.pt"
         target_path = self.features_dir / f"target_scores_{split}.pt"
         
-        if not tabular_path.exists():
-            raise FileNotFoundError(f"Tabular features not found: {tabular_path}")
-        if not target_path.exists():
-            raise FileNotFoundError(f"Target scores not found: {target_path}")
-        
-        logger.info(f"Loading RAW tabular features from {tabular_path}...")
-        tabular_raw = torch.load(tabular_path, map_location="cpu")  # (total_samples, 7)
-        logger.info(f"✓ Raw tabular features: {tabular_raw.shape}")
-        
-        logger.info(f"Loading RAW target scores from {target_path}...")
-        target_raw = torch.load(target_path, map_location="cpu")  # (total_samples,)
-        logger.info(f"✓ Raw target scores: {target_raw.shape}")
+        if tabular_path.exists() and target_path.exists():
+            # Per-split format
+            logger.info(f"[Per-split format] Loading RAW tabular features from {tabular_path}...")
+            tabular_raw = torch.load(tabular_path, map_location="cpu")  # (total_samples, 7)
+            logger.info(f"✓ Raw tabular features: {tabular_raw.shape}")
+            
+            logger.info(f"[Per-split format] Loading RAW target scores from {target_path}...")
+            target_raw = torch.load(target_path, map_location="cpu")  # (total_samples,)
+            logger.info(f"✓ Raw target scores: {target_raw.shape}")
+        else:
+            # Try consolidated format with split_metadata.json
+            metadata_path = self.features_dir / "split_metadata.json"
+            tabular_path = self.features_dir / "tabular_features.pt"
+            target_path = self.features_dir / "target_scores.pt"
+            
+            if not metadata_path.exists():
+                raise FileNotFoundError(
+                    f"Split metadata not found: {metadata_path}. "
+                    f"Expected either per-split files (tabular_features_{split}.pt) or "
+                    f"consolidated files (tabular_features.pt + split_metadata.json)"
+                )
+            
+            if not tabular_path.exists():
+                raise FileNotFoundError(f"Tabular features not found: {tabular_path}")
+            if not target_path.exists():
+                raise FileNotFoundError(f"Target scores not found: {target_path}")
+            
+            # Load split metadata
+            logger.info(f"[Consolidated format] Loading split metadata from {metadata_path}...")
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            
+            # Determine slice indices for this split
+            if split == "train":
+                start_idx = 0
+                end_idx = metadata["train_end_idx"]
+            elif split == "validation":
+                start_idx = metadata["train_end_idx"]
+                end_idx = metadata["val_end_idx"]
+            elif split == "test_in_domain":
+                start_idx = metadata["val_end_idx"]
+                end_idx = metadata["test_end_idx"]
+            else:
+                raise ValueError(f"Unknown split: {split}. Must be 'train', 'validation', or 'test_in_domain'")
+            
+            logger.info(f"✓ Split metadata: {split} uses indices [{start_idx}:{end_idx}]")
+            
+            # Load full consolidated files
+            logger.info(f"[Consolidated format] Loading RAW tabular features from {tabular_path}...")
+            tabular_full = torch.load(tabular_path, map_location="cpu")
+            logger.info(f"  Full shape: {tabular_full.shape}")
+            tabular_raw = tabular_full[start_idx:end_idx]
+            logger.info(f"✓ Raw tabular features ({split}): {tabular_raw.shape}")
+            
+            logger.info(f"[Consolidated format] Loading RAW target scores from {target_path}...")
+            target_full = torch.load(target_path, map_location="cpu")
+            logger.info(f"  Full shape: {target_full.shape}")
+            target_raw = target_full[start_idx:end_idx]
+            logger.info(f"✓ Raw target scores ({split}): {target_raw.shape}")
         
         # ========== APPLY SCALERS ==========
         if split == "train":
@@ -327,7 +452,7 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
             - tabular: (batch_size, seq_len, 7)
             - text_embedding: (batch_size, seq_len, 256)
             - image_embedding: (batch_size, seq_len, 256)
-            - target: (batch_size,)
+             - target: (batch_size,)
             - timestamp: (batch_size,)
     """
     stacked = {
@@ -535,8 +660,8 @@ def create_walk_forward_dataloaders(
     """
     Create walk-forward validation folds.
     
-    Loads training data once, then yields (train_loader, val_loader) pairs
-    for each temporal fold, preventing data leakage.
+    Loads concatenated train/validation/test embeddings, then applies
+    temporal walk-forward splits for proper chronological validation.
     
     CRITICAL: Walk-forward respects temporal ordering:
     - Fold 1: Train on [0:70%], validate on [70%:85%]
@@ -544,42 +669,90 @@ def create_walk_forward_dataloaders(
     
     Args:
         config: ExperimentConfig instance
-        features_dir: Local directory with pre-extracted Kaggle features
+        features_dir: Local directory with extracted embeddings
         num_folds: Number of temporal validation folds
         num_workers: Data loading workers (always 0 on Kaggle)
         pin_memory: Pin memory for GPU transfer
     
     Yields:
         Tuple of (fold_num, train_loader, val_loader, scalers_dict)
-    
-    Example:
-        for fold_num, train_loader, val_loader, scalers in create_walk_forward_dataloaders(config):
-            train_model(train_loader, val_loader)
     """
     num_workers = 0  # Force num_workers=0 for Kaggle safety
+    features_dir = Path(features_dir) if features_dir else Path("./data/features")
     
     logger.info("=" * 80)
-    logger.info("WALK-FORWARD VALIDATION: Loading base dataset once")
+    logger.info("WALK-FORWARD VALIDATION: Loading embeddings")
     logger.info("=" * 80)
     
-    # Load training data ONCE
-    print("[PROGRESS] Loading base training dataset for walk-forward...")
+    # Load split metadata
+    metadata_path = features_dir / "split_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Split metadata not found at {metadata_path}. "
+            "Make sure to extract full-sequence embeddings first."
+        )
+    
+    import json
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+    
+    logger.info(f"✓ Split metadata loaded:")
+    logger.info(f"  Total samples: {metadata['total_samples']}")
+    logger.info(f"  Train end: {metadata['train_end_idx']}")
+    logger.info(f"  Val end: {metadata['val_end_idx']}")
+    logger.info(f"  Test end: {metadata['test_end_idx']}")
+    
+    # Load full-sequence embeddings
+    print("[PROGRESS] Loading embeddings...")
     sys.stdout.flush()
     
-    base_dataset = CryptoMultimodalDataset(
-        split="train",
-        seq_len=config.data.seq_len,
-        features_dir=features_dir,
-        debug=config.debug if hasattr(config, "debug") else False,
+    text_embeddings = torch.load(
+        features_dir / "text_embeddings.pt",
+        map_location="cpu"
+    )
+    image_embeddings = torch.load(
+        features_dir / "image_embeddings.pt",
+        map_location="cpu"
+    )
+    tabular_data = torch.load(
+        features_dir / "tabular_features.pt",
+        map_location="cpu"
+    )
+    target_scores = torch.load(
+        features_dir / "target_scores.pt",
+        map_location="cpu"
     )
     
-    logger.info(f"✓ Base dataset loaded: {base_dataset.total_samples} samples")
-    logger.info(f"  Scalers: tabular_scaler={base_dataset.tabular_scaler}, target_scaler={base_dataset.target_scaler}")
+    total_samples = text_embeddings.shape[0]
+    logger.info(f"\u2713 Embeddings loaded: {total_samples} samples")
+    logger.info(f"  text_embeddings: {text_embeddings.shape}")
+    logger.info(f"  image_embeddings: {image_embeddings.shape}")
+    logger.info(f"  tabular_data: {tabular_data.shape}")
+    logger.info(f"  target_scores: {target_scores.shape}")
+    
+    # Create scalers from TRAINING portion only (to prevent data leakage)
+    train_end_idx = metadata["train_end_idx"]
+    logger.info(f"\nFitting scalers on training data [0:{train_end_idx}]...")
+    
+    from sklearn.preprocessing import StandardScaler
+    
+    # Fit tabular scaler on training data only
+    tabular_scaler = StandardScaler()
+    tabular_scaler.fit(tabular_data[:train_end_idx].numpy())
+    
+    # Fit target scaler on training data only
+    target_scaler = StandardScaler()
+    target_scaler.fit(target_scores[:train_end_idx].numpy().reshape(-1, 1))
+    
+    logger.info(f"✓ Scalers fitted on training data")
+    
+    # Create timestamps (dummy - sequential indices for now)
+    timestamps = torch.arange(total_samples, dtype=torch.float32)
     
     # Calculate walk-forward splits
-    data_len = base_dataset.total_samples
-    window_size = int(0.7 * data_len)  # Initial train window: 70% of data
-    step_size = int(0.15 * data_len) // num_folds  # Validation fold size
+    data_len = total_samples
+    window_size = int(0.7 * data_len)  # 70% initial train window
+    step_size = int(0.15 * data_len) // num_folds  # 15% validation spread across folds
     
     logger.info(f"\nWalk-Forward Configuration:")
     logger.info(f"  Total samples: {data_len}")
@@ -602,21 +775,21 @@ def create_walk_forward_dataloaders(
         
         # Create datasets for this fold
         train_dataset = WalkForwardDataset(
-            text_embeddings=base_dataset.text_embeddings,
-            image_embeddings=base_dataset.image_embeddings,
-            tabular_data=base_dataset.tabular_data,
-            target_scores=base_dataset.target_scores,
-            timestamps=base_dataset.timestamps,
+            text_embeddings=text_embeddings,
+            image_embeddings=image_embeddings,
+            tabular_data=tabular_data,
+            target_scores=target_scores,
+            timestamps=timestamps,
             data_slice=train_slice,
             seq_len=config.data.seq_len,
         )
         
         val_dataset = WalkForwardDataset(
-            text_embeddings=base_dataset.text_embeddings,
-            image_embeddings=base_dataset.image_embeddings,
-            tabular_data=base_dataset.tabular_data,
-            target_scores=base_dataset.target_scores,
-            timestamps=base_dataset.timestamps,
+            text_embeddings=text_embeddings,
+            image_embeddings=image_embeddings,
+            tabular_data=tabular_data,
+            target_scores=target_scores,
+            timestamps=timestamps,
             data_slice=val_slice,
             seq_len=config.data.seq_len,
         )
@@ -649,8 +822,8 @@ def create_walk_forward_dataloaders(
         logger.info(f"  ✓ Val loader: {len(val_loader)} batches")
         
         scalers_dict = {
-            "tabular_scaler": base_dataset.tabular_scaler,
-            "target_scaler": base_dataset.target_scaler,
+            "tabular_scaler": tabular_scaler,
+            "target_scaler": target_scaler,
         }
         
         yield fold_num, train_loader, val_loader, scalers_dict

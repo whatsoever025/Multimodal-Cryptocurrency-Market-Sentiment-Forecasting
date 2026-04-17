@@ -32,7 +32,6 @@ Innovation: Learnable [FUSION] token replaces mean pooling for better fusion.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Dict, Optional
 import logging
 
@@ -252,7 +251,7 @@ class MultimodalFusionNet(nn.Module):
         self.tabular_encoder = TabularEncoder(
             hidden_dim=self.hidden_dim,
             input_size=7,
-            dropout=0.4,  # Increased from 0.2 for stronger regularization
+            dropout=config.model.encoder_dropout,
         )
         
         # 2. Cross-modal attention
@@ -270,13 +269,13 @@ class MultimodalFusionNet(nn.Module):
         self.temporal_lstm = TemporalLSTMLayer(
             input_dim=config.model.bottleneck_dim,
             num_layers=config.model.lstm_layers,
-            dropout=0.4,  # Increased from config.model.lstm_dropout (0.2) for stronger regularization
+            dropout=config.model.lstm_dropout,
         )
         
         # 5. Prediction head (simplified: 64 → 16 → 1)
         self.prediction_head = PredictionHead(
             input_dim=config.model.bottleneck_dim,
-            dropout=0.4,  # Increased from config.model.head_dropout (0.2) for stronger regularization
+            dropout=config.model.head_dropout,
         )
         
         logger.info("✓ MultimodalFusionNet initialized")

@@ -3,7 +3,7 @@ Production training loop with VRAM management, W&B integration, and best model c
 
 Key Features:
 - Trainer class with full state management (save/load/train/validate)
-- Pure float32 training (no AMP) for numerical stability
+- Pure float32 training for numerical stability
 - Gradient accumulation configured via config.training.accumulate_steps
 - Gradient clipping via config.model.grad_clip
 - W&B integration per-branch via wandb_run_name
@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 import numpy as np
 import logging
-import json
 import argparse
 from datetime import datetime
 import sys
@@ -43,6 +42,137 @@ from .utils import setup_logging, format_duration
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_metrics_to_wandb(phase: str, metrics: Dict, config) -> None:
+    """
+    Log phase-specific metrics to W&B with visualizations.
+    
+    Creates scatter plot and error histogram for predictions vs ground truth.
+    
+    Args:
+        phase: Phase name ('train', 'val', or 'test')
+        metrics: Dictionary with 'predictions', 'targets', and metric values
+        config: Experiment config
+    """
+    if wandb is None or wandb.run is None:
+        return
+    
+    # Prepare core metrics for logging
+    log_dict = {
+        f"{phase}_mse": metrics["mse"],
+        f"{phase}_mae": metrics["mae"],
+        f"{phase}_rmse": metrics["rmse"],
+        f"{phase}_r2": metrics["r2"],
+        f"{phase}_correlation": metrics["correlation"],
+        f"{phase}_prediction_bias": metrics["prediction_error_mean"],
+        f"{phase}_prediction_error_std": metrics["prediction_error_std"],
+        f"{phase}_pred_min": metrics["pred_min"],
+        f"{phase}_pred_max": metrics["pred_max"],
+        f"{phase}_target_min": metrics["target_min"],
+        f"{phase}_target_max": metrics["target_max"],
+    }
+    
+    if "is_denormalized" in metrics:
+        log_dict[f"{phase}_is_denormalized"] = metrics["is_denormalized"]
+    
+    wandb.log(log_dict, commit=False)
+    
+    # Extract predictions and targets
+    predictions = metrics["predictions"].numpy()
+    targets = metrics["targets"].numpy()
+    
+    # Create scatter plot (first 500 samples for memory efficiency)
+    plot_limit = min(500, len(predictions))
+    try:
+        wandb_plot = wandb.plot.scatter(
+            wandb.Table(data=[
+                [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+            ], columns=["Ground Truth", "Prediction"]),
+            "Ground Truth", "Prediction", title=f"[{phase.upper()}] Predictions vs Ground Truth"
+        )
+        wandb.log({f"{phase}_predictions_scatter": wandb_plot}, commit=False)
+    except Exception as e:
+        logger.warning(f"Failed to log {phase} scatter plot: {e}")
+    
+    # Create error histogram
+    errors = predictions - targets
+    try:
+        wandb.log({f"{phase}_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
+    except Exception as e:
+        logger.warning(f"Failed to log {phase} error histogram: {e}")
+    
+    # Log sample predictions table (first 100 samples)
+    sample_limit = min(100, len(predictions))
+    table_data = [
+        [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
+        for i in range(sample_limit)
+    ]
+    try:
+        wandb.log({
+            f"{phase}_predictions_table": wandb.Table(
+                data=table_data,
+                columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+            )
+        }, commit=True)  # Commit after each phase
+    except Exception as e:
+        logger.warning(f"Failed to log {phase} predictions table: {e}")
+
+
+def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
+    """
+    Compute comprehensive regression metrics.
+    
+    Args:
+        predictions: Model predictions (torch.Tensor)
+        targets: Ground truth targets (torch.Tensor)
+    
+    Returns:
+        Dict with keys: 'mse', 'mae', 'rmse', 'r2', 'correlation',
+                       'prediction_error_mean', 'prediction_error_std',
+                       'pred_min', 'pred_max', 'target_min', 'target_max'
+    """
+    # MSE, MAE, RMSE
+    mse = torch.mean((predictions - targets) ** 2).item()
+    mae = torch.mean(torch.abs(predictions - targets)).item()
+    rmse = np.sqrt(mse)
+    
+    # R² Score
+    ss_res = torch.sum((predictions - targets) ** 2).item()
+    ss_tot = torch.sum((targets - targets.mean()) ** 2).item()
+    r2_score = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+    
+    # Correlation
+    pred_mean = predictions.mean()
+    target_mean = targets.mean()
+    numerator = torch.sum((predictions - pred_mean) * (targets - target_mean))
+    denom = torch.sqrt(
+        torch.sum((predictions - pred_mean) ** 2) * torch.sum((targets - target_mean) ** 2)
+    )
+    correlation = (numerator / denom).item() if denom > 0 else 0.0
+    
+    # Prediction error analysis
+    prediction_errors = predictions - targets
+    prediction_error_mean = prediction_errors.mean().item()
+    prediction_error_std = prediction_errors.std().item()
+    
+    # Min/Max ranges
+    pred_min, pred_max = predictions.min().item(), predictions.max().item()
+    target_min, target_max = targets.min().item(), targets.max().item()
+    
+    return {
+        "mse": mse,
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2_score,
+        "correlation": correlation,
+        "prediction_error_mean": prediction_error_mean,
+        "prediction_error_std": prediction_error_std,
+        "pred_min": pred_min,
+        "pred_max": pred_max,
+        "target_min": target_min,
+        "target_max": target_max,
+    }
 
 
 def safe_wandb_log(log_dict: Dict, commit: bool = True) -> bool:
@@ -378,55 +508,18 @@ class Trainer:
         all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
         all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
         
-        # MSE, MAE, RMSE
-        mse = torch.mean((all_predictions - all_targets) ** 2).item()
-        mae = torch.mean(torch.abs(all_predictions - all_targets)).item()
-        rmse = np.sqrt(mse)
-        
-        # R² Score
-        ss_res = torch.sum((all_predictions - all_targets) ** 2).item()
-        ss_tot = torch.sum((all_targets - all_targets.mean()) ** 2).item()
-        r2_score = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        
-        # Correlation
-        pred_mean = all_predictions.mean()
-        target_mean = all_targets.mean()
-        numerator = torch.sum((all_predictions - pred_mean) * (all_targets - target_mean))
-        denom = torch.sqrt(
-            torch.sum((all_predictions - pred_mean) ** 2) * torch.sum((all_targets - target_mean) ** 2)
-        )
-        correlation = (numerator / denom).item() if denom > 0 else 0.0
-        
-        # Prediction error analysis
-        prediction_errors = all_predictions - all_targets
-        prediction_error_mean = prediction_errors.mean().item()
-        prediction_error_std = prediction_errors.std().item()
-        
-        # Min/Max ranges
-        pred_min, pred_max = all_predictions.min().item(), all_predictions.max().item()
-        target_min, target_max = all_targets.min().item(), all_targets.max().item()
+        # Compute metrics using shared helper
+        metrics = _compute_metrics(all_predictions, all_targets)
+        metrics["loss"] = avg_loss
+        metrics["predictions"] = all_predictions
+        metrics["targets"] = all_targets
         
         logger.info(
-            f"Epoch {self.epoch+1} completed | Avg Loss: {avg_loss:.6f} | MSE: {mse:.6f} | "
-            f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | R²: {r2_score:.6f}"
+            f"Epoch {self.epoch+1} completed | Avg Loss: {avg_loss:.6f} | MSE: {metrics['mse']:.6f} | "
+            f"MAE: {metrics['mae']:.6f} | RMSE: {metrics['rmse']:.6f} | R²: {metrics['r2']:.6f}"
         )
         
-        return {
-            "loss": avg_loss,
-            "mse": mse,
-            "mae": mae,
-            "rmse": rmse,
-            "r2": r2_score,
-            "correlation": correlation,
-            "prediction_error_mean": prediction_error_mean,
-            "prediction_error_std": prediction_error_std,
-            "pred_min": pred_min,
-            "pred_max": pred_max,
-            "target_min": target_min,
-            "target_max": target_max,
-            "predictions": all_predictions,
-            "targets": all_targets,
-        }
+        return metrics
     
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """
@@ -467,10 +560,11 @@ class Trainer:
                 targets = batch["target"]  # (batch,)
                 
                 # Compute metrics (on normalized scale for loss)
-                mse = nn.MSELoss()(predictions, targets)
+                # Use HuberLoss for consistency with training (robust to outliers)
+                huber_loss = nn.HuberLoss(delta=1.0)(predictions, targets)
                 mae = nn.L1Loss()(predictions, targets)
                 
-                total_mse += mse.item()
+                total_mse += huber_loss.item()
                 total_mae += mae.item()
                 num_steps += 1
                 
@@ -504,48 +598,13 @@ class Trainer:
         avg_mae = total_mae / num_steps
         self.val_losses.append(avg_mse)
         
-        # Compute additional metrics
-        rmse = torch.sqrt(torch.tensor(avg_mse)).item()
+        # Compute metrics using shared helper
+        metrics = _compute_metrics(all_predictions, all_targets)
+        metrics["mse"] = avg_mse  # Override with per-batch average
+        metrics["mae"] = avg_mae  # Override with per-batch average
+        metrics["is_denormalized"] = is_denormalized
         
-        # R² Score: 1 - (SS_res / SS_tot)
-        ss_res = torch.sum((all_predictions - all_targets) ** 2).item()
-        ss_tot = torch.sum((all_targets - all_targets.mean()) ** 2).item()
-        r2_score = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        
-        # Correlation coefficient between predictions and targets
-        pred_mean = all_predictions.mean()
-        target_mean = all_targets.mean()
-        numerator = torch.sum((all_predictions - pred_mean) * (all_targets - target_mean))
-        denom = torch.sqrt(
-            torch.sum((all_predictions - pred_mean) ** 2) * torch.sum((all_targets - target_mean) ** 2)
-        )
-        correlation = (numerator / denom).item() if denom > 0 else 0.0
-        
-        # Prediction error analysis (bias and std)
-        prediction_errors = all_predictions - all_targets
-        prediction_error_mean = prediction_errors.mean().item()  # Bias
-        prediction_error_std = prediction_errors.std().item()  # Prediction spread
-        
-        # Min/Max of predictions and targets (for range checking)
-        pred_min, pred_max = all_predictions.min().item(), all_predictions.max().item()
-        target_min, target_max = all_targets.min().item(), all_targets.max().item()
-        
-        return {
-            "mse": avg_mse,
-            "mae": avg_mae,
-            "rmse": rmse,
-            "r2": r2_score,
-            "correlation": correlation,
-            "prediction_error_mean": prediction_error_mean,
-            "prediction_error_std": prediction_error_std,
-            "pred_min": pred_min,
-            "pred_max": pred_max,
-            "target_min": target_min,
-            "target_max": target_max,
-            "predictions": all_predictions,
-            "targets": all_targets,
-            "is_denormalized": is_denormalized,
-        }
+        return metrics
     
     def save_checkpoint(self, path: Path, is_best: bool = False) -> None:
         """
@@ -626,8 +685,17 @@ def main(args):
     Main training script.
     
     Args:
-        args: Parsed command-line arguments
+        args: Parsed command-line arguments (or Namespace object with attributes)
     """
+    # Set safe defaults for all args attributes (in case called from notebook without argparse)
+    asset = getattr(args, 'asset', 'MULTI')
+    features_dir = getattr(args, 'features_dir', './data/features')
+    run_name = getattr(args, 'run_name', None)
+    config_path = getattr(args, 'config', None)
+    seed = getattr(args, 'seed', 42)
+    resume_training = getattr(args, 'resume', False)
+    debug = getattr(args, 'debug', False)
+    num_folds = getattr(args, 'num_folds', 5)
     # Setup
     setup_logging()
     logger.info("=" * 80)
@@ -635,106 +703,78 @@ def main(args):
     logger.info("=" * 80)
     
     # Set seed for reproducibility
-    torch.manual_seed(args.seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(seed)
         logger.info(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
     
-    device = "cuda" if torch.cuda.is_available() and not args.debug else "cpu"
+    device = "cuda" if torch.cuda.is_available() and not debug else "cpu"
     logger.info(f"Device: {device}")
     
     # Load or create config
-    if args.config:
-        logger.info(f"Loading config from {args.config}...")
+    if config_path:
+        logger.info(f"Loading config from {config_path}...")
         # For now, use default config (could load from YAML in future)
         config = ExperimentConfig()
     else:
         config = create_config(
-            asset=args.asset,
-            wandb_run_name=args.run_name,
+            asset=asset,
+            wandb_run_name=run_name,
         )
-        config.debug = args.debug
+        config.debug = debug
     
     logger.info(f"Config: asset={config.data.asset}, seq_len={config.data.seq_len}, batch_size={config.data.batch_size}")
     logger.info(f"Model: hidden_dim={config.model.hidden_dim}, frozen_backbones={config.model.frozen_backbones}")
     logger.info(f"Training: lr={config.training.learning_rate:.2e}, epochs={config.training.max_epochs}")
     logger.info(f"MLOps: wandb_run={config.mlops.wandb_run_name}")
     
-    # Create dataloaders (walk-forward or fixed split)
+    # Create dataloaders (walk-forward validation)
     logger.info("\n" + "-" * 80)
     logger.info("Loading datasets...")
     print("[PROGRESS] Starting to load datasets (this may take 1-5 minutes)...")
     sys.stdout.flush()
     
-    if args.walk_forward:
-        # Use walk-forward validation
-        logger.info(f"Using WALK-FORWARD VALIDATION with {args.num_folds} folds")
-        logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
-        
-        # Will iterate through folds in training loop
-        walk_forward_generator = create_walk_forward_dataloaders(
-            config,
-            features_dir=args.features_dir,
-            num_folds=args.num_folds,
-            num_workers=0,
-            pin_memory=True
+    # Use walk-forward validation
+    logger.info(f"Using WALK-FORWARD VALIDATION with {num_folds} folds")
+    logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
+    
+    # Will iterate through folds in training loop
+    walk_forward_generator = create_walk_forward_dataloaders(
+        config,
+        features_dir=features_dir,
+        num_folds=num_folds,
+        num_workers=0,
+        pin_memory=True
+    )
+    
+    # Also load test set once for final evaluation
+    logger.info("Also loading test set for final evaluation...")
+    try:
+        from .dataset import CryptoMultimodalDataset
+        test_dataset = CryptoMultimodalDataset(
+            split="test_in_domain",
+            seq_len=config.data.seq_len,
+            features_dir=features_dir,
+            debug=debug,
         )
-        
-        # Also load test set once for final evaluation
-        logger.info("Also loading test set for final evaluation...")
-        try:
-            from .dataset import CryptoMultimodalDataset
-            test_dataset = CryptoMultimodalDataset(
-                split="test_in_domain",
-                seq_len=config.data.seq_len,
-                features_dir=args.features_dir,
-                debug=args.debug,
-            )
-            test_loader = torch.utils.data.DataLoader(
-                test_dataset,
-                batch_size=config.data.batch_size,
-                shuffle=False,
-                collate_fn=multimodal_collate_fn,
-                num_workers=0,
-                pin_memory=True,
-                drop_last=False,
-            )
-            target_scaler = test_dataset.target_scaler
-            logger.info(f"✓ Test loader created: {len(test_loader)} batches")
-        except Exception as e:
-            logger.warning(f"Failed to load test set: {e}")
-            test_loader = None
-            target_scaler = None
-        
-        print("[PROGRESS] ✓ Walk-forward generator ready!")
-        sys.stdout.flush()
-        
-        # Training will happen in fold loop below
-        use_walk_forward = True
-    else:
-        # Use fixed chronological split (original behavior)
-        logger.info("Using FIXED CHRONOLOGICAL SPLIT (70/15/15)")
-        logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
-        try:
-            dataloaders, scalers_dict = create_dataloaders(
-                config,
-                features_dir=args.features_dir,
-                num_workers=0  # CRITICAL: Always 0 on Kaggle
-            )
-            print("[PROGRESS] ✓ All datasets loaded successfully!")
-            sys.stdout.flush()
-        except Exception as e:
-            logger.error(f"Failed to create dataloaders: {e}", exc_info=True)
-            print(f"[ERROR] Failed to load datasets: {e}")
-            sys.stdout.flush()
-            raise
-        
-        train_loader = dataloaders["train"]
-        val_loader = dataloaders["validation"]
-        test_loader = dataloaders["test_in_domain"]
-        target_scaler = scalers_dict.get("target_scaler", None)
-        
-        use_walk_forward = False
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=config.data.batch_size,
+            shuffle=False,
+            collate_fn=multimodal_collate_fn,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
+        target_scaler = test_dataset.target_scaler
+        logger.info(f"✓ Test loader created: {len(test_loader)} batches")
+    except Exception as e:
+        logger.warning(f"Failed to load test set: {e}")
+        test_loader = None
+        target_scaler = None
+    
+    print("[PROGRESS] ✓ Walk-forward generator ready!")
+    sys.stdout.flush()
     
     
     # Initialize model
@@ -768,7 +808,7 @@ def main(args):
     
     # Resume from checkpoint if requested
     start_epoch = 0
-    if args.resume:
+    if resume_training:
         logger.info("\n" + "-" * 80)
         logger.info("Resuming from checkpoint...")
         
@@ -792,287 +832,101 @@ def main(args):
     print("[PROGRESS] ✓ Setup complete, training begins now...")
     sys.stdout.flush()
     
-    # ==================== WALK-FORWARD LOOP (if enabled) ====================
-    if use_walk_forward:
-        logger.info("=" * 80)
-        logger.info("WALK-FORWARD VALIDATION MODE")
-        logger.info("=" * 80)
-        
-        fold_results = {}
-        
-        for fold_num, train_loader, val_loader, scalers_dict in walk_forward_generator:
-            logger.info("\n" + "=" * 80)
-            logger.info(f"FOLD {fold_num}")
-            logger.info("=" * 80)
-            
-            # Reset trainer for each fold
-            trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
-            trainer.setup_optimizer()
-            
-            # Early stopping reset
-            early_stopping = EarlyStopping(
-                patience=config.training.early_stopping_patience,
-                verbose=True
-            )
-            
-            # Train for this fold
-            for epoch in range(config.training.max_epochs):
-                trainer.epoch = epoch
-                
-                # Train epoch
-                train_metrics = trainer.train_epoch(train_loader)
-                train_loss = train_metrics["loss"]
-                
-                logger.info(
-                    f"Fold {fold_num} Epoch {epoch+1:3d} | "
-                    f"Train Loss {train_loss:.6f} | "
-                    f"Train R² {train_metrics['r2']:.6f}"
-                )
-                
-                # Validate
-                if (epoch + 1) % config.mlops.eval_frequency == 0:
-                    val_metrics = trainer.validate(val_loader)
-                    val_loss = val_metrics["mse"]
-                    
-                    logger.info(
-                        f"Fold {fold_num} Epoch {epoch+1:3d} | "
-                        f"Val Loss {val_loss:.6f} | "
-                        f"Val MSE {val_metrics['mse']:.6f} | "
-                        f"Val R² {val_metrics['r2']:.6f}"
-                    )
-                    
-                    # Early stopping check
-                    if early_stopping(val_loss):
-                        logger.info(f"✓ Early stopping triggered at epoch {epoch+1}")
-                        break
-                    
-                    # Update best model for this fold
-                    if val_loss < trainer.best_val_loss:
-                        trainer.best_val_loss = val_loss
-                        trainer.best_epoch = epoch
-            
-            # Validate on full validation set for this fold
-            logger.info(f"\nFinal validation for Fold {fold_num}...")
-            final_val_metrics = trainer.validate(val_loader)
-            
-            fold_results[fold_num] = {
-                "val_r2": final_val_metrics["r2"],
-                "val_mse": final_val_metrics["mse"],
-                "val_rmse": final_val_metrics["rmse"],
-                "val_mae": final_val_metrics["mae"],
-                "val_correlation": final_val_metrics["correlation"],
-            }
-            
-            logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}")
-        
-        # Log fold summary
+    # ==================== WALK-FORWARD TRAINING LOOP ====================
+    logger.info("=" * 80)
+    logger.info("WALK-FORWARD VALIDATION MODE")
+    logger.info("=" * 80)
+    
+    fold_results = {}
+    
+    for fold_num, train_loader, val_loader, scalers_dict in walk_forward_generator:
         logger.info("\n" + "=" * 80)
-        logger.info("WALK-FORWARD VALIDATION SUMMARY")
+        logger.info(f"FOLD {fold_num}")
         logger.info("=" * 80)
         
-        r2_scores = [fold_results[i]["val_r2"] for i in sorted(fold_results.keys())]
-        mse_scores = [fold_results[i]["val_mse"] for i in sorted(fold_results.keys())]
-        rmse_scores = [fold_results[i]["val_rmse"] for i in sorted(fold_results.keys())]
+        # Reset trainer for each fold
+        trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
+        trainer.setup_optimizer()
         
-        logger.info(f"Mean R²: {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
-        logger.info(f"Mean MSE: {np.mean(mse_scores):.6f} ± {np.std(mse_scores):.6f}")
-        logger.info(f"Mean RMSE: {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
-        
-        for fold_num in sorted(fold_results.keys()):
-            logger.info(f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}")
-        
-        if wandb is not None and wandb.run is not None:
-            wandb.log({
-                "walk_forward/mean_r2": np.mean(r2_scores),
-                "walk_forward/std_r2": np.std(r2_scores),
-                "walk_forward/mean_mse": np.mean(mse_scores),
-                "walk_forward/mean_rmse": np.mean(rmse_scores),
-            })
-    else:
-        # ==================== FIXED SPLIT TRAINING LOOP (original) ====================
-        logger.info("=" * 80)
-        logger.info("FIXED CHRONOLOGICAL SPLIT MODE")
-        logger.info("=" * 80)
-        
-        # ==================== EARLY STOPPING INITIALIZATION ====================
+        # Early stopping reset
         early_stopping = EarlyStopping(
             patience=config.training.early_stopping_patience,
             verbose=True
         )
         
-        for epoch in range(start_epoch, config.training.max_epochs):
+        # Train for this fold
+        for epoch in range(config.training.max_epochs):
             trainer.epoch = epoch
             
-            # Train
+            # Train epoch
             train_metrics = trainer.train_epoch(train_loader)
             train_loss = train_metrics["loss"]
+            
             logger.info(
-                f"Epoch {epoch+1:3d} | "
+                f"Fold {fold_num} Epoch {epoch+1:3d} | "
                 f"Train Loss {train_loss:.6f} | "
-                f"Train MSE {train_metrics['mse']:.6f} | "
-            f"Train RMSE {train_metrics['rmse']:.6f} | "
-            f"Train MAE {train_metrics['mae']:.6f} | "
-            f"Train R² {train_metrics['r2']:.6f}"
+                f"Train R² {train_metrics['r2']:.6f}"
             )
-            
-            # Log training metrics to W&B
-            if wandb is not None and wandb.run is not None:
-                # Core training metrics - log simple scalars first
-                train_log_dict = {
-                    "epoch": epoch + 1,
-                    "train_loss": train_metrics["loss"],
-                    "train_mse": train_metrics["mse"],
-                    "train_mae": train_metrics["mae"],
-                    "train_rmse": train_metrics["rmse"],
-                    "train_r2": train_metrics["r2"],
-                    "train_correlation": train_metrics["correlation"],
-                    "train_prediction_bias": train_metrics["prediction_error_mean"],
-                    "train_prediction_error_std": train_metrics["prediction_error_std"],
-                    "train_pred_min": train_metrics["pred_min"],
-                    "train_pred_max": train_metrics["pred_max"],
-                    "train_target_min": train_metrics["target_min"],
-                    "train_target_max": train_metrics["target_max"],
-                }
-                
-                wandb.log(train_log_dict, commit=False)  # Don't commit yet, add visualizations
-                
-                # Create visualizations for training data
-                predictions = train_metrics["predictions"].numpy()
-                targets = train_metrics["targets"].numpy()
-                
-                # Scatter plot (first 500 samples for efficiency)
-                plot_limit = min(500, len(predictions))
-                try:
-                    wandb_plot = wandb.plot.scatter(
-                        wandb.Table(data=[
-                            [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                        ], columns=["Ground Truth", "Prediction"]),
-                        "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
-                    )
-                    wandb.log({"train_predictions_scatter": wandb_plot}, commit=False)
-                except Exception as e:
-                    logger.warning(f"Failed to log training scatter plot: {e}")
-
-                # Error histogram
-                errors = predictions - targets
-                try:
-                    wandb.log({"train_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
-                except Exception as e:
-                    logger.warning(f"Failed to log training error histogram: {e}")
-            
-                # Sample predictions table (first 100)
-                sample_limit = min(100, len(predictions))
-                table_data = [
-                    [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
-                    for i in range(sample_limit)
-                ]
-                try:
-                    wandb.log({
-                        "train_predictions_table": wandb.Table(
-                            data=table_data,
-                            columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
-                        )
-                    }, commit=True)  # Commit here - this is the final log for this epoch
-                except Exception as e:
-                    logger.warning(f"Failed to log training predictions table: {e}")
             
             # Validate
             if (epoch + 1) % config.mlops.eval_frequency == 0:
                 val_metrics = trainer.validate(val_loader)
-                val_mse = val_metrics["mse"]
-                denorm_status = " (denormalized)" if val_metrics.get("is_denormalized", False) else ""
+                val_loss = val_metrics["mse"]
+                
                 logger.info(
-                    f"Epoch {epoch+1:3d} | "
-                f"Val MSE {val_mse:.6f} | "
-                f"Val RMSE {val_metrics['rmse']:.6f} | "
-                f"Val MAE {val_metrics['mae']:.6f} | "
-                f"Val R² {val_metrics['r2']:.6f}{denorm_status}"
-            )
-            
-            # Log comprehensive metrics to W&B
-            if wandb is not None and wandb.run is not None:
-                # Log core metrics first (don't commit yet)
-                val_log_dict = {
-                    "epoch": epoch + 1,
-                    "val_mse": val_metrics["mse"],
-                    "val_mae": val_metrics["mae"],
-                    "val_rmse": val_metrics["rmse"],
-                    "val_r2": val_metrics["r2"],
-                    "val_correlation": val_metrics["correlation"],
-                    "val_prediction_bias": val_metrics["prediction_error_mean"],
-                    "val_prediction_error_std": val_metrics["prediction_error_std"],
-                    "val_pred_min": val_metrics["pred_min"],
-                    "val_pred_max": val_metrics["pred_max"],
-                    "val_target_min": val_metrics["target_min"],
-                    "val_target_max": val_metrics["target_max"],
-                    "val_is_denormalized": val_metrics.get("is_denormalized", False),
-                }
-                
-                wandb.log(val_log_dict, commit=False)
-                
-                # Create prediction error scatter plot (ground truth vs predictions)
-                predictions = val_metrics["predictions"].numpy()
-                targets = val_metrics["targets"].numpy()
-                
-                # Create scatter plot for first 500 samples (memory efficiency)
-                plot_limit = min(500, len(predictions))
-                try:
-                    wandb_plot = wandb.plot.scatter(
-                        wandb.Table(data=[
-                            [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                        ], columns=["Ground Truth", "Prediction"]),
-                        "Ground Truth", "Prediction", title="[VAL] Predictions vs Ground Truth"
-                    )
-                    wandb.log({"val_predictions_scatter": wandb_plot}, commit=False)
-                except Exception as e:
-                    logger.warning(f"Failed to log validation scatter plot: {e}")
-                
-                # Create histogram of prediction errors
-                errors = predictions - targets
-                try:
-                    wandb.log({"val_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
-                except Exception as e:
-                    logger.warning(f"Failed to log validation error histogram: {e}")
-                
-                # Log actual values as table for samples (first 100 samples for inspection)
-                sample_limit = min(100, len(predictions))
-                table_data = [
-                    [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
-                    for i in range(sample_limit)
-                ]
-                try:
-                    wandb.log({
-                        "val_predictions_table": wandb.Table(
-                            data=table_data,
-                            columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
-                        )
-                    }, commit=True)  # Commit after validation logging
-                except Exception as e:
-                    logger.warning(f"Failed to log validation predictions table: {e}")
-            
-            # Save best model
-            if val_mse < trainer.best_val_loss:
-                trainer.best_val_loss = val_mse
-                trainer.best_epoch = epoch + 1
-                
-                checkpoint_path = config.mlops.checkpoint_dir / f"{config.mlops.wandb_run_name}_best.pt"
-                trainer.save_checkpoint(checkpoint_path, is_best=True)
-            
-            # Check early stopping
-            if early_stopping(val_mse):
-                logger.info(
-                    f"\n{'='*80}\n"
-                    f"🛑 EARLY STOPPING: Training stopped at epoch {epoch+1}\n"
-                    f"Best validation loss: {trainer.best_val_loss:.6f} (epoch {trainer.best_epoch})\n"
-                    f"{'='*80}\n"
+                    f"Fold {fold_num} Epoch {epoch+1:3d} | "
+                    f"Val Loss {val_loss:.6f} | "
+                    f"Val MSE {val_metrics['mse']:.6f} | "
+                    f"Val R² {val_metrics['r2']:.6f}"
                 )
-                break  # Exit the epoch loop
+                
+                # Early stopping check
+                if early_stopping(val_loss):
+                    logger.info(f"✓ Early stopping triggered at epoch {epoch+1}")
+                    break
+                
+                # Update best model for this fold
+                if val_loss < trainer.best_val_loss:
+                    trainer.best_val_loss = val_loss
+                    trainer.best_epoch = epoch
         
-        # Save periodic checkpoint
-        if (epoch + 1) % config.mlops.save_frequency == 0:
-            periodic_ckpt_path = config.mlops.checkpoint_dir / f"{config.mlops.wandb_run_name}_epoch_{epoch+1:03d}.pt"
-            trainer.save_checkpoint(periodic_ckpt_path, is_best=False)
-            trainer.cleanup_old_checkpoints()
+        # Validate on full validation set for this fold
+        logger.info(f"\nFinal validation for Fold {fold_num}...")
+        final_val_metrics = trainer.validate(val_loader)
+        
+        fold_results[fold_num] = {
+            "val_r2": final_val_metrics["r2"],
+            "val_mse": final_val_metrics["mse"],
+            "val_rmse": final_val_metrics["rmse"],
+            "val_mae": final_val_metrics["mae"],
+            "val_correlation": final_val_metrics["correlation"],
+        }
+        
+        logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}")
+    
+    # Log fold summary
+    logger.info("\n" + "=" * 80)
+    logger.info("WALK-FORWARD VALIDATION SUMMARY")
+    logger.info("=" * 80)
+    
+    r2_scores = [fold_results[i]["val_r2"] for i in sorted(fold_results.keys())]
+    mse_scores = [fold_results[i]["val_mse"] for i in sorted(fold_results.keys())]
+    rmse_scores = [fold_results[i]["val_rmse"] for i in sorted(fold_results.keys())]
+    
+    logger.info(f"Mean R²: {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
+    logger.info(f"Mean MSE: {np.mean(mse_scores):.6f} ± {np.std(mse_scores):.6f}")
+    logger.info(f"Mean RMSE: {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
+    
+    for fold_num in sorted(fold_results.keys()):
+        logger.info(f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}")
+    
+    if wandb is not None and wandb.run is not None:
+        wandb.log({
+            "walk_forward/mean_r2": np.mean(r2_scores),
+            "walk_forward/std_r2": np.std(r2_scores),
+            "walk_forward/mean_mse": np.mean(mse_scores),
+            "walk_forward/mean_rmse": np.mean(rmse_scores),
+        })
     
     # ==================== TEST EVALUATION ====================
     logger.info("\n" + "=" * 80)
@@ -1177,7 +1031,6 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--debug", action="store_true", help="Debug mode (small dataset)")
-    parser.add_argument("--walk-forward", action="store_true", help="Use walk-forward validation instead of fixed train/val/test split")
     parser.add_argument("--num-folds", type=int, default=5, help="Number of walk-forward folds (default: 5)")
     
     args = parser.parse_args()

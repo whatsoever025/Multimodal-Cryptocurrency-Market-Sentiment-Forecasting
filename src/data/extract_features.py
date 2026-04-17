@@ -314,14 +314,17 @@ def extract_image_embeddings(
 
 def main(args):
     """
-    Main extraction script.
+    Main extraction script - extracts FULL SEQUENCE (no pre-split).
+    
+    Concatenates train + validation + test_in_domain, extracts embeddings,
+    and saves metadata about split boundaries for walk-forward validation.
     
     Args:
         args: Parsed command-line arguments
     """
     setup_logging()
     logger.info("=" * 80)
-    logger.info("Offline Feature Extraction Pipeline")
+    logger.info("Offline Feature Extraction Pipeline - FULL SEQUENCE")
     logger.info("=" * 80)
     
     # Ensure output directory exists
@@ -337,108 +340,157 @@ def main(args):
     text_encoder = FrozenTextEncoder(hidden_dim=256)
     image_encoder = FrozenImageEncoder(hidden_dim=256)
     
-    # Extract features for each split
+    # Load all splits and concatenate
+    logger.info("\n" + "-" * 80)
+    logger.info("Loading and concatenating all splits...")
+    logger.info("-" * 80)
+    
     splits = ["train", "validation", "test_in_domain"]
+    all_datasets = {}
+    split_sizes = {}
     
     for split in splits:
-        logger.info("\n" + "-" * 80)
-        logger.info(f"Processing {split} split...")
-        logger.info("-" * 80)
-        
-        # Load dataset
+        logger.info(f"Loading {split}...")
         dataset = load_dataset_multi_asset(split=split, debug=args.debug)
-        
-        # Text embeddings
-        text_output_path = output_dir / f"text_embeddings_{split}.pt"
-        if text_output_path.exists() and not args.force:
-            logger.info(f"✓ Text embeddings already exist: {text_output_path}")
-            print(f"[PROGRESS] Skipping text extraction (file exists)")
-        else:
-            start_time = time.time()
-            extract_text_embeddings(
-                dataset,
-                text_encoder,
-                text_output_path,
-                batch_size=32,
-                device=device,
-            )
-            elapsed = time.time() - start_time
-            logger.info(f"Text extraction took {format_duration(elapsed)}")
-            print(f"[PROGRESS] Text extraction complete ({format_duration(elapsed)})")
-        
-        # Image embeddings
-        image_output_path = output_dir / f"image_embeddings_{split}.pt"
-        if image_output_path.exists() and not args.force:
-            logger.info(f"✓ Image embeddings already exist: {image_output_path}")
-            print(f"[PROGRESS] Skipping image extraction (file exists)")
-        else:
-            start_time = time.time()
-            extract_image_embeddings(
-                dataset,
-                image_encoder,
-                image_output_path,
-                batch_size=32,
-                device=device,
-            )
-            elapsed = time.time() - start_time
-            logger.info(f"Image extraction took {format_duration(elapsed)}")
-            print(f"[PROGRESS] Image extraction complete ({format_duration(elapsed)})")
-        
-        # Tabular features (raw, no scaling)
-        tabular_output_path = output_dir / f"tabular_features_{split}.pt"
-        if tabular_output_path.exists() and not args.force:
-            logger.info(f"✓ Tabular features already exist: {tabular_output_path}")
-            print(f"[PROGRESS] Skipping tabular extraction (file exists)")
-        else:
-            start_time = time.time()
-            extract_tabular_features(
-                dataset,
-                output_dir,
-                split=split,
-            )
-            elapsed = time.time() - start_time
-            logger.info(f"Tabular extraction took {format_duration(elapsed)}")
-            print(f"[PROGRESS] Tabular extraction complete ({format_duration(elapsed)})")
-        
-        # Target scores (raw, no scaling)
-        target_output_path = output_dir / f"target_scores_{split}.pt"
-        if target_output_path.exists() and not args.force:
-            logger.info(f"✓ Target scores already exist: {target_output_path}")
-            print(f"[PROGRESS] Skipping target extraction (file exists)")
-        else:
-            start_time = time.time()
-            extract_target_scores(
-                dataset,
-                target_output_path,
-            )
-            elapsed = time.time() - start_time
-            logger.info(f"Target extraction took {format_duration(elapsed)}")
-            print(f"[PROGRESS] Target extraction complete ({format_duration(elapsed)})")
-        
-        sys.stdout.flush()
+        all_datasets[split] = dataset
+        split_sizes[split] = len(dataset)
+        logger.info(f"✓ {split}: {len(dataset)} samples")
+    
+    # Concatenate datasets in chronological order: train → validation → test
+    logger.info("\nConcatenating datasets in order: train → validation → test...")
+    full_dataset = concatenate_datasets([
+        all_datasets["train"],
+        all_datasets["validation"],
+        all_datasets["test_in_domain"]
+    ])
+    
+    total_samples = len(full_dataset)
+    train_end = split_sizes["train"]
+    val_end = train_end + split_sizes["validation"]
+    
+    logger.info(f"✓ Full sequence: {total_samples} samples")
+    logger.info(f"  Split boundaries:")
+    logger.info(f"    Train: [0:{train_end}]")
+    logger.info(f"    Val:   [{train_end}:{val_end}]")
+    logger.info(f"    Test:  [{val_end}:{total_samples}]")
+    
+    # Save split metadata
+    metadata = {
+        "total_samples": total_samples,
+        "train_end_idx": int(train_end),
+        "val_end_idx": int(val_end),
+        "test_end_idx": int(total_samples),
+        "split_sizes": {
+            "train": int(split_sizes["train"]),
+            "validation": int(split_sizes["validation"]),
+            "test_in_domain": int(split_sizes["test_in_domain"]),
+        }
+    }
+    
+    import json
+    metadata_path = output_dir / "split_metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    logger.info(f"\n✓ Split metadata saved to {metadata_path}")
+    
+    # Extract features from FULL sequence
+    logger.info("\n" + "-" * 80)
+    logger.info("Extracting embeddings from full sequence...")
+    logger.info("-" * 80)
+    
+    # Text embeddings
+    text_output_path = output_dir / "text_embeddings.pt"
+    if text_output_path.exists() and not args.force:
+        logger.info(f"✓ Text embeddings already exist: {text_output_path}")
+        print(f"[PROGRESS] Skipping text extraction (file exists)")
+    else:
+        start_time = time.time()
+        extract_text_embeddings(
+            full_dataset,
+            text_encoder,
+            text_output_path,
+            batch_size=32,
+            device=device,
+        )
+        elapsed = time.time() - start_time
+        logger.info(f"Text extraction took {format_duration(elapsed)}")
+        print(f"[PROGRESS] Text extraction complete ({format_duration(elapsed)})")
+    
+    # Image embeddings
+    image_output_path = output_dir / "image_embeddings.pt"
+    if image_output_path.exists() and not args.force:
+        logger.info(f"✓ Image embeddings already exist: {image_output_path}")
+        print(f"[PROGRESS] Skipping image extraction (file exists)")
+    else:
+        start_time = time.time()
+        extract_image_embeddings(
+            full_dataset,
+            image_encoder,
+            image_output_path,
+            batch_size=32,
+            device=device,
+        )
+        elapsed = time.time() - start_time
+        logger.info(f"Image extraction took {format_duration(elapsed)}")
+        print(f"[PROGRESS] Image extraction complete ({format_duration(elapsed)})")
+    
+    # Tabular features (raw, no scaling)
+    tabular_output_path = output_dir / "tabular_features.pt"
+    if tabular_output_path.exists() and not args.force:
+        logger.info(f"✓ Tabular features already exist: {tabular_output_path}")
+        print(f"[PROGRESS] Skipping tabular extraction (file exists)")
+    else:
+        start_time = time.time()
+        extract_tabular_features_sequence(
+            full_dataset,
+            tabular_output_path,
+        )
+        elapsed = time.time() - start_time
+        logger.info(f"Tabular extraction took {format_duration(elapsed)}")
+        print(f"[PROGRESS] Tabular extraction complete ({format_duration(elapsed)})")
+    
+    # Target scores (raw, no scaling)
+    target_output_path = output_dir / "target_scores.pt"
+    if target_output_path.exists() and not args.force:
+        logger.info(f"✓ Target scores already exist: {target_output_path}")
+        print(f"[PROGRESS] Skipping target extraction (file exists)")
+    else:
+        start_time = time.time()
+        extract_target_scores_sequence(
+            full_dataset,
+            target_output_path,
+        )
+        elapsed = time.time() - start_time
+        logger.info(f"Target extraction took {format_duration(elapsed)}")
+        print(f"[PROGRESS] Target extraction complete ({format_duration(elapsed)})")
+    
+    sys.stdout.flush()
     
     # Verify all files
     logger.info("\n" + "-" * 80)
     logger.info("Extraction Complete!")
     logger.info("-" * 80)
     
-    for split in splits:
-        text_path = output_dir / f"text_embeddings_{split}.pt"
-        image_path = output_dir / f"image_embeddings_{split}.pt"
-        tabular_path = output_dir / f"tabular_features_{split}.pt"
-        target_path = output_dir / f"target_scores_{split}.pt"
-        
-        if (text_path.exists() and image_path.exists() and 
-            tabular_path.exists() and target_path.exists()):
-            text_shape = torch.load(text_path, map_location="cpu").shape
-            image_shape = torch.load(image_path, map_location="cpu").shape
-            tabular_shape = torch.load(tabular_path, map_location="cpu").shape
-            target_shape = torch.load(target_path, map_location="cpu").shape
-            logger.info(f"✓ {split}: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
-            print(f"[PROGRESS] ✓ {split}: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
-        else:
-            logger.warning(f"✗ {split}: Missing files")
-            print(f"[PROGRESS] ✗ {split}: Missing files")
+    text_path = output_dir / "text_embeddings.pt"
+    image_path = output_dir / "image_embeddings.pt"
+    tabular_path = output_dir / "tabular_features.pt"
+    target_path = output_dir / "target_scores.pt"
+    
+    if (text_path.exists() and image_path.exists() and 
+        tabular_path.exists() and target_path.exists()):
+        text_shape = torch.load(text_path, map_location="cpu").shape
+        image_shape = torch.load(image_path, map_location="cpu").shape
+        tabular_shape = torch.load(tabular_path, map_location="cpu").shape
+        target_shape = torch.load(target_path, map_location="cpu").shape
+        logger.info(f"✓ Extraction complete:")
+        logger.info(f"  text_embeddings: {text_shape}")
+        logger.info(f"  image_embeddings: {image_shape}")
+        logger.info(f"  tabular_features: {tabular_shape}")
+        logger.info(f"  target_scores: {target_shape}")
+        print(f"[PROGRESS] ✓ All embeddings extracted: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
+    else:
+        logger.warning(f"✗ Missing files")
+        print(f"[PROGRESS] ✗ Missing files")
     
     print("[PROGRESS] ✓ Feature extraction pipeline complete!")
     sys.stdout.flush()
@@ -458,6 +510,34 @@ def extract_target_scores(
     """
     logger.info(f"Extracting target_score ({len(dataset)} samples)...")
     print("[PROGRESS] Extracting target_score (RAW, no scaling)...")
+    sys.stdout.flush()
+    
+    # Extract target scores (raw, no scaling)
+    target_scores = np.array(dataset["target_score"], dtype=np.float32)
+    logger.info(f"Target scores shape: {target_scores.shape}")
+    logger.info(f"Target scores range (RAW): [{target_scores.min():.4f}, {target_scores.max():.4f}]")
+    
+    # Save raw targets
+    target_tensor = torch.tensor(target_scores, dtype=torch.float32)
+    torch.save(target_tensor, output_path)
+    logger.info(f"✓ Saved raw target scores to {output_path}")
+    print(f"[PROGRESS] ✓ Target scores extracted and saved ({target_tensor.shape})")
+    sys.stdout.flush()
+
+
+def extract_target_scores_sequence(
+    dataset,
+    output_path: Path,
+) -> None:
+    """
+    Extract RAW target scores (no scaling). Scaling done during training.
+    
+    Args:
+        dataset: Concatenated HuggingFace Dataset (train + validation + test)
+        output_path: Path to save raw target scores
+    """
+    logger.info(f"Extracting target scores ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting target scores (RAW, no scaling)...")
     sys.stdout.flush()
     
     # Extract target scores (raw, no scaling)
@@ -524,6 +604,50 @@ def extract_tabular_features(
     
     # Save raw tabular features
     output_path = output_dir / f"tabular_features_{split}.pt"
+    tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
+    torch.save(tabular_tensor, output_path)
+    logger.info(f"✓ Saved raw tabular features to {output_path}")
+    print(f"[PROGRESS] ✓ Tabular features extracted and saved ({tabular_tensor.shape})")
+    sys.stdout.flush()
+
+
+def extract_tabular_features_sequence(
+    dataset,
+    output_path: Path,
+) -> None:
+    """
+    Extract RAW 7 tabular features (no scaling). Scaling done during training.
+    
+    Features: return_1h, volume, funding_rate, fear_greed_value,
+    gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume
+    
+    Args:
+        dataset: Concatenated HuggingFace Dataset (train + validation + test)
+        output_path: Path to save raw features
+    """
+    logger.info(f"Extracting tabular features ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting tabular features (RAW, no scaling)...")
+    sys.stdout.flush()
+    
+    # Extract 7 tabular features
+    tabular_features = []
+    feature_names = [
+        "return_1h", "volume", "funding_rate", "fear_greed_value",
+        "gdelt_econ_volume", "gdelt_econ_tone", "gdelt_conflict_volume",
+    ]
+    
+    for feature_name in feature_names:
+        feature_values = np.array(dataset[feature_name], dtype=np.float32)
+        tabular_features.append(feature_values)
+    
+    # Stack into (total_samples, 7) array
+    tabular_array = np.stack(tabular_features, axis=1).astype(np.float32)
+    logger.info(f"Tabular array shape: {tabular_array.shape}")
+    logger.info(f"Feature ranges (RAW):")
+    for i, name in enumerate(feature_names):
+        logger.info(f"  {name}: [{tabular_array[:, i].min():.4f}, {tabular_array[:, i].max():.4f}]")
+    
+    # Save raw tabular features
     tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
     torch.save(tabular_tensor, output_path)
     logger.info(f"✓ Saved raw tabular features to {output_path}")

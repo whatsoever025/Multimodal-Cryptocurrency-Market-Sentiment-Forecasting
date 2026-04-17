@@ -1,22 +1,26 @@
 {
-  "id": "namkhanhng/crypto-sentiment-features",
+  "title": "crypto-sentiment-embeddings",
+  "id": "namkhanhng/crypto-sentiment-embeddings",
   "licenses": [
     {
-      "name": "cc0-1.0"
+      "name": "cc-by-nc-4"
     }
   ],
   "resources": [
-    {"path": "text_embeddings_train.pt"},
-    {"path": "text_embeddings_validation.pt"},
-    {"path": "text_embeddings_test_in_domain.pt"},
-    {"path": "image_embeddings_train.pt"},
-    {"path": "image_embeddings_validation.pt"},
-    {"path": "image_embeddings_test_in_domain.pt"},
-    {"path": "tabular_features_train.pt"},
-    {"path": "tabular_features_validation.pt"},
-    {"path": "tabular_features_test_in_domain.pt"},
-    {"path": "target_scores_train.pt"},
-    {"path": "target_scores_validation.pt"},
-    {"path": "target_scores_test_in_domain.pt"}
+    {
+      "path": "text_embeddings.pt"
+    },
+    {
+      "path": "image_embeddings.pt"
+    },
+    {
+      "path": "tabular_features.pt"
+    },
+    {
+      "path": "target_scores.pt"
+    },
+    {
+      "path": "split_metadata.json"
+    }
   ]
 }
