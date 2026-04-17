@@ -37,7 +37,7 @@ except ImportError:
     wandb = None
 
 from .config import ExperimentConfig, create_config
-from .dataset import CryptoMultimodalDataset, multimodal_collate_fn, create_dataloaders
+from .dataset import CryptoMultimodalDataset, multimodal_collate_fn, create_dataloaders, create_walk_forward_dataloaders
 from .model import MultimodalFusionNet
 from .utils import setup_logging, format_duration
 
@@ -660,34 +660,82 @@ def main(args):
     logger.info(f"Training: lr={config.training.learning_rate:.2e}, epochs={config.training.max_epochs}")
     logger.info(f"MLOps: wandb_run={config.mlops.wandb_run_name}")
     
-    # Create dataloaders
+    # Create dataloaders (walk-forward or fixed split)
     logger.info("\n" + "-" * 80)
     logger.info("Loading datasets...")
     print("[PROGRESS] Starting to load datasets (this may take 1-5 minutes)...")
     sys.stdout.flush()
-    # NOTE: num_workers=0 always (Kaggle multi-worker deadlock fix)
-    # Multi-worker DataLoader spawns intermittently deadlock on Kaggle
-    # CRITICAL: Enforce num_workers=0 regardless of config
-    logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
-    try:
-        dataloaders, scalers_dict = create_dataloaders(
+    
+    if args.walk_forward:
+        # Use walk-forward validation
+        logger.info(f"Using WALK-FORWARD VALIDATION with {args.num_folds} folds")
+        logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
+        
+        # Will iterate through folds in training loop
+        walk_forward_generator = create_walk_forward_dataloaders(
             config,
             features_dir=args.features_dir,
-            num_workers=0  # CRITICAL: Always 0 on Kaggle
+            num_folds=args.num_folds,
+            num_workers=0,
+            pin_memory=True
         )
-        print("[PROGRESS] ✓ All datasets loaded successfully!")
+        
+        # Also load test set once for final evaluation
+        logger.info("Also loading test set for final evaluation...")
+        try:
+            from .dataset import CryptoMultimodalDataset
+            test_dataset = CryptoMultimodalDataset(
+                split="test_in_domain",
+                seq_len=config.data.seq_len,
+                features_dir=args.features_dir,
+                debug=args.debug,
+            )
+            test_loader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=config.data.batch_size,
+                shuffle=False,
+                collate_fn=multimodal_collate_fn,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=False,
+            )
+            target_scaler = test_dataset.target_scaler
+            logger.info(f"✓ Test loader created: {len(test_loader)} batches")
+        except Exception as e:
+            logger.warning(f"Failed to load test set: {e}")
+            test_loader = None
+            target_scaler = None
+        
+        print("[PROGRESS] ✓ Walk-forward generator ready!")
         sys.stdout.flush()
-    except Exception as e:
-        logger.error(f"Failed to create dataloaders: {e}", exc_info=True)
-        print(f"[ERROR] Failed to load datasets: {e}")
-        sys.stdout.flush()
-        raise
-    train_loader = dataloaders["train"]
-    val_loader = dataloaders["validation"]
-    test_loader = dataloaders["test_in_domain"]  # Load test dataloader for final evaluation
+        
+        # Training will happen in fold loop below
+        use_walk_forward = True
+    else:
+        # Use fixed chronological split (original behavior)
+        logger.info("Using FIXED CHRONOLOGICAL SPLIT (70/15/15)")
+        logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
+        try:
+            dataloaders, scalers_dict = create_dataloaders(
+                config,
+                features_dir=args.features_dir,
+                num_workers=0  # CRITICAL: Always 0 on Kaggle
+            )
+            print("[PROGRESS] ✓ All datasets loaded successfully!")
+            sys.stdout.flush()
+        except Exception as e:
+            logger.error(f"Failed to create dataloaders: {e}", exc_info=True)
+            print(f"[ERROR] Failed to load datasets: {e}")
+            sys.stdout.flush()
+            raise
+        
+        train_loader = dataloaders["train"]
+        val_loader = dataloaders["validation"]
+        test_loader = dataloaders["test_in_domain"]
+        target_scaler = scalers_dict.get("target_scaler", None)
+        
+        use_walk_forward = False
     
-    # Extract scalers for inverse transforms
-    target_scaler = scalers_dict.get("target_scaler", None)
     
     # Initialize model
     logger.info("\n" + "-" * 80)
@@ -744,95 +792,197 @@ def main(args):
     print("[PROGRESS] ✓ Setup complete, training begins now...")
     sys.stdout.flush()
     
-    # ==================== EARLY STOPPING INITIALIZATION ====================
-    early_stopping = EarlyStopping(
-        patience=config.training.early_stopping_patience,
-        verbose=True
-    )
-    
-    for epoch in range(start_epoch, config.training.max_epochs):
-        trainer.epoch = epoch
+    # ==================== WALK-FORWARD LOOP (if enabled) ====================
+    if use_walk_forward:
+        logger.info("=" * 80)
+        logger.info("WALK-FORWARD VALIDATION MODE")
+        logger.info("=" * 80)
         
-        # Train
-        train_metrics = trainer.train_epoch(train_loader)
-        train_loss = train_metrics["loss"]
-        logger.info(
-            f"Epoch {epoch+1:3d} | "
-            f"Train Loss {train_loss:.6f} | "
-            f"Train MSE {train_metrics['mse']:.6f} | "
+        fold_results = {}
+        
+        for fold_num, train_loader, val_loader, scalers_dict in walk_forward_generator:
+            logger.info("\n" + "=" * 80)
+            logger.info(f"FOLD {fold_num}")
+            logger.info("=" * 80)
+            
+            # Reset trainer for each fold
+            trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
+            trainer.setup_optimizer()
+            
+            # Early stopping reset
+            early_stopping = EarlyStopping(
+                patience=config.training.early_stopping_patience,
+                verbose=True
+            )
+            
+            # Train for this fold
+            for epoch in range(config.training.max_epochs):
+                trainer.epoch = epoch
+                
+                # Train epoch
+                train_metrics = trainer.train_epoch(train_loader)
+                train_loss = train_metrics["loss"]
+                
+                logger.info(
+                    f"Fold {fold_num} Epoch {epoch+1:3d} | "
+                    f"Train Loss {train_loss:.6f} | "
+                    f"Train R² {train_metrics['r2']:.6f}"
+                )
+                
+                # Validate
+                if (epoch + 1) % config.mlops.eval_frequency == 0:
+                    val_metrics = trainer.validate(val_loader)
+                    val_loss = val_metrics["mse"]
+                    
+                    logger.info(
+                        f"Fold {fold_num} Epoch {epoch+1:3d} | "
+                        f"Val Loss {val_loss:.6f} | "
+                        f"Val MSE {val_metrics['mse']:.6f} | "
+                        f"Val R² {val_metrics['r2']:.6f}"
+                    )
+                    
+                    # Early stopping check
+                    if early_stopping(val_loss):
+                        logger.info(f"✓ Early stopping triggered at epoch {epoch+1}")
+                        break
+                    
+                    # Update best model for this fold
+                    if val_loss < trainer.best_val_loss:
+                        trainer.best_val_loss = val_loss
+                        trainer.best_epoch = epoch
+            
+            # Validate on full validation set for this fold
+            logger.info(f"\nFinal validation for Fold {fold_num}...")
+            final_val_metrics = trainer.validate(val_loader)
+            
+            fold_results[fold_num] = {
+                "val_r2": final_val_metrics["r2"],
+                "val_mse": final_val_metrics["mse"],
+                "val_rmse": final_val_metrics["rmse"],
+                "val_mae": final_val_metrics["mae"],
+                "val_correlation": final_val_metrics["correlation"],
+            }
+            
+            logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}")
+        
+        # Log fold summary
+        logger.info("\n" + "=" * 80)
+        logger.info("WALK-FORWARD VALIDATION SUMMARY")
+        logger.info("=" * 80)
+        
+        r2_scores = [fold_results[i]["val_r2"] for i in sorted(fold_results.keys())]
+        mse_scores = [fold_results[i]["val_mse"] for i in sorted(fold_results.keys())]
+        rmse_scores = [fold_results[i]["val_rmse"] for i in sorted(fold_results.keys())]
+        
+        logger.info(f"Mean R²: {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
+        logger.info(f"Mean MSE: {np.mean(mse_scores):.6f} ± {np.std(mse_scores):.6f}")
+        logger.info(f"Mean RMSE: {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
+        
+        for fold_num in sorted(fold_results.keys()):
+            logger.info(f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}")
+        
+        if wandb is not None and wandb.run is not None:
+            wandb.log({
+                "walk_forward/mean_r2": np.mean(r2_scores),
+                "walk_forward/std_r2": np.std(r2_scores),
+                "walk_forward/mean_mse": np.mean(mse_scores),
+                "walk_forward/mean_rmse": np.mean(rmse_scores),
+            })
+    else:
+        # ==================== FIXED SPLIT TRAINING LOOP (original) ====================
+        logger.info("=" * 80)
+        logger.info("FIXED CHRONOLOGICAL SPLIT MODE")
+        logger.info("=" * 80)
+        
+        # ==================== EARLY STOPPING INITIALIZATION ====================
+        early_stopping = EarlyStopping(
+            patience=config.training.early_stopping_patience,
+            verbose=True
+        )
+        
+        for epoch in range(start_epoch, config.training.max_epochs):
+            trainer.epoch = epoch
+            
+            # Train
+            train_metrics = trainer.train_epoch(train_loader)
+            train_loss = train_metrics["loss"]
+            logger.info(
+                f"Epoch {epoch+1:3d} | "
+                f"Train Loss {train_loss:.6f} | "
+                f"Train MSE {train_metrics['mse']:.6f} | "
             f"Train RMSE {train_metrics['rmse']:.6f} | "
             f"Train MAE {train_metrics['mae']:.6f} | "
             f"Train R² {train_metrics['r2']:.6f}"
-        )
-        
-        # Log training metrics to W&B
-        if wandb is not None and wandb.run is not None:
-            # Core training metrics - log simple scalars first
-            train_log_dict = {
-                "epoch": epoch + 1,
-                "train_loss": train_metrics["loss"],
-                "train_mse": train_metrics["mse"],
-                "train_mae": train_metrics["mae"],
-                "train_rmse": train_metrics["rmse"],
-                "train_r2": train_metrics["r2"],
-                "train_correlation": train_metrics["correlation"],
-                "train_prediction_bias": train_metrics["prediction_error_mean"],
-                "train_prediction_error_std": train_metrics["prediction_error_std"],
-                "train_pred_min": train_metrics["pred_min"],
-                "train_pred_max": train_metrics["pred_max"],
-                "train_target_min": train_metrics["target_min"],
-                "train_target_max": train_metrics["target_max"],
-            }
+            )
             
-            wandb.log(train_log_dict, commit=False)  # Don't commit yet, add visualizations
-            
-            # Create visualizations for training data
-            predictions = train_metrics["predictions"].numpy()
-            targets = train_metrics["targets"].numpy()
-            
-            # Scatter plot (first 500 samples for efficiency)
-            plot_limit = min(500, len(predictions))
-            try:
-                wandb_plot = wandb.plot.scatter(
-                    wandb.Table(data=[
-                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                    ], columns=["Ground Truth", "Prediction"]),
-                    "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
-                )
-                wandb.log({"train_predictions_scatter": wandb_plot}, commit=False)
-            except Exception as e:
-                logger.warning(f"Failed to log training scatter plot: {e}")
-
-            # Error histogram
-            errors = predictions - targets
-            try:
-                wandb.log({"train_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
-            except Exception as e:
-                logger.warning(f"Failed to log training error histogram: {e}")
-            
-            # Sample predictions table (first 100)
-            sample_limit = min(100, len(predictions))
-            table_data = [
-                [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
-                for i in range(sample_limit)
-            ]
-            try:
-                wandb.log({
-                    "train_predictions_table": wandb.Table(
-                        data=table_data,
-                        columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+            # Log training metrics to W&B
+            if wandb is not None and wandb.run is not None:
+                # Core training metrics - log simple scalars first
+                train_log_dict = {
+                    "epoch": epoch + 1,
+                    "train_loss": train_metrics["loss"],
+                    "train_mse": train_metrics["mse"],
+                    "train_mae": train_metrics["mae"],
+                    "train_rmse": train_metrics["rmse"],
+                    "train_r2": train_metrics["r2"],
+                    "train_correlation": train_metrics["correlation"],
+                    "train_prediction_bias": train_metrics["prediction_error_mean"],
+                    "train_prediction_error_std": train_metrics["prediction_error_std"],
+                    "train_pred_min": train_metrics["pred_min"],
+                    "train_pred_max": train_metrics["pred_max"],
+                    "train_target_min": train_metrics["target_min"],
+                    "train_target_max": train_metrics["target_max"],
+                }
+                
+                wandb.log(train_log_dict, commit=False)  # Don't commit yet, add visualizations
+                
+                # Create visualizations for training data
+                predictions = train_metrics["predictions"].numpy()
+                targets = train_metrics["targets"].numpy()
+                
+                # Scatter plot (first 500 samples for efficiency)
+                plot_limit = min(500, len(predictions))
+                try:
+                    wandb_plot = wandb.plot.scatter(
+                        wandb.Table(data=[
+                            [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                        ], columns=["Ground Truth", "Prediction"]),
+                        "Ground Truth", "Prediction", title="[TRAIN] Predictions vs Ground Truth"
                     )
-                }, commit=True)  # Commit here - this is the final log for this epoch
-            except Exception as e:
-                logger.warning(f"Failed to log training predictions table: {e}")
-        
-        # Validate
-        if (epoch + 1) % config.mlops.eval_frequency == 0:
-            val_metrics = trainer.validate(val_loader)
-            val_mse = val_metrics["mse"]
-            denorm_status = " (denormalized)" if val_metrics.get("is_denormalized", False) else ""
-            logger.info(
-                f"Epoch {epoch+1:3d} | "
+                    wandb.log({"train_predictions_scatter": wandb_plot}, commit=False)
+                except Exception as e:
+                    logger.warning(f"Failed to log training scatter plot: {e}")
+
+                # Error histogram
+                errors = predictions - targets
+                try:
+                    wandb.log({"train_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
+                except Exception as e:
+                    logger.warning(f"Failed to log training error histogram: {e}")
+            
+                # Sample predictions table (first 100)
+                sample_limit = min(100, len(predictions))
+                table_data = [
+                    [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
+                    for i in range(sample_limit)
+                ]
+                try:
+                    wandb.log({
+                        "train_predictions_table": wandb.Table(
+                            data=table_data,
+                            columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+                        )
+                    }, commit=True)  # Commit here - this is the final log for this epoch
+                except Exception as e:
+                    logger.warning(f"Failed to log training predictions table: {e}")
+            
+            # Validate
+            if (epoch + 1) % config.mlops.eval_frequency == 0:
+                val_metrics = trainer.validate(val_loader)
+                val_mse = val_metrics["mse"]
+                denorm_status = " (denormalized)" if val_metrics.get("is_denormalized", False) else ""
+                logger.info(
+                    f"Epoch {epoch+1:3d} | "
                 f"Val MSE {val_mse:.6f} | "
                 f"Val RMSE {val_metrics['rmse']:.6f} | "
                 f"Val MAE {val_metrics['mae']:.6f} | "
@@ -1027,6 +1177,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--debug", action="store_true", help="Debug mode (small dataset)")
+    parser.add_argument("--walk-forward", action="store_true", help="Use walk-forward validation instead of fixed train/val/test split")
+    parser.add_argument("--num-folds", type=int, default=5, help="Number of walk-forward folds (default: 5)")
     
     args = parser.parse_args()
     

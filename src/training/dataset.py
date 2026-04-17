@@ -427,6 +427,235 @@ def create_dataloaders(
     return dataloaders, scalers_dict
 
 
+def walk_forward_split(data_len: int, window_size: int, step_size: int):
+    """
+    Generate walk-forward train/val splits.
+    
+    CRITICAL: Walk-forward validation prevents look-ahead bias by training on
+    [0, train_end], validating on [train_end, train_end+step_size], then
+    progressively advancing the window forward.
+    
+    Args:
+        data_len: Total data length
+        window_size: Initial train window size
+        step_size: Number of samples for each validation fold
+    
+    Yields:
+        Tuple of (train_slice, val_slice) representing temporal folds
+    
+    Example:
+        data_len = 100, window_size = 70, step_size = 15
+        Fold 1: train=[0:70], val=[70:85]
+        Fold 2: train=[0:85], val=[85:100]
+    """
+    for i in range(0, data_len - window_size - step_size, step_size):
+        train_end = i + window_size
+        val_start = train_end
+        val_end = val_start + step_size
+        
+        if val_end > data_len:
+            val_end = data_len
+        
+        train_slice = slice(0, train_end)
+        val_slice = slice(val_start, val_end)
+        
+        yield train_slice, val_slice
+
+
+class WalkForwardDataset(torch.utils.data.Dataset):
+    """
+    Walk-forward dataset that slices pre-loaded embeddings/features for a given fold.
+    
+    Wraps the complete dataset and provides views for a specific train/val split.
+    """
+    
+    def __init__(
+        self,
+        text_embeddings: torch.Tensor,
+        image_embeddings: torch.Tensor,
+        tabular_data: torch.Tensor,
+        target_scores: torch.Tensor,
+        timestamps: torch.Tensor,
+        data_slice: slice,
+        seq_len: int = 24,
+    ):
+        """
+        Initialize walk-forward dataset for a specific slice.
+        
+        Args:
+            text_embeddings: Full tensor (total_samples, 256)
+            image_embeddings: Full tensor (total_samples, 256)
+            tabular_data: Full tensor (total_samples, 7) - already scaled
+            target_scores: Full tensor (total_samples,) - already scaled
+            timestamps: Full tensor (total_samples,)
+            data_slice: slice object (e.g., slice(0, 70000))
+            seq_len: Sliding window length
+        """
+        self.seq_len = seq_len
+        
+        # Slice data to specific fold
+        self.text_embeddings = text_embeddings[data_slice].contiguous()
+        self.image_embeddings = image_embeddings[data_slice].contiguous()
+        self.tabular_data = tabular_data[data_slice].contiguous()
+        self.target_scores = target_scores[data_slice].contiguous()
+        self.timestamps = timestamps[data_slice].contiguous()
+        
+        self.total_samples = self.text_embeddings.shape[0]
+        self.max_valid_idx = self.total_samples - seq_len
+        
+        if self.max_valid_idx <= 0:
+            raise ValueError(
+                f"Slice too small for seq_len={seq_len}. "
+                f"Got {self.total_samples}, need at least {seq_len + 1}"
+            )
+    
+    def __len__(self) -> int:
+        return self.max_valid_idx
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        if idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds for length {len(self)}")
+        
+        return {
+            "tabular": self.tabular_data[idx:idx + self.seq_len],
+            "text_embedding": self.text_embeddings[idx:idx + self.seq_len],
+            "image_embedding": self.image_embeddings[idx:idx + self.seq_len],
+            "target": self.target_scores[idx + self.seq_len],
+            "timestamp": self.timestamps[idx + self.seq_len],
+        }
+
+
+def create_walk_forward_dataloaders(
+    config,
+    features_dir: str = None,
+    num_folds: int = 5,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+):
+    """
+    Create walk-forward validation folds.
+    
+    Loads training data once, then yields (train_loader, val_loader) pairs
+    for each temporal fold, preventing data leakage.
+    
+    CRITICAL: Walk-forward respects temporal ordering:
+    - Fold 1: Train on [0:70%], validate on [70%:85%]
+    - Fold 2: Train on [0:85%], validate on [85%:100%]
+    
+    Args:
+        config: ExperimentConfig instance
+        features_dir: Local directory with pre-extracted Kaggle features
+        num_folds: Number of temporal validation folds
+        num_workers: Data loading workers (always 0 on Kaggle)
+        pin_memory: Pin memory for GPU transfer
+    
+    Yields:
+        Tuple of (fold_num, train_loader, val_loader, scalers_dict)
+    
+    Example:
+        for fold_num, train_loader, val_loader, scalers in create_walk_forward_dataloaders(config):
+            train_model(train_loader, val_loader)
+    """
+    num_workers = 0  # Force num_workers=0 for Kaggle safety
+    
+    logger.info("=" * 80)
+    logger.info("WALK-FORWARD VALIDATION: Loading base dataset once")
+    logger.info("=" * 80)
+    
+    # Load training data ONCE
+    print("[PROGRESS] Loading base training dataset for walk-forward...")
+    sys.stdout.flush()
+    
+    base_dataset = CryptoMultimodalDataset(
+        split="train",
+        seq_len=config.data.seq_len,
+        features_dir=features_dir,
+        debug=config.debug if hasattr(config, "debug") else False,
+    )
+    
+    logger.info(f"✓ Base dataset loaded: {base_dataset.total_samples} samples")
+    logger.info(f"  Scalers: tabular_scaler={base_dataset.tabular_scaler}, target_scaler={base_dataset.target_scaler}")
+    
+    # Calculate walk-forward splits
+    data_len = base_dataset.total_samples
+    window_size = int(0.7 * data_len)  # Initial train window: 70% of data
+    step_size = int(0.15 * data_len) // num_folds  # Validation fold size
+    
+    logger.info(f"\nWalk-Forward Configuration:")
+    logger.info(f"  Total samples: {data_len}")
+    logger.info(f"  Initial train window: {window_size} ({window_size/data_len*100:.1f}%)")
+    logger.info(f"  Validation fold size: {step_size} ({step_size/data_len*100:.1f}%)")
+    logger.info(f"  Number of folds: {num_folds}")
+    
+    # Generate folds
+    fold_num = 0
+    for train_slice, val_slice in walk_forward_split(data_len, window_size, step_size):
+        fold_num += 1
+        
+        if fold_num > num_folds:
+            break
+        
+        logger.info(f"\n" + "-" * 80)
+        logger.info(f"Creating Fold {fold_num}/{num_folds}")
+        logger.info(f"  Train: [{train_slice.start}:{train_slice.stop}] ({train_slice.stop - train_slice.start} samples)")
+        logger.info(f"  Val:   [{val_slice.start}:{val_slice.stop}] ({val_slice.stop - val_slice.start} samples)")
+        
+        # Create datasets for this fold
+        train_dataset = WalkForwardDataset(
+            text_embeddings=base_dataset.text_embeddings,
+            image_embeddings=base_dataset.image_embeddings,
+            tabular_data=base_dataset.tabular_data,
+            target_scores=base_dataset.target_scores,
+            timestamps=base_dataset.timestamps,
+            data_slice=train_slice,
+            seq_len=config.data.seq_len,
+        )
+        
+        val_dataset = WalkForwardDataset(
+            text_embeddings=base_dataset.text_embeddings,
+            image_embeddings=base_dataset.image_embeddings,
+            tabular_data=base_dataset.tabular_data,
+            target_scores=base_dataset.target_scores,
+            timestamps=base_dataset.timestamps,
+            data_slice=val_slice,
+            seq_len=config.data.seq_len,
+        )
+        
+        logger.info(f"  ✓ Train dataset: {len(train_dataset)} sequences")
+        logger.info(f"  ✓ Val dataset: {len(val_dataset)} sequences")
+        
+        # Create dataloaders
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=config.data.batch_size,
+            shuffle=True,
+            collate_fn=multimodal_collate_fn,
+            num_workers=0,
+            pin_memory=pin_memory,
+            drop_last=True,
+        )
+        
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=config.data.batch_size,
+            shuffle=False,
+            collate_fn=multimodal_collate_fn,
+            num_workers=0,
+            pin_memory=pin_memory,
+            drop_last=False,
+        )
+        
+        logger.info(f"  ✓ Train loader: {len(train_loader)} batches")
+        logger.info(f"  ✓ Val loader: {len(val_loader)} batches")
+        
+        scalers_dict = {
+            "tabular_scaler": base_dataset.tabular_scaler,
+            "target_scaler": base_dataset.target_scaler,
+        }
+        
+        yield fold_num, train_loader, val_loader, scalers_dict
+
+
 if __name__ == "__main__":
     """Test dataset loading and safe sliding window."""
     from training.config import ExperimentConfig

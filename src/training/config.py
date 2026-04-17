@@ -45,11 +45,11 @@ class ModelConfig:
     bottleneck_dim: int = 64  # Bottleneck layer: 256 -> 64 (compression before LSTM)
     lstm_layers: int = 1  # Simplified: reduced from 2 to 1
     lstm_hidden_dim: int = 64  # Simplified: reduced from 256 to 64
-    lstm_dropout: float = 0.2
+    lstm_dropout: float = 0.5  # INCREASED: Kill temporal memorization (was 0.2)
     attention_heads: int = 4
-    mha_dropout: float = 0.1
-    encoder_dropout: float = 0.2
-    head_dropout: float = 0.2
+    mha_dropout: float = 0.3  # INCREASED: Stronger attention dropout (was 0.1)
+    encoder_dropout: float = 0.3  # INCREASED: Stronger encoder dropout (was 0.2)
+    head_dropout: float = 0.4  # INCREASED: Stronger head dropout (was 0.2)
     grad_clip: float = 1.0
     frozen_backbones: bool = True  # Freeze BERT & ViT
     use_gradient_checkpointing: bool = True  # Mandatory for 16GB VRAM
@@ -73,8 +73,8 @@ class ModelConfig:
 class TrainingConfig:
     """Training loop configuration."""
     max_epochs: int = 60  # Increased from 50 (more capacity needs more training)
-    learning_rate: float = 5e-5  # Conservative for multimodal fine-tuning with AMP
-    weight_decay: float = 1e-3  # Increased from 1e-5 for stronger L2 regularization
+    learning_rate: float = 1e-5  # DECREASED: Slower, more stable (was 5e-5) - prevents overconfident predictions
+    weight_decay: float = 5e-3  # INCREASED: Stronger L2 regularization (was 1e-3) - penalize complex solutions
     accumulate_steps: int = 2  # Gradient accumulation for 16GB VRAM
     warmup_steps: int = 800  # Increased warmup for larger model (was 500)
     warmup_proportion: float = 0.1  # Alternate: warmup as % of total steps
