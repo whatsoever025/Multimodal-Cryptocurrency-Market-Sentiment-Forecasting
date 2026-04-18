@@ -913,15 +913,15 @@ def main(args):
             for i in range(min(5, len(predictions))):
                 logger.info(f"  [{i+1}] Predicted: {predictions[i].item():.4f} | Actual: {targets[i].item():.4f} | Error: {abs(predictions[i].item() - targets[i].item()):.4f}")
         
-        # Log per-fold metrics to W&B
+        # Log per-fold metrics to W&B (with step=fold_num for combined chart)
         if wandb is not None and wandb.run is not None:
             fold_log_dict = {
-                f"fold_{fold_num}/val_r2": final_val_metrics["r2"],
-                f"fold_{fold_num}/val_rmse": final_val_metrics["rmse"],
-                f"fold_{fold_num}/val_mae": final_val_metrics["mae"],
-                f"fold_{fold_num}/val_correlation": final_val_metrics["correlation"],
+                "val_r2": final_val_metrics["r2"],
+                "val_rmse": final_val_metrics["rmse"],
+                "val_mae": final_val_metrics["mae"],
+                "val_correlation": final_val_metrics["correlation"],
             }
-            wandb.log(fold_log_dict)
+            wandb.log(fold_log_dict, step=fold_num)
             logger.info(f"✓ Logged Fold {fold_num} metrics to W&B")
     
     # Log fold summary with simple line plots
@@ -958,113 +958,112 @@ def main(args):
         }
         wandb.log(summary_log)
         logger.info("✓ Logged fold summary statistics to W&B")
-    
-    # Log 4 line plots to wandb (fold number on x-axis)
-    if wandb is not None and wandb.run is not None:
-        # Plot 1: R² vs Fold
-        r2_table = wandb.Table(data=[[fold, r2] for fold, r2 in zip(fold_numbers, r2_scores)], columns=["Fold", "R²"])
-        wandb.log({"fold_r2_plot": wandb.plot.line(r2_table, "Fold", "R²", title="R² Across Folds")})
-        
-        # Plot 2: RMSE vs Fold
-        rmse_table = wandb.Table(data=[[fold, rmse] for fold, rmse in zip(fold_numbers, rmse_scores)], columns=["Fold", "RMSE"])
-        wandb.log({"fold_rmse_plot": wandb.plot.line(rmse_table, "Fold", "RMSE", title="RMSE Across Folds")})
-        
-        # Plot 3: MAE vs Fold
-        mae_table = wandb.Table(data=[[fold, mae] for fold, mae in zip(fold_numbers, mae_scores)], columns=["Fold", "MAE"])
-        wandb.log({"fold_mae_plot": wandb.plot.line(mae_table, "Fold", "MAE", title="MAE Across Folds")})
-        
-        # Plot 4: Correlation vs Fold
-        corr_table = wandb.Table(data=[[fold, corr] for fold, corr in zip(fold_numbers, corr_scores)], columns=["Fold", "Correlation"])
-        wandb.log({"fold_correlation_plot": wandb.plot.line(corr_table, "Fold", "Correlation", title="Correlation Across Folds")})
-        
-        logger.info("✓ Logged 4 fold comparison plots to wandb")
+        logger.info("✓ Fold metrics plotted as line charts with fold number on x-axis")
     
     # ==================== TEST EVALUATION ====================
     logger.info("\n" + "=" * 80)
     logger.info("Evaluating on Test Set...")
     logger.info("=" * 80)
     
-    test_metrics = trainer.validate(test_loader)
-    test_mse = test_metrics["mse"]
-    denorm_status = " (denormalized to original scale)" if test_metrics.get("is_denormalized", False) else " (normalized scale)"
+    # Check if test_loader is available
+    if test_loader is None:
+        logger.warning("⚠ Test loader is None - skipping test evaluation (test dataset failed to load)")
+        test_metrics = None
+    else:
+        # CRITICAL: Update trainer's target_scaler to test set's scaler before evaluation
+        # The trainer currently has the last fold's scaler, which causes scale mismatch
+        if target_scaler is not None:
+            trainer.target_scaler = target_scaler
+            logger.info("✓ Updated trainer scaler to test set scaler")
+        else:
+            trainer.target_scaler = None
+            logger.info("⚠ No test set scaler available - will evaluate on normalized scale")
+        
+        test_metrics = trainer.validate(test_loader)
     
-    logger.info(
-        f"Test Results{denorm_status}:\n"
-        f"  MSE:  {test_metrics['mse']:.6f}\n"
-        f"  RMSE: {test_metrics['rmse']:.6f}\n"
-        f"  MAE:  {test_metrics['mae']:.6f}\n"
-        f"  R²:   {test_metrics['r2']:.6f}\n"
-        f"  Correlation: {test_metrics['correlation']:.6f}\n"
-        f"  Prediction Bias: {test_metrics['prediction_error_mean']:.6f}\n"
-        f"  Prediction Error Std: {test_metrics['prediction_error_std']:.6f}"
-    )
-    
-    # Log comprehensive test metrics to W&B
-    if wandb is not None and wandb.run is not None:
-        # Log core metrics first
-        test_log_dict = {
-            "test_mse": test_metrics["mse"],
-            "test_mae": test_metrics["mae"],
-            "test_rmse": test_metrics["rmse"],
-            "test_r2": test_metrics["r2"],
-            "test_correlation": test_metrics["correlation"],
-            "test_prediction_bias": test_metrics["prediction_error_mean"],
-            "test_prediction_error_std": test_metrics["prediction_error_std"],
-            "test_pred_min": test_metrics["pred_min"],
-            "test_pred_max": test_metrics["pred_max"],
-            "test_target_min": test_metrics["target_min"],
-            "test_target_max": test_metrics["target_max"],
-            "test_is_denormalized": test_metrics.get("is_denormalized", False),
-        }
+    # Only process test metrics if evaluation succeeded
+    if test_metrics is not None:
+        test_mse = test_metrics["mse"]
+        denorm_status = " (denormalized to original scale)" if test_metrics.get("is_denormalized", False) else " (normalized scale)"
         
-        wandb.log(test_log_dict, commit=False)
+        logger.info(
+            f"Test Results{denorm_status}:\n"
+            f"  MSE:  {test_metrics['mse']:.6f}\n"
+            f"  RMSE: {test_metrics['rmse']:.6f}\n"
+            f"  MAE:  {test_metrics['mae']:.6f}\n"
+            f"  R²:   {test_metrics['r2']:.6f}\n"
+            f"  Correlation: {test_metrics['correlation']:.6f}\n"
+            f"  Prediction Bias: {test_metrics['prediction_error_mean']:.6f}\n"
+            f"  Prediction Error Std: {test_metrics['prediction_error_std']:.6f}"
+        )
         
-        # Create prediction error scatter plot (ground truth vs predictions)
-        predictions = test_metrics["predictions"].numpy()
-        targets = test_metrics["targets"].numpy()
-        
-        # Create scatter plot for first 500 samples (memory efficiency)
-        plot_limit = min(500, len(predictions))
-        try:
-            wandb_plot = wandb.plot.scatter(
-                wandb.Table(data=[
-                    [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                ], columns=["Ground Truth", "Prediction"]),
-                "Ground Truth", "Prediction", title="[TEST] Predictions vs Ground Truth"
-            )
-            wandb.log({"test_predictions_scatter": wandb_plot}, commit=False)
-        except Exception as e:
-            logger.warning(f"Failed to log test scatter plot: {e}")
-        
-        # Create histogram of prediction errors
-        errors = predictions - targets
-        try:
-            wandb.log({"test_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
-        except Exception as e:
-            logger.warning(f"Failed to log test error histogram: {e}")
-        
-        # Log actual values as table for samples (first 100 samples for inspection)
-        sample_limit = min(100, len(predictions))
-        table_data = [
-            [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
-            for i in range(sample_limit)
-        ]
-        try:
-            wandb.log({
-                "test_predictions_table": wandb.Table(
-                    data=table_data,
-                    columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+        # Log comprehensive test metrics to W&B
+        if wandb is not None and wandb.run is not None:
+            # Log core metrics first
+            test_log_dict = {
+                "test_mse": test_metrics["mse"],
+                "test_mae": test_metrics["mae"],
+                "test_rmse": test_metrics["rmse"],
+                "test_r2": test_metrics["r2"],
+                "test_correlation": test_metrics["correlation"],
+                "test_prediction_bias": test_metrics["prediction_error_mean"],
+                "test_prediction_error_std": test_metrics["prediction_error_std"],
+                "test_pred_min": test_metrics["pred_min"],
+                "test_pred_max": test_metrics["pred_max"],
+                "test_target_min": test_metrics["target_min"],
+                "test_target_max": test_metrics["target_max"],
+                "test_is_denormalized": test_metrics.get("is_denormalized", False),
+            }
+            
+            wandb.log(test_log_dict, commit=False)
+            
+            # Create prediction error scatter plot (ground truth vs predictions)
+            predictions = test_metrics["predictions"].numpy()
+            targets = test_metrics["targets"].numpy()
+            
+            # Create scatter plot for first 500 samples (memory efficiency)
+            plot_limit = min(500, len(predictions))
+            try:
+                wandb_plot = wandb.plot.scatter(
+                    wandb.Table(data=[
+                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                    ], columns=["Ground Truth", "Prediction"]),
+                    "Ground Truth", "Prediction", title="[TEST] Predictions vs Ground Truth"
                 )
-            }, commit=True)  # Final commit after test evaluation
-        except Exception as e:
-            logger.warning(f"Failed to log test predictions table: {e}")
+                wandb.log({"test_predictions_scatter": wandb_plot}, commit=False)
+            except Exception as e:
+                logger.warning(f"Failed to log test scatter plot: {e}")
+            
+            # Create histogram of prediction errors
+            errors = predictions - targets
+            try:
+                wandb.log({"test_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
+            except Exception as e:
+                logger.warning(f"Failed to log test error histogram: {e}")
+            
+            # Log actual values as table for samples (first 100 samples for inspection)
+            sample_limit = min(100, len(predictions))
+            table_data = [
+                [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
+                for i in range(sample_limit)
+            ]
+            try:
+                wandb.log({
+                    "test_predictions_table": wandb.Table(
+                        data=table_data,
+                        columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+                    )
+                }, commit=True)  # Final commit after test evaluation
+            except Exception as e:
+                logger.warning(f"Failed to log test predictions table: {e}")
     
     # Final summary
     logger.info("\n" + "=" * 80)
     logger.info("Training Complete!")
     logger.info(f"Best Val Loss: {trainer.best_val_loss:.6f} (Epoch {trainer.best_epoch})")
-    logger.info(f"Test MSE: {test_metrics['mse']:.6f}")
-    logger.info(f"Test R²: {test_metrics['r2']:.6f}")
+    if test_metrics is not None:
+        logger.info(f"Test MSE: {test_metrics['mse']:.6f}")
+        logger.info(f"Test R²: {test_metrics['r2']:.6f}")
     logger.info(f"Best Model Checkpoint: {config.mlops.checkpoint_dir / f'{config.mlops.wandb_run_name}_best.pt'}")
     logger.info("=" * 80)
     
