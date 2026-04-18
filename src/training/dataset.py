@@ -749,13 +749,14 @@ def create_walk_forward_dataloaders(
     # Create timestamps (dummy - sequential indices for now)
     timestamps = torch.arange(total_samples, dtype=torch.float32)
     
-    # Calculate walk-forward splits
-    data_len = total_samples
-    window_size = int(0.7 * data_len)  # 70% initial train window
-    step_size = int(0.15 * data_len) // num_folds  # 15% validation spread across folds
+    # Calculate walk-forward splits on TRAIN + VAL data ONLY (exclude test)
+    # This ensures test data is completely isolated for final evaluation
+    data_len = metadata["val_end_idx"]  # ✓ Only train + validation, NOT test
+    window_size = int(0.7 * data_len)  # 70% of (train + val)
+    step_size = int(0.15 * data_len) // num_folds  # 15% of (train + val) spread across folds
     
-    logger.info(f"\nWalk-Forward Configuration:")
-    logger.info(f"  Total samples: {data_len}")
+    logger.info(f"\nWalk-Forward Configuration (excluding test data):")
+    logger.info(f"  Train + Val samples: {data_len} (test={total_samples - data_len} isolated)")
     logger.info(f"  Initial train window: {window_size} ({window_size/data_len*100:.1f}%)")
     logger.info(f"  Validation fold size: {step_size} ({step_size/data_len*100:.1f}%)")
     logger.info(f"  Number of folds: {num_folds}")
