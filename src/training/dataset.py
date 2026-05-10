@@ -753,26 +753,15 @@ def create_walk_forward_dataloaders(
     
     logger.info(f"✓ Scalers fitted on training data [0:{train_end_idx}]")
     
-    # ========== APPLY SCALERS TO FULL DATASET ==========
-    # Scaler was fitted on training portion only → no look-ahead leakage for later folds.
-    # We scale the full tensor once here (CPU, one-shot) rather than per-fold to avoid
-    # redundant copies and ensure WalkForwardDataset receives already-scaled tensors.
-    logger.info("Applying StandardScaler to full tabular data...")
-    tabular_data = torch.from_numpy(
-        tabular_scaler.transform(tabular_data.numpy())
-    ).float().contiguous()
-    logger.info(f"✓ Tabular data scaled: {tabular_data.shape}  "
-                f"range [{tabular_data.min():.3f}, {tabular_data.max():.3f}]")
-    
-    logger.info("Applying RobustScaler to full target scores...")
-    target_scores = torch.from_numpy(
-        target_scaler.transform(target_scores.numpy().reshape(-1, 1)).squeeze(axis=1)
-    ).float().contiguous()
-    logger.info(f"✓ Target scores scaled: {target_scores.shape}  "
-                f"range [{target_scores.min():.3f}, {target_scores.max():.3f}]")
+    # Keep raw tensors for per-fold scaling inside the fold loop.
+    # Each fold will fit its own scaler on its training slice only → zero look-ahead leakage.
+    # (The global scalers above were only for logging reference statistics.)
+    tabular_data_raw = tabular_data    # (N, 7)  raw float32
+    target_scores_raw = target_scores  # (N,)   raw float32
     
     # Create timestamps as long integers (sequential index, consistent with CryptoMultimodalDataset)
     timestamps = torch.arange(total_samples, dtype=torch.long)
+
     
     # Calculate walk-forward splits on TRAIN + VAL data ONLY (exclude test)
     # This ensures test data is completely isolated for final evaluation
@@ -799,13 +788,34 @@ def create_walk_forward_dataloaders(
         logger.info(f"  Train: [{train_slice.start}:{train_slice.stop}] ({train_slice.stop - train_slice.start} samples)")
         logger.info(f"  Val:   [{val_slice.start}:{val_slice.stop}] ({val_slice.stop - val_slice.start} samples)")
         
-        # Create datasets for this fold
+        # ========== PER-FOLD SCALER FITTING ==========
+        # Fit scalers ONLY on this fold's training slice → zero look-ahead leakage.
+        # Using a single global scaler (fitted on train_end_idx) would "leak" statistics
+        # from later folds' training data into earlier folds' scalers.
+        fold_tabular_scaler = StandardScaler()
+        fold_tabular_scaler.fit(tabular_data_raw[train_slice].numpy())
+        
+        fold_target_scaler = RobustScaler()
+        fold_target_scaler.fit(target_scores_raw[train_slice].numpy().reshape(-1, 1))
+        
+        logger.info(f"  Scalers fitted on fold training slice [{train_slice.start}:{train_slice.stop}]")
+        
+        # Apply per-fold scalers to train+val region (safe: test is excluded from data_len)
+        fold_end = val_slice.stop  # last index needed for this fold
+        tabular_fold_scaled = torch.from_numpy(
+            fold_tabular_scaler.transform(tabular_data_raw[:fold_end].numpy())
+        ).float().contiguous()
+        target_fold_scaled = torch.from_numpy(
+            fold_target_scaler.transform(target_scores_raw[:fold_end].numpy().reshape(-1, 1)).squeeze(axis=1)
+        ).float().contiguous()
+        
+        # Create datasets for this fold (use fold-scaled tensors)
         train_dataset = WalkForwardDataset(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
-            tabular_data=tabular_data,
-            target_scores=target_scores,
-            timestamps=timestamps,
+            tabular_data=tabular_fold_scaled,
+            target_scores=target_fold_scaled,
+            timestamps=timestamps[:fold_end],
             data_slice=train_slice,
             seq_len=config.data.seq_len,
         )
@@ -813,9 +823,9 @@ def create_walk_forward_dataloaders(
         val_dataset = WalkForwardDataset(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
-            tabular_data=tabular_data,
-            target_scores=target_scores,
-            timestamps=timestamps,
+            tabular_data=tabular_fold_scaled,
+            target_scores=target_fold_scaled,
+            timestamps=timestamps[:fold_end],
             data_slice=val_slice,
             seq_len=config.data.seq_len,
         )
@@ -848,11 +858,12 @@ def create_walk_forward_dataloaders(
         logger.info(f"  ✓ Val loader: {len(val_loader)} batches")
         
         scalers_dict = {
-            "tabular_scaler": tabular_scaler,
-            "target_scaler": target_scaler,
+            "tabular_scaler": fold_tabular_scaler,
+            "target_scaler": fold_target_scaler,
         }
         
         yield fold_num, train_loader, val_loader, scalers_dict
+
 
 
 if __name__ == "__main__":

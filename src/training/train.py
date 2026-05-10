@@ -56,6 +56,39 @@ from .utils import setup_logging, format_duration
 logger = logging.getLogger(__name__)
 
 
+def _reset_weights(module: nn.Module) -> None:
+    """
+    Reinitialize the weights of a module to their default distributions.
+    
+    Called via `model.apply(_reset_weights)` at the start of each walk-forward fold
+    to ensure each fold trains from a fresh initialization.
+    
+    WHY THIS MATTERS: Without per-fold reset, fold N's model starts from fold N-1's
+    trained weights. By the final fold the model has implicitly seen ALL prior folds'
+    train+val data, making validation R² optimistically biased relative to test R².
+    
+    Handles:
+    - nn.Linear: kaiming_uniform (matches PyTorch default)
+    - nn.LSTM: orthogonal for weight_hh, kaiming for weight_ih, zeros for bias
+    - nn.LayerNorm: ones for weight, zeros for bias
+    - nn.Parameter (fusion_token): normal(0, 0.02) matching model.py initialization
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LSTM):
+        for name, param in module.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.kaiming_uniform_(param, a=0, mode='fan_in', nonlinearity='leaky_relu')
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param)  # Orthogonal init for recurrent weights (stable gradients)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+    elif isinstance(module, nn.LayerNorm):
+        nn.init.ones_(module.weight)
+        nn.init.zeros_(module.bias)
+
 def check_for_nan(loss: torch.Tensor, batch_idx: int, predictions: torch.Tensor, targets: torch.Tensor) -> bool:
     """
     Check for NaN/Inf in loss and predictions before backward pass.
@@ -182,16 +215,25 @@ def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[s
 class EarlyStopping:
     """
     Early stopping callback to prevent overfitting.
-    Stops training if validation loss doesn't improve for N consecutive epochs.
+    Stops training if validation loss doesn't improve by at least min_delta
+    for N consecutive epochs.
+    
+    min_delta is critical for financial time-series: without it, a noise improvement
+    of 1e-6 resets the patience counter, causing the model to train far longer than
+    necessary and memorize validation-period patterns.
     """
     
-    def __init__(self, patience: int = 7, verbose: bool = True):
+    def __init__(self, patience: int = 7, min_delta: float = 1e-4, verbose: bool = True):
         """
         Args:
-            patience: Number of epochs with no improvement after which training will be stopped
-            verbose: Whether to log early stopping events
+            patience:  Number of epochs with no meaningful improvement before stopping
+            min_delta: Minimum absolute improvement in val loss to count as 'improved'.
+                       Prevents noise-level decreases from resetting the patience counter.
+                       Default 1e-4 = loss must drop by at least 0.01% of its magnitude.
+            verbose:   Whether to log early stopping events
         """
         self.patience = patience
+        self.min_delta = min_delta
         self.verbose = verbose
         self.counter = 0
         self.best_loss = None
@@ -211,27 +253,28 @@ class EarlyStopping:
             self.best_loss = val_loss
             return False
         
-        if val_loss < self.best_loss:
-            # Improvement detected
+        if val_loss < self.best_loss - self.min_delta:
+            # Meaningful improvement (exceeds min_delta threshold)
             self.best_loss = val_loss
             self.counter = 0
             if self.verbose:
-                logger.info(f"✓ Early Stopping: Validation loss improved to {val_loss:.6f}")
+                logger.info(f"✓ Early Stopping: Validation loss improved to {val_loss:.6f} (Δ > {self.min_delta})")
             return False
         else:
-            # No improvement
+            # No meaningful improvement
             self.counter += 1
             if self.verbose:
                 logger.info(
                     f"⚠ Early Stopping: No improvement for {self.counter}/{self.patience} epochs "
-                    f"(best: {self.best_loss:.6f}, current: {val_loss:.6f})"
+                    f"(best: {self.best_loss:.6f}, current: {val_loss:.6f}, "
+                    f"Δ={self.best_loss - val_loss:.2e} < min_delta={self.min_delta})"
                 )
             
             if self.counter >= self.patience:
                 if self.verbose:
                     logger.warning(
-                        f"🛑 Early Stopping triggered! No improvement for {self.patience} consecutive epochs. "
-                        f"Stopping training to prevent overfitting."
+                        f"🛑 Early Stopping triggered! No meaningful improvement for {self.patience} "
+                        f"consecutive epochs. Stopping to prevent overfitting."
                     )
                 self.early_stop = True
                 return True
@@ -902,13 +945,23 @@ def main(args):
         logger.info(f"FOLD {fold_num}")
         logger.info("=" * 80)
         
+        # Reset model weights for each fold.
+        # CRITICAL for generalization: without this, fold N's model is fine-tuned from
+        # fold N-1's weights — meaning by the final fold the model has implicitly seen
+        # ALL prior folds' training+val data, causing optimistic validation R² that
+        # doesn't transfer to the held-out test set.
+        # Fresh initialization per fold ensures each fold's val metric is honest.
+        model.apply(_reset_weights)
+        logger.info(f"✓ Model weights reset for Fold {fold_num}")
+        
         # Reset trainer for each fold
         trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
         trainer.setup_optimizer()
         
-        # Early stopping reset
+        # Early stopping reset (patience=5 for faster folds, min_delta=1e-4 prevents noise resets)
         early_stopping = EarlyStopping(
             patience=config.training.early_stopping_patience,
+            min_delta=1e-4,
             verbose=True
         )
         
