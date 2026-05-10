@@ -245,11 +245,10 @@ class MultimodalFusionNet(nn.Module):
     - Entirely trainable fusion mechanism
     - No fixed pooling operation
     
-    Mixed precision training (AMP):
-    - float16 activations + float32 weights
-    - GradScaler for automatic loss scaling
+    Pure float32 training (no AMP, no GradScaler):
+    - All activations and weights stay in float32
     - Gradient clipping (L2 norm <= 1.0)
-    - 16GB VRAM sufficient with batch_size=128, seq_len=24
+    - VRAM: 16GB sufficient with batch_size=8, seq_len=24
     """
     
     def __init__(self, config):
@@ -263,8 +262,10 @@ class MultimodalFusionNet(nn.Module):
         # 0. Learnable [FUSION] token (detector token for cross-modal fusion)
         # Shape: (1, 1, hidden_dim) -> expands to (batch, seq_len, hidden_dim) in forward
         self.fusion_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-        nn.init.xavier_uniform_(self.fusion_token)
-        logger.info("✓ [FUSION] token initialized (learnable 256D parameter)")
+        # Initialize like BERT's [CLS] token: small normal distribution.
+        # xavier_uniform_ is designed for weight matrices (fan_in/fan_out), not embedding vectors.
+        nn.init.normal_(self.fusion_token, mean=0.0, std=0.02)
+        logger.info("✓ [FUSION] token initialized (learnable 256D parameter, std=0.02)")
         
         # 1. Tabular encoder (only trainable component with backbones)
         self.tabular_encoder = TabularEncoder(
@@ -364,9 +365,11 @@ class MultimodalFusionNet(nn.Module):
         temporal_output = self.temporal_lstm(bottleneck_features)
         
         # ==================== PREDICTION HEAD ====================
-        # Simplified MLP head: (batch, 64) -> (batch, 1) -> squeeze to (batch,)
+        # Simplified MLP head: (batch, 64) -> (batch, 1) -> reshape to (batch,)
+        # Use view(-1) instead of squeeze(dim=1) to safely handle batch_size=1:
+        # squeeze(dim=1) on shape (1,1) collapses to scalar (), breaking metric computation.
         predictions = self.prediction_head(temporal_output)  # (batch, 1)
-        predictions = predictions.squeeze(dim=1)  # (batch,) - match target shape
+        predictions = predictions.view(-1)  # (batch,) - safe for all batch sizes
         
         return predictions
     
@@ -378,8 +381,10 @@ class MultimodalFusionNet(nn.Module):
 if __name__ == "__main__":
     """Test model initialization and forward pass."""
     import sys
-    
-    from config import ExperimentConfig
+    import os
+    # Allow running this file directly by adding the package root to sys.path
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from training.config import ExperimentConfig
     
     print("=" * 80)
     print("Testing MultimodalFusionNet (Offline Features)")

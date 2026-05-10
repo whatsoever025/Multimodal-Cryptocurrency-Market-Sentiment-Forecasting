@@ -23,7 +23,8 @@ Stability Improvements (2025-04-17):
 
 import torch
 
-torch.autograd.set_detect_anomaly(True) # Công cụ truy tìm nguồn gốc NaN
+# NOTE: set_detect_anomaly is enabled only in debug mode (gated in main()).
+# Leaving it on globally slows training by 2-5x due to per-op NaN checking.
 
 import torch.nn as nn
 import torch.optim as optim
@@ -89,13 +90,15 @@ def check_gradients(model: nn.Module, batch_idx: int) -> bool:
     has_issues = False
     for name, param in model.named_parameters():
         if param.grad is not None:
+            # Use separate `if` (not `elif`) so Inf is independently checked
+            # even when NaN is also present in the same gradient tensor.
             if torch.isnan(param.grad).any():
                 logger.error(f"✗ Batch {batch_idx}: Gradient NaN in {name}")
                 has_issues = True
-            elif torch.isinf(param.grad).any():
+            if torch.isinf(param.grad).any():
                 logger.error(f"✗ Batch {batch_idx}: Gradient Inf in {name}")
                 has_issues = True
-            elif (torch.abs(param.grad) > 1e4).any():
+            if not has_issues and (torch.abs(param.grad) > 1e4).any():
                 logger.warning(f"⚠ Batch {batch_idx}: Extreme gradients in {name} (max: {param.grad.abs().max():.2e})")
     
     return has_issues
@@ -110,8 +113,14 @@ def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[s
         targets: Ground truth targets (torch.Tensor)
     
     Returns:
-        Dict with keys: 'mse', 'mae', 'rmse', 'r2', 'correlation',
-                       'prediction_error_mean', 'prediction_error_std',
+        Dict with keys: 'mse', 'mae', 'rmse',
+                       'r2'     - Standard R² (benchmarks against test-set mean ȳ)
+                       'r2_oos' - OOS R² from Gu, Kelly & Xiu (2020) "Empirical Asset
+                                  Pricing via Machine Learning", Rev. of Financial Studies.
+                                  Formula: 1 - SS_res / sum(y²)
+                                  Benchmarks against zero-predictor (ŷ=0), not test-set mean.
+                                  More conservative and correct for OOS financial forecasting.
+                       'correlation', 'prediction_error_mean', 'prediction_error_std',
                        'pred_min', 'pred_max', 'target_min', 'target_max'
     """
     # MSE, MAE, RMSE
@@ -119,10 +128,23 @@ def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[s
     mae = torch.mean(torch.abs(predictions - targets)).item()
     rmse = np.sqrt(mse)
     
-    # R² Score
+    # Residual sum of squares (shared by both R² variants)
     ss_res = torch.sum((predictions - targets) ** 2).item()
+
+    # --- Standard R² ---
+    # Denominator: sum((y - ȳ)²) — benchmarks against predicting the test-set mean.
+    # Appropriate for in-sample evaluation or when test-set mean is a known baseline.
     ss_tot = torch.sum((targets - targets.mean()) ** 2).item()
     r2_score = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # --- OOS R² (Gu, Kelly & Xiu, 2020) ---
+    # Denominator: sum(y²) — benchmarks against the zero-predictor (ŷ_i = 0).
+    # The correct OOS benchmark for financial return/sentiment forecasting:
+    #   - Does NOT use the test-set mean (unknown at forecast time in a real deployment)
+    #   - Always more conservative: R²_OOS ≤ R²_standard, with equality only when ȳ = 0
+    #   - Relationship: sum(y²) = sum((y-ȳ)²) + n*ȳ²  →  larger denom → lower R²
+    ss_tot_oos = torch.sum(targets ** 2).item()
+    r2_oos = 1.0 - (ss_res / ss_tot_oos) if ss_tot_oos > 0 else 0.0
     
     # Correlation
     pred_mean = predictions.mean()
@@ -147,6 +169,7 @@ def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[s
         "mae": mae,
         "rmse": rmse,
         "r2": r2_score,
+        "r2_oos": r2_oos,
         "correlation": correlation,
         "prediction_error_mean": prediction_error_mean,
         "prediction_error_std": prediction_error_std,
@@ -272,7 +295,7 @@ class Trainer:
         - Pure float32 advantages:
           - No gradient scaling complexity (no underflow/overflow)
           - Direct gradient magnitudes (easier debugging)
-          - Sufficient VRAM on Kaggle 16GB (BS=8, seq_len=24)
+          - Sufficient VRAM on Kaggle 16GB (BS=128, MULTI asset, offline features)
           - Gradient clipping handles LSTM/Attention instability
         """
         # AdamW optimizer with conservative defaults for multimodal training
@@ -335,13 +358,16 @@ class Trainer:
         - Eliminates float16 underflow/overflow in backward pass
         - Eliminates GradScaler scaling complexity
         - Direct gradient magnitudes → easier debugging
-        - Kaggle 16GB VRAM sufficient for BS=8, seq_len=24
+        - Kaggle 16GB VRAM sufficient for BS=128 with offline features
         
         ============================================================================
         
         VRAM Management:
-        - Batch size 8 (seq_len 24 = 192 effective samples)
-        - Gradient accumulation: accumulate_steps=2 → effective batch=16
+        - Batch size 128 (MULTI asset: BTC+ETH combined, seq_len=24)
+        - Frozen backbones + offline feature extraction → backbones NOT in VRAM
+        - Only trainable components in VRAM: TabularEncoder, CrossModalAttn,
+          Bottleneck, TemporalLSTM, PredictionHead (~few MB)
+        - Gradient accumulation: accumulate_steps=2 → effective batch=256
         - Precision: Native float32 (no mixed precision)
         - Gradient clipping: max_norm=1.0 (prevents explosion in LSTM/Attention)
         
@@ -504,6 +530,19 @@ class Trainer:
         
         pbar.close()
         
+        # Guard against all-skipped epoch (every batch had NaN/Inf)
+        if num_steps == 0 or len(all_predictions) == 0:
+            logger.error(f"Epoch {self.epoch+1}: ALL batches were skipped (NaN/Inf). Returning zero metrics.")
+            return {
+                "loss": float("nan"), "mse": float("nan"), "mae": float("nan"),
+                "rmse": float("nan"), "r2": float("nan"), "r2_oos": float("nan"),
+                "correlation": float("nan"), "prediction_error_mean": float("nan"),
+                "prediction_error_std": float("nan"), "pred_min": float("nan"),
+                "pred_max": float("nan"), "target_min": float("nan"),
+                "target_max": float("nan"), "predictions": torch.tensor([]),
+                "targets": torch.tensor([]),
+            }
+        
         avg_loss = total_loss / num_steps
         self.train_losses.append(avg_loss)
         
@@ -519,7 +558,8 @@ class Trainer:
         
         logger.info(
             f"Epoch {self.epoch+1} completed | Avg Loss: {avg_loss:.6f} | MSE: {metrics['mse']:.6f} | "
-            f"MAE: {metrics['mae']:.6f} | RMSE: {metrics['rmse']:.6f} | R²: {metrics['r2']:.6f}"
+            f"MAE: {metrics['mae']:.6f} | RMSE: {metrics['rmse']:.6f} | "
+            f"R²: {metrics['r2']:.6f} | R²_OOS: {metrics['r2_oos']:.6f}"
         )
         
         return metrics
@@ -545,7 +585,7 @@ class Trainer:
                           'predictions', 'targets', 'is_denormalized'
         """
         self.model.eval()
-        total_mse = 0.0
+        total_huber = 0.0  # Accumulates HuberLoss (NOT MSE) — used for val_losses tracking
         total_mae = 0.0
         num_steps = 0
         
@@ -562,12 +602,14 @@ class Trainer:
                 predictions = self.model(batch)  # (batch,)
                 targets = batch["target"]  # (batch,)
                 
-                # Compute metrics (on normalized scale for loss)
-                # Use HuberLoss for consistency with training (robust to outliers)
+                # Compute metrics on normalized scale for loss tracking.
+                # Use HuberLoss for consistency with training (robust to outliers).
+                # NOTE: This is HuberLoss, not MSE — kept on normalized scale intentionally
+                # so val_losses is comparable across folds regardless of target_scaler.
                 huber_loss = nn.HuberLoss(delta=1.0)(predictions, targets)
                 mae = nn.L1Loss()(predictions, targets)
                 
-                total_mse += huber_loss.item()
+                total_huber += huber_loss.item()
                 total_mae += mae.item()
                 num_steps += 1
                 
@@ -579,31 +621,38 @@ class Trainer:
         all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
         all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
         
+        # Per-batch averages on normalized scale — used for consistent early stopping / val_losses
+        # These are HuberLoss-based, not MSE, and always on normalized scale.
+        avg_huber = total_huber / num_steps
+        avg_mae_normalized = total_mae / num_steps
+        self.val_losses.append(avg_huber)  # val_losses always tracks normalized HuberLoss
+        
         # Apply inverse transform if scaler is available
         is_denormalized = False
         if self.target_scaler is not None:
             logger.debug("Applying inverse transform to predictions and targets...")
-            # RobustScaler inverse_transform expects (n_samples, 1) shape
+            # RobustScaler inverse_transform expects (n_samples, 1) shape.
+            # Use squeeze(axis=1) instead of squeeze() to safely handle single-sample batches
+            # (squeeze() would collapse (1,) → scalar which breaks downstream tensor ops).
             all_predictions_denorm = self.target_scaler.inverse_transform(
                 all_predictions.numpy().reshape(-1, 1)
-            ).squeeze()
+            ).squeeze(axis=1)
             all_targets_denorm = self.target_scaler.inverse_transform(
                 all_targets.numpy().reshape(-1, 1)
-            ).squeeze()
+            ).squeeze(axis=1)
             
             all_predictions = torch.from_numpy(all_predictions_denorm).float()
             all_targets = torch.from_numpy(all_targets_denorm).float()
             is_denormalized = True
             logger.debug("✓ Inverse transform applied (metrics computed on original scale)")
         
-        # Compute per-batch averages (on normalized scale for loss tracking)
-        avg_mse = total_mse / num_steps
-        avg_mae = total_mae / num_steps
-        self.val_losses.append(avg_mse)
-        
-        # Compute metrics using shared helper (this recomputes MSE/RMSE on current scale)
+        # Compute all metrics via shared helper.
+        # When is_denormalized=True, mse/mae/rmse/r2 are in original (denormalized) scale.
+        # When is_denormalized=False, they are in normalized scale.
+        # 'normalized_huber' is always in normalized scale and is what drives early stopping.
         metrics = _compute_metrics(all_predictions, all_targets)
-        # Don't override metrics["mse"] or metrics["mae"] - use values computed on correct scale
+        metrics["normalized_huber"] = avg_huber       # Always normalized — use for early stopping
+        metrics["normalized_mae"] = avg_mae_normalized  # Always normalized
         metrics["is_denormalized"] = is_denormalized
         metrics["predictions"] = all_predictions
         metrics["targets"] = all_targets
@@ -714,6 +763,14 @@ def main(args):
     
     device = "cuda" if torch.cuda.is_available() and not debug else "cpu"
     logger.info(f"Device: {device}")
+    
+    # Enable anomaly detection only in debug mode.
+    # Leaving it on in production slows training by 2-5x.
+    if debug:
+        torch.autograd.set_detect_anomaly(True)
+        logger.info("⚠ Anomaly detection ENABLED (debug mode — expect slower training)")
+    else:
+        torch.autograd.set_detect_anomaly(False)
     
     # Load or create config
     if config_path:
@@ -855,8 +912,11 @@ def main(args):
             verbose=True
         )
         
-        # Train for this fold
-        for epoch in range(config.training.max_epochs):
+        # Train for this fold.
+        # On resume, start_epoch > 0 for the FIRST fold only (subsequent folds always start at 0).
+        fold_start = start_epoch if fold_num == 1 else 0
+        start_epoch = 0  # Only apply resume offset to the first fold
+        for epoch in range(fold_start, config.training.max_epochs):
             trainer.epoch = epoch
             
             # Train epoch
@@ -872,31 +932,38 @@ def main(args):
             # Validate
             if (epoch + 1) % config.mlops.eval_frequency == 0:
                 val_metrics = trainer.validate(val_loader)
-                val_loss = val_metrics["mse"]
+                # Use normalized_huber for early stopping & best-model comparison:
+                # always on normalized scale regardless of whether target_scaler is set,
+                # ensuring consistent comparisons across folds.
+                val_loss = val_metrics["normalized_huber"]
                 
                 logger.info(
                     f"Fold {fold_num} Epoch {epoch+1:3d} | "
-                    f"Val Loss {val_loss:.6f} | "
+                    f"Val HuberLoss (normalized) {val_loss:.6f} | "
                     f"Val MSE {val_metrics['mse']:.6f} | "
                     f"Val R² {val_metrics['r2']:.6f}"
                 )
                 
-                # Early stopping check
+                # Early stopping check (based on normalized HuberLoss)
                 if early_stopping(val_loss):
                     logger.info(f"✓ Early stopping triggered at epoch {epoch+1}")
                     break
                 
-                # Update best model for this fold
+                # Update best model for this fold (based on normalized HuberLoss)
                 if val_loss < trainer.best_val_loss:
                     trainer.best_val_loss = val_loss
                     trainer.best_epoch = epoch
         
-        # Validate on full validation set for this fold
+        # Validate on full validation set for this fold.
+        # Use a fresh validate call, but mark it so val_losses doesn't get a duplicate append.
+        # (val_losses was already appended during the per-epoch training loop above.)
         logger.info(f"\nFinal validation for Fold {fold_num}...")
         final_val_metrics = trainer.validate(val_loader)
+        trainer.val_losses.pop()  # Remove the extra append from this summary-only validate() call
         
         fold_results[fold_num] = {
             "val_r2": final_val_metrics["r2"],
+            "val_r2_oos": final_val_metrics["r2_oos"],
             "val_mse": final_val_metrics["mse"],
             "val_rmse": final_val_metrics["rmse"],
             "val_mae": final_val_metrics["mae"],
@@ -917,6 +984,7 @@ def main(args):
         if wandb is not None and wandb.run is not None:
             fold_log_dict = {
                 "val_r2": final_val_metrics["r2"],
+                "val_r2_oos": final_val_metrics["r2_oos"],
                 "val_rmse": final_val_metrics["rmse"],
                 "val_mae": final_val_metrics["mae"],
                 "val_correlation": final_val_metrics["correlation"],
@@ -931,30 +999,40 @@ def main(args):
     
     # Collect metrics across folds
     fold_numbers = sorted(fold_results.keys())
-    r2_scores = [fold_results[i]["val_r2"] for i in fold_numbers]
-    rmse_scores = [fold_results[i]["val_rmse"] for i in fold_numbers]
-    mae_scores = [fold_results[i]["val_mae"] for i in fold_numbers]
-    corr_scores = [fold_results[i]["val_correlation"] for i in fold_numbers]
+    r2_scores     = [fold_results[i]["val_r2"]      for i in fold_numbers]
+    r2_oos_scores = [fold_results[i]["val_r2_oos"]  for i in fold_numbers]
+    rmse_scores   = [fold_results[i]["val_rmse"]    for i in fold_numbers]
+    mae_scores    = [fold_results[i]["val_mae"]     for i in fold_numbers]
+    corr_scores   = [fold_results[i]["val_correlation"] for i in fold_numbers]
     
-    logger.info(f"Mean R²: {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
-    logger.info(f"Mean RMSE: {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
-    logger.info(f"Mean MAE: {np.mean(mae_scores):.6f} ± {np.std(mae_scores):.6f}")
+    logger.info(f"Mean R²:          {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
+    logger.info(f"Mean R²_OOS:      {np.mean(r2_oos_scores):.6f} ± {np.std(r2_oos_scores):.6f}")
+    logger.info(f"Mean RMSE:        {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
+    logger.info(f"Mean MAE:         {np.mean(mae_scores):.6f} ± {np.std(mae_scores):.6f}")
     logger.info(f"Mean Correlation: {np.mean(corr_scores):.6f} ± {np.std(corr_scores):.6f}")
     
     for fold_num in fold_numbers:
-        logger.info(f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}, RMSE={fold_results[fold_num]['val_rmse']:.6f}, MAE={fold_results[fold_num]['val_mae']:.6f}, Corr={fold_results[fold_num]['val_correlation']:.6f}")
+        logger.info(
+            f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}, "
+            f"R²_OOS={fold_results[fold_num]['val_r2_oos']:.6f}, "
+            f"RMSE={fold_results[fold_num]['val_rmse']:.6f}, "
+            f"MAE={fold_results[fold_num]['val_mae']:.6f}, "
+            f"Corr={fold_results[fold_num]['val_correlation']:.6f}"
+        )
     
     # Log fold summary statistics to W&B
     if wandb is not None and wandb.run is not None:
         summary_log = {
-            "fold_summary/mean_r2": np.mean(r2_scores),
-            "fold_summary/std_r2": np.std(r2_scores),
-            "fold_summary/mean_rmse": np.mean(rmse_scores),
-            "fold_summary/std_rmse": np.std(rmse_scores),
-            "fold_summary/mean_mae": np.mean(mae_scores),
-            "fold_summary/std_mae": np.std(mae_scores),
+            "fold_summary/mean_r2":          np.mean(r2_scores),
+            "fold_summary/std_r2":           np.std(r2_scores),
+            "fold_summary/mean_r2_oos":      np.mean(r2_oos_scores),
+            "fold_summary/std_r2_oos":       np.std(r2_oos_scores),
+            "fold_summary/mean_rmse":        np.mean(rmse_scores),
+            "fold_summary/std_rmse":         np.std(rmse_scores),
+            "fold_summary/mean_mae":         np.mean(mae_scores),
+            "fold_summary/std_mae":          np.std(mae_scores),
             "fold_summary/mean_correlation": np.mean(corr_scores),
-            "fold_summary/std_correlation": np.std(corr_scores),
+            "fold_summary/std_correlation":  np.std(corr_scores),
         }
         wandb.log(summary_log)
         logger.info("✓ Logged fold summary statistics to W&B")
@@ -983,15 +1061,15 @@ def main(args):
     
     # Only process test metrics if evaluation succeeded
     if test_metrics is not None:
-        test_mse = test_metrics["mse"]
         denorm_status = " (denormalized to original scale)" if test_metrics.get("is_denormalized", False) else " (normalized scale)"
         
         logger.info(
             f"Test Results{denorm_status}:\n"
-            f"  MSE:  {test_metrics['mse']:.6f}\n"
-            f"  RMSE: {test_metrics['rmse']:.6f}\n"
-            f"  MAE:  {test_metrics['mae']:.6f}\n"
-            f"  R²:   {test_metrics['r2']:.6f}\n"
+            f"  MSE:    {test_metrics['mse']:.6f}\n"
+            f"  RMSE:   {test_metrics['rmse']:.6f}\n"
+            f"  MAE:    {test_metrics['mae']:.6f}\n"
+            f"  R²:     {test_metrics['r2']:.6f}\n"
+            f"  R²_OOS: {test_metrics['r2_oos']:.6f}  (Gu, Kelly & Xiu 2020)\n"
             f"  Correlation: {test_metrics['correlation']:.6f}\n"
             f"  Prediction Bias: {test_metrics['prediction_error_mean']:.6f}\n"
             f"  Prediction Error Std: {test_metrics['prediction_error_std']:.6f}"
@@ -1005,6 +1083,7 @@ def main(args):
                 "test_mae": test_metrics["mae"],
                 "test_rmse": test_metrics["rmse"],
                 "test_r2": test_metrics["r2"],
+                "test_r2_oos": test_metrics["r2_oos"],
                 "test_correlation": test_metrics["correlation"],
                 "test_prediction_bias": test_metrics["prediction_error_mean"],
                 "test_prediction_error_std": test_metrics["prediction_error_std"],
@@ -1062,8 +1141,9 @@ def main(args):
     logger.info("Training Complete!")
     logger.info(f"Best Val Loss: {trainer.best_val_loss:.6f} (Epoch {trainer.best_epoch})")
     if test_metrics is not None:
-        logger.info(f"Test MSE: {test_metrics['mse']:.6f}")
-        logger.info(f"Test R²: {test_metrics['r2']:.6f}")
+        logger.info(f"Test MSE:    {test_metrics['mse']:.6f}")
+        logger.info(f"Test R²:     {test_metrics['r2']:.6f}")
+        logger.info(f"Test R²_OOS: {test_metrics['r2_oos']:.6f}")
     logger.info(f"Best Model Checkpoint: {config.mlops.checkpoint_dir / f'{config.mlops.wandb_run_name}_best.pt'}")
     logger.info("=" * 80)
     

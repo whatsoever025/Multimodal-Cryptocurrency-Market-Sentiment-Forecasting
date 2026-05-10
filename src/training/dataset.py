@@ -734,20 +734,45 @@ def create_walk_forward_dataloaders(
     train_end_idx = metadata["train_end_idx"]
     logger.info(f"\nFitting scalers on training data [0:{train_end_idx}]...")
     
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import StandardScaler, RobustScaler
     
-    # Fit tabular scaler on training data only
+    # Fit tabular scaler on training data only (StandardScaler: zero-mean, unit-variance)
     tabular_scaler = StandardScaler()
     tabular_scaler.fit(tabular_data[:train_end_idx].numpy())
+    logger.info(f"  Tabular scaler mean:  {tabular_scaler.mean_}")
+    logger.info(f"  Tabular scaler scale: {tabular_scaler.scale_}")
     
-    # Fit target scaler on training data only
-    target_scaler = StandardScaler()
+    # Fit target scaler on training data only.
+    # RobustScaler: uses median + IQR → robust to outliers in financial return distributions.
+    # CRITICAL: train.py's validate() calls target_scaler.inverse_transform() to report
+    # metrics in the original scale. Must be the same scaler type used here.
+    target_scaler = RobustScaler()
     target_scaler.fit(target_scores[:train_end_idx].numpy().reshape(-1, 1))
+    logger.info(f"  Target scaler center (median): {target_scaler.center_}")
+    logger.info(f"  Target scaler scale (IQR):     {target_scaler.scale_}")
     
-    logger.info(f"✓ Scalers fitted on training data")
+    logger.info(f"✓ Scalers fitted on training data [0:{train_end_idx}]")
     
-    # Create timestamps (dummy - sequential indices for now)
-    timestamps = torch.arange(total_samples, dtype=torch.float32)
+    # ========== APPLY SCALERS TO FULL DATASET ==========
+    # Scaler was fitted on training portion only → no look-ahead leakage for later folds.
+    # We scale the full tensor once here (CPU, one-shot) rather than per-fold to avoid
+    # redundant copies and ensure WalkForwardDataset receives already-scaled tensors.
+    logger.info("Applying StandardScaler to full tabular data...")
+    tabular_data = torch.from_numpy(
+        tabular_scaler.transform(tabular_data.numpy())
+    ).float().contiguous()
+    logger.info(f"✓ Tabular data scaled: {tabular_data.shape}  "
+                f"range [{tabular_data.min():.3f}, {tabular_data.max():.3f}]")
+    
+    logger.info("Applying RobustScaler to full target scores...")
+    target_scores = torch.from_numpy(
+        target_scaler.transform(target_scores.numpy().reshape(-1, 1)).squeeze(axis=1)
+    ).float().contiguous()
+    logger.info(f"✓ Target scores scaled: {target_scores.shape}  "
+                f"range [{target_scores.min():.3f}, {target_scores.max():.3f}]")
+    
+    # Create timestamps as long integers (sequential index, consistent with CryptoMultimodalDataset)
+    timestamps = torch.arange(total_samples, dtype=torch.long)
     
     # Calculate walk-forward splits on TRAIN + VAL data ONLY (exclude test)
     # This ensures test data is completely isolated for final evaluation
