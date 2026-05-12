@@ -20,6 +20,11 @@ class DataConfig:
     asset: str = "MULTI"  # "MULTI" for BTC+ETH combined, or single "BTC"/"ETH"
     seq_len: int = 24  # Sliding window length in hours
     batch_size: int = 128  # Per-GPU batch size
+    rolling_norm_window: int = 168  # Rolling z-score window for tabular features (hours).
+    # 168h = 7 days — normalizes each feature relative to the past 7 days of history.
+    # This makes tabular features regime-agnostic: the model sees "how extreme is this value
+    # relative to recent history" rather than absolute values anchored to training-period stats.
+    # Strictly causal: position t uses only [t-W, t-1], zero look-ahead.
 
     def __post_init__(self):
         """Validate data config."""
@@ -29,6 +34,9 @@ class DataConfig:
             raise ValueError(f"seq_len must be > 0, got {self.seq_len}")
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
+        if self.rolling_norm_window <= 0:
+            raise ValueError(f"rolling_norm_window must be > 0, got {self.rolling_norm_window}")
+
 
 
 @dataclass

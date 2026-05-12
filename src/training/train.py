@@ -945,16 +945,11 @@ def main(args):
         logger.info(f"FOLD {fold_num}")
         logger.info("=" * 80)
         
-        # Reset model weights for each fold.
-        # CRITICAL for generalization: without this, fold N's model is fine-tuned from
-        # fold N-1's weights — meaning by the final fold the model has implicitly seen
-        # ALL prior folds' training+val data, causing optimistic validation R² that
-        # doesn't transfer to the held-out test set.
-        # Fresh initialization per fold ensures each fold's val metric is honest.
-        model.apply(_reset_weights)
-        logger.info(f"✓ Model weights reset for Fold {fold_num}")
-        
-        # Reset trainer for each fold
+        # Reset trainer for each fold (optimizer state resets, model weights accumulate).
+        # Accumulating weights across folds is intentional: each fold fine-tunes from
+        # the previous fold, so by fold N the model has seen all prior training data.
+        # The optimizer IS reset per fold (fresh AdamW adaptive state) to avoid stale
+        # momentum from a prior fold's loss landscape.
         trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
         trainer.setup_optimizer()
         

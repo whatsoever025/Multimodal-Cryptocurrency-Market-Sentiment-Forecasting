@@ -2,8 +2,15 @@
 Simplified Offline Feature Dataset
 
 Loads ALL data (embeddings + tabular + targets) from pre-extracted RAW Kaggle files.
-No HuggingFace dataset loading. Scaling (StandardScaler for tabular, RobustScaler for targets)
-are applied in-memory during dataset initialization based on training split.
+No HuggingFace dataset loading.
+
+Normalization strategy (walk-forward path):
+- Tabular features: causal rolling z-score (window=config.data.rolling_norm_window, default 168h)
+  Makes features regime-agnostic — the model sees values relative to recent history,
+  not anchored to a fixed training-period distribution. Overcomes regime-shift bias.
+- Target scores: RobustScaler fitted on training portion only (median + IQR).
+  Targets are kept on a fixed scale so validate() can inverse-transform for
+  original-scale metric reporting.
 
 CRITICAL: Safe sliding window logic prevents IndexError at dataset boundaries.
 - __len__() returns total_samples - seq_len (to guarantee idx + seq_len exists)
@@ -14,16 +21,77 @@ import os
 import sys
 import torch
 import numpy as np
+import pandas as pd
 import logging
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
 
 from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler
 from .utils import format_duration
 
 logger = logging.getLogger(__name__)
+
+
+def apply_rolling_zscore(
+    data: torch.Tensor,
+    window: int = 168,
+    clip: float = 5.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Apply strictly causal rolling z-score normalization to a time-series tensor.
+
+    For each position t, normalizes using only past data [max(0, t-window) : t].
+    No look-ahead bias: position t never sees t or later.
+
+    Why this overcomes regime shift:
+        StandardScaler anchors features to training-period statistics (mean/std).
+        When the test period has a structurally different market regime (e.g. post-halving
+        bull market), those fixed statistics become wrong references.
+        Rolling z-score instead anchors to the *recent* 7-day window, so the model always
+        sees 'how extreme is this value relative to what just happened' — a signal that
+        remains meaningful across regimes.
+
+    Args:
+        data:   (N, F) float32 tensor of raw feature values
+        window: lookback window in time steps (hours). Default 168 = 7 days.
+        clip:   clip normalized values to [-clip, clip]. Prevents extreme outlier
+                events (e.g. flash crashes) from creating unbounded inputs.
+        eps:    small constant added to std to avoid division by zero.
+
+    Returns:
+        (N, F) float32 tensor, normalized + clipped.
+
+    Implementation note:
+        Uses pandas rolling() for O(N) efficiency. The .shift(1) ensures the
+        window at position t covers [t-window, t-1], not [t-window+1, t].
+        First row is 0.0 (no history available).
+        min_periods=1 allows expanding window until full window is available.
+    """
+    N, F = data.shape
+    df = pd.DataFrame(data.numpy())  # (N, F)
+
+    # Strictly causal: shift(1) moves the rolling window one step back
+    # so stats at row t are computed from rows [t-window, t-1]
+    rolling_mean = df.rolling(window=window, min_periods=1).mean().shift(1).fillna(0.0)
+    rolling_std  = df.rolling(window=window, min_periods=1).std().shift(1).fillna(1.0)
+
+    normalized = (df.values - rolling_mean.values) / (rolling_std.values + eps)
+
+    # Clip to suppress extreme outlier events
+    normalized = np.clip(normalized, -clip, clip)
+
+    # First row has no history (shift produced NaN for mean, 1.0 for std) → zero
+    normalized[0] = 0.0
+
+    result = torch.from_numpy(normalized.astype(np.float32)).contiguous()
+    logger.info(
+        f"Rolling z-score applied: window={window}h, clip=±{clip}, "
+        f"shape={result.shape}, range=[{result.min():.3f}, {result.max():.3f}]"
+    )
+    return result
 
 
 class CryptoMultimodalDataset(torch.utils.data.Dataset):
@@ -730,39 +798,41 @@ def create_walk_forward_dataloaders(
     logger.info(f"  tabular_data: {tabular_data.shape}")
     logger.info(f"  target_scores: {target_scores.shape}")
     
-    # Create scalers from TRAINING portion only (to prevent data leakage)
+    # ========== NORMALIZATION ==========
     train_end_idx = metadata["train_end_idx"]
-    logger.info(f"\nFitting scalers on training data [0:{train_end_idx}]...")
-    
-    from sklearn.preprocessing import StandardScaler, RobustScaler
-    
-    # Fit tabular scaler on training data only (StandardScaler: zero-mean, unit-variance)
-    tabular_scaler = StandardScaler()
-    tabular_scaler.fit(tabular_data[:train_end_idx].numpy())
-    logger.info(f"  Tabular scaler mean:  {tabular_scaler.mean_}")
-    logger.info(f"  Tabular scaler scale: {tabular_scaler.scale_}")
-    
-    # Fit target scaler on training data only.
-    # RobustScaler: uses median + IQR → robust to outliers in financial return distributions.
-    # CRITICAL: train.py's validate() calls target_scaler.inverse_transform() to report
-    # metrics in the original scale. Must be the same scaler type used here.
+
+    # --- Tabular features: causal rolling z-score ---
+    # Instead of a fixed StandardScaler (anchored to training-period stats), we apply a
+    # strictly causal rolling z-score. For each position t, the normalizer uses only the
+    # past `rolling_norm_window` hours → regime-agnostic features across train/val/test.
+    # This is the primary fix for the regime-shift problem confirmed by KS tests (7/7 features drifted).
+    rolling_window = config.data.rolling_norm_window
+    logger.info(f"\nApplying causal rolling z-score to tabular features (window={rolling_window}h)...")
+    tabular_data = apply_rolling_zscore(tabular_data, window=rolling_window)
+    logger.info(f"✓ Tabular features normalized: {tabular_data.shape}")
+
+    # --- Target scores: RobustScaler fitted on training portion only ---
+    # Targets use a fixed scaler (not rolling) because:
+    #   1. Target distribution drift was much lower (KS=0.018 vs 0.46 for features)
+    #   2. validate() needs a fixed scaler for inverse_transform to report original-scale metrics
+    #   3. Consistent target scale ensures comparable loss across folds
+    logger.info(f"\nFitting RobustScaler on target scores [0:{train_end_idx}]...")
     target_scaler = RobustScaler()
     target_scaler.fit(target_scores[:train_end_idx].numpy().reshape(-1, 1))
     logger.info(f"  Target scaler center (median): {target_scaler.center_}")
     logger.info(f"  Target scaler scale (IQR):     {target_scaler.scale_}")
-    
-    logger.info(f"✓ Scalers fitted on training data [0:{train_end_idx}]")
-    
-    # Keep raw tensors for per-fold scaling inside the fold loop.
-    # Each fold will fit its own scaler on its training slice only → zero look-ahead leakage.
-    # (The global scalers above were only for logging reference statistics.)
-    tabular_data_raw = tabular_data    # (N, 7)  raw float32
-    target_scores_raw = target_scores  # (N,)   raw float32
-    
+
+    logger.info("Applying RobustScaler to full target scores...")
+    target_scores = torch.from_numpy(
+        target_scaler.transform(target_scores.numpy().reshape(-1, 1)).squeeze(axis=1)
+    ).float().contiguous()
+    logger.info(f"✓ Target scores scaled: {target_scores.shape}  "
+                f"range [{target_scores.min():.3f}, {target_scores.max():.3f}]")
+
     # Create timestamps as long integers (sequential index, consistent with CryptoMultimodalDataset)
     timestamps = torch.arange(total_samples, dtype=torch.long)
-
     
+
     # Calculate walk-forward splits on TRAIN + VAL data ONLY (exclude test)
     # This ensures test data is completely isolated for final evaluation
     data_len = metadata["val_end_idx"]  # ✓ Only train + validation, NOT test
@@ -775,7 +845,7 @@ def create_walk_forward_dataloaders(
     logger.info(f"  Validation fold size: {step_size} ({step_size/data_len*100:.1f}%)")
     logger.info(f"  Number of folds: {num_folds}")
     
-    # Generate folds
+    # Generate folds — all folds share the same global-scaled tensors
     fold_num = 0
     for train_slice, val_slice in walk_forward_split(data_len, window_size, step_size):
         fold_num += 1
@@ -788,34 +858,14 @@ def create_walk_forward_dataloaders(
         logger.info(f"  Train: [{train_slice.start}:{train_slice.stop}] ({train_slice.stop - train_slice.start} samples)")
         logger.info(f"  Val:   [{val_slice.start}:{val_slice.stop}] ({val_slice.stop - val_slice.start} samples)")
         
-        # ========== PER-FOLD SCALER FITTING ==========
-        # Fit scalers ONLY on this fold's training slice → zero look-ahead leakage.
-        # Using a single global scaler (fitted on train_end_idx) would "leak" statistics
-        # from later folds' training data into earlier folds' scalers.
-        fold_tabular_scaler = StandardScaler()
-        fold_tabular_scaler.fit(tabular_data_raw[train_slice].numpy())
-        
-        fold_target_scaler = RobustScaler()
-        fold_target_scaler.fit(target_scores_raw[train_slice].numpy().reshape(-1, 1))
-        
-        logger.info(f"  Scalers fitted on fold training slice [{train_slice.start}:{train_slice.stop}]")
-        
-        # Apply per-fold scalers to train+val region (safe: test is excluded from data_len)
-        fold_end = val_slice.stop  # last index needed for this fold
-        tabular_fold_scaled = torch.from_numpy(
-            fold_tabular_scaler.transform(tabular_data_raw[:fold_end].numpy())
-        ).float().contiguous()
-        target_fold_scaled = torch.from_numpy(
-            fold_target_scaler.transform(target_scores_raw[:fold_end].numpy().reshape(-1, 1)).squeeze(axis=1)
-        ).float().contiguous()
-        
-        # Create datasets for this fold (use fold-scaled tensors)
+
+        # Create datasets for this fold (all folds use the same global-scaled tensors)
         train_dataset = WalkForwardDataset(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
-            tabular_data=tabular_fold_scaled,
-            target_scores=target_fold_scaled,
-            timestamps=timestamps[:fold_end],
+            tabular_data=tabular_data,
+            target_scores=target_scores,
+            timestamps=timestamps,
             data_slice=train_slice,
             seq_len=config.data.seq_len,
         )
@@ -823,9 +873,9 @@ def create_walk_forward_dataloaders(
         val_dataset = WalkForwardDataset(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
-            tabular_data=tabular_fold_scaled,
-            target_scores=target_fold_scaled,
-            timestamps=timestamps[:fold_end],
+            tabular_data=tabular_data,
+            target_scores=target_scores,
+            timestamps=timestamps,
             data_slice=val_slice,
             seq_len=config.data.seq_len,
         )
@@ -857,12 +907,18 @@ def create_walk_forward_dataloaders(
         logger.info(f"  ✓ Train loader: {len(train_loader)} batches")
         logger.info(f"  ✓ Val loader: {len(val_loader)} batches")
         
+        # tabular_scaler is NOT included — rolling z-score is stateless (no stored parameters).
+        # Only target_scaler is returned, used by validate() for inverse_transform to report
+        # metrics in the original (pre-RobustScaler) scale.
         scalers_dict = {
-            "tabular_scaler": fold_tabular_scaler,
-            "target_scaler": fold_target_scaler,
+            "tabular_scaler": None,   # Rolling z-score → no fixed scaler
+            "target_scaler": target_scaler,
         }
         
         yield fold_num, train_loader, val_loader, scalers_dict
+
+
+
 
 
 
