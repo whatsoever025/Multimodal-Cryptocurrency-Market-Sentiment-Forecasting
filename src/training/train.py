@@ -873,7 +873,10 @@ def main(args):
         target_scaler = test_dataset.target_scaler
         logger.info(f"✓ Test loader created: {len(test_loader)} batches")
     except Exception as e:
-        logger.warning(f"Failed to load test set: {e}")
+        import traceback
+        logger.warning(f"⚠ Failed to load test dataset: {type(e).__name__}: {e}")
+        logger.warning("Full traceback:")
+        logger.warning(traceback.format_exc())
         test_loader = None
         target_scaler = None
     

@@ -342,6 +342,11 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.info(f"[Per-split format] Loading RAW target scores from {target_path}...")
             target_raw = torch.load(target_path, map_location="cpu")  # (total_samples,)
             logger.info(f"✓ Raw target scores: {target_raw.shape}")
+            
+            # Per-split files cover [0:N] for their own split only.
+            # start_idx/end_idx must always be defined for the rolling normalization below.
+            start_idx = 0
+            end_idx = len(tabular_raw)
         else:
             # Try consolidated format with split_metadata.json
             metadata_path = self.features_dir / "split_metadata.json"
@@ -393,61 +398,67 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             target_raw = target_full[start_idx:end_idx]
             logger.info(f"✓ Raw target scores ({split}): {target_raw.shape}")
         
-        # ========== APPLY SCALERS ==========
+        # ========== ROLLING Z-SCORE FOR TABULAR FEATURES ==========
+        # CRITICAL: Must use apply_rolling_zscore here to match the walk-forward training path.
+        # The model was trained on rolling-normalized tabular features. Applying a different
+        # normalization (e.g. StandardScaler) at test time → input distribution mismatch → bad R².
+        #
+        # Rolling z-score REQUIRES full historical context to compute the window at each position.
+        # We cannot just normalize tabular_raw[start_idx:end_idx] in isolation because position
+        # start_idx needs the `window` hours of history before it.
+        # Solution: load the full tabular tensor, normalize it all, then slice the correct split.
         if split == "train":
-            # TRAIN: Fit scalers on raw data, then apply
-            logger.info("Fitting StandardScaler on tabular features (training split)...")
-            tabular_scaler = StandardScaler()
-            tabular_np = tabular_raw.numpy()  # (total_samples, 7)
-            tabular_scaled_np = tabular_scaler.fit_transform(tabular_np)
-            self.tabular_data = torch.from_numpy(tabular_scaled_np).float()
-            logger.info(f"✓ StandardScaler fitted and applied: {self.tabular_data.shape}")
-            logger.info(f"  Scaler mean: {tabular_scaler.mean_}")
-            logger.info(f"  Scaler scale: {tabular_scaler.scale_}")
-            
+            # For training: normalize the training slice only (it starts from t=0, so no prior context needed)
+            tabular_full_normalized = apply_rolling_zscore(
+                tabular_raw,  # training slice starts at 0 — full history available within slice
+                window=168,
+            )
+            self.tabular_data = tabular_full_normalized.contiguous()
+        else:
+            # For val/test: MUST normalize the FULL consolidated tensor [0:end_idx] first,
+            # then slice — so the rolling window at position start_idx has full history [start_idx-168:start_idx]
+            logger.info(f"[{split}] Loading full tabular tensor for causal rolling normalization...")
+            tabular_for_norm = torch.load(self.features_dir / "tabular_features.pt", map_location="cpu")
+            tabular_normalized = apply_rolling_zscore(
+                tabular_for_norm,
+                window=168,
+            )
+            self.tabular_data = tabular_normalized[start_idx:end_idx].contiguous()
+
+        logger.info(f"✓ Tabular features (rolling z-score): {self.tabular_data.shape}")
+
+        # ========== ROBUST SCALER FOR TARGETS ==========
+        # Targets use a fixed scaler fitted on training data (not rolling) because:
+        #   1. Target drift was much lower (KS=0.018) than features
+        #   2. validate() needs fixed scaler for inverse_transform to report original-scale metrics
+
+        if split == "train":
             logger.info("Fitting RobustScaler on target scores (training split)...")
             target_scaler = RobustScaler()
-            target_np = target_raw.numpy().reshape(-1, 1)  # (total_samples, 1) for sklearn
-            target_scaled_np = target_scaler.fit_transform(target_np).squeeze()  # Back to 1D
-            self.target_scores = torch.from_numpy(target_scaled_np).float()
+            target_np = target_raw.numpy().reshape(-1, 1)
+            target_scaled_np = target_scaler.fit_transform(target_np).squeeze()
+            self.target_scores = torch.from_numpy(target_scaled_np).float().contiguous()
             logger.info(f"✓ RobustScaler fitted and applied: {self.target_scores.shape}")
             logger.info(f"  Scaler center (median): {target_scaler.center_}")
             logger.info(f"  Scaler scale (IQR): {target_scaler.scale_}")
-            
-            # Store scalers for validation/test (will be loaded by those splits)
-            self.tabular_scaler = tabular_scaler
+            self.tabular_scaler = None   # No fixed tabular scaler — rolling z-score is stateless
             self.target_scaler = target_scaler
         else:
-            # VALIDATION/TEST: Load scalers from training split, apply to current split
-            logger.info(f"Loading scalers from training split for {split}...")
+            # val/test: reuse the RobustScaler fitted on the training split
+            logger.info(f"Loading target scaler from training split for {split}...")
             train_dataset = CryptoMultimodalDataset(
                 split="train",
                 seq_len=self.seq_len,
                 features_dir=str(self.features_dir),
-                debug=self.debug
+                debug=self.debug,
             )
-            tabular_scaler = train_dataset.tabular_scaler
             target_scaler = train_dataset.target_scaler
-            
-            # Apply training scalers to current split data
-            logger.info(f"Applying StandardScaler from training to {split} tabular features...")
-            tabular_np = tabular_raw.numpy()
-            tabular_scaled_np = tabular_scaler.transform(tabular_np)
-            self.tabular_data = torch.from_numpy(tabular_scaled_np).float()
-            logger.info(f"✓ Tabular features scaled: {self.tabular_data.shape}")
-            
-            logger.info(f"Applying RobustScaler from training to {split} target scores...")
             target_np = target_raw.numpy().reshape(-1, 1)
             target_scaled_np = target_scaler.transform(target_np).squeeze()
-            self.target_scores = torch.from_numpy(target_scaled_np).float()
+            self.target_scores = torch.from_numpy(target_scaled_np).float().contiguous()
             logger.info(f"✓ Target scores scaled: {self.target_scores.shape}")
-            
-            self.tabular_scaler = tabular_scaler
+            self.tabular_scaler = None
             self.target_scaler = target_scaler
-        
-        # Make contiguous for efficient slicing
-        self.tabular_data = self.tabular_data.contiguous()
-        self.target_scores = self.target_scores.contiguous()
         
         # Create timestamps (indices for reference)
         self.timestamps = torch.arange(self.total_samples, dtype=torch.long)
