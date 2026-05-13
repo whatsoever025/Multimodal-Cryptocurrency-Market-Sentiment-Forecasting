@@ -1,0 +1,11 @@
+{
+  "total_samples": 88954,
+  "train_end_idx": 62267,
+  "val_end_idx": 75610,
+  "test_end_idx": 88954,
+  "split_sizes": {
+    "train": 62267,
+    "validation": 13343,
+    "test_in_domain": 13344
+  }
+}

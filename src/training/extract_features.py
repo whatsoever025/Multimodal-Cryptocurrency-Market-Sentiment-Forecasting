@@ -136,38 +136,47 @@ class FrozenImageEncoder(nn.Module):
 
 def load_dataset_multi_asset(split: str = "train", debug: bool = False):
     """
-    Load multi-asset dataset (BTC + ETH concatenated).
-    
+    Load multi-asset dataset (BTC + ETH concatenated) from v4 HF repos.
+
+    v4 repos have a SINGLE flat split (split="train") with NO pre-defined
+    train/val/test boundaries.  Walk-forward splits are applied here at
+    extraction time using the split_metadata.json file.
+
+    v4 tabular features (9 total):
+        return_1h, volume, funding_rate, fear_greed_value,
+        gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
+        vol_30d, mom_30d
+
     Args:
-        split: "train", "validation", or "test_in_domain"
-        debug: If True, load only 100 samples for testing
-    
+        split: Ignored for v4 (always loads the single flat "train" split).
+               Kept for API compatibility with callers that pass split=.
+        debug: If True, load only 200 samples for testing.
+
     Returns:
-        Concatenated HF Dataset
+        Concatenated HF Dataset (BTC rows first, ETH rows second)
     """
-    logger.info(f"Loading multi-asset dataset ({split} split)...")
-    
-    print(f"[PROGRESS] Downloading BTC dataset ({split})...")
+    logger.info(f"Loading multi-asset v4 dataset (flat split, was: {split})...")
+
+    print(f"[PROGRESS] Downloading BTC v4 dataset...")
     btc_dataset = load_dataset(
-        "khanh252004/multimodal_crypto_sentiment_btc",
-        split=split,
+        "khanh252004/multimodal_crypto_sentiment_btc_v4",
+        split="train",           # v4 has only one flat split
         cache_dir="/tmp/huggingface_cache",
     )
-    
-    print(f"[PROGRESS] Downloading ETH dataset ({split})...")
+
+    print(f"[PROGRESS] Downloading ETH v4 dataset...")
     eth_dataset = load_dataset(
-        "khanh252004/multimodal_crypto_sentiment_eth",
-        split=split,
+        "khanh252004/multimodal_crypto_sentiment_eth_v4",
+        split="train",           # v4 has only one flat split
         cache_dir="/tmp/huggingface_cache",
     )
-    
-    # Concatenate datasets
+
     dataset = concatenate_datasets([btc_dataset, eth_dataset])
-    
+
     if debug:
-        dataset = dataset.select(range(min(100, len(dataset))))
-    
-    logger.info(f"Loaded {len(dataset)} samples for {split}")
+        dataset = dataset.select(range(min(200, len(dataset))))
+
+    logger.info(f"Loaded {len(dataset)} samples (BTC + ETH, v4 flat split)")
     return dataset
 
 
@@ -237,7 +246,7 @@ def extract_text_embeddings(
     # Save to disk
     torch.save(text_embeddings, output_path)
     logger.info(f"✓ Saved text embeddings to {output_path}")
-    print(f"[PROGRESS] ✓ Text embeddings saved ({text_embeddings.shape})")
+    print(f"[PROGRESS] OK Text embeddings saved ({text_embeddings.shape})")
     sys.stdout.flush()
 
 
@@ -308,7 +317,7 @@ def extract_image_embeddings(
     # Save to disk
     torch.save(image_embeddings, output_path)
     logger.info(f"✓ Saved image embeddings to {output_path}")
-    print(f"[PROGRESS] ✓ Image embeddings saved ({image_embeddings.shape})")
+    print(f"[PROGRESS] OK Image embeddings saved ({image_embeddings.shape})")
     sys.stdout.flush()
 
 
@@ -340,53 +349,43 @@ def main(args):
     text_encoder = FrozenTextEncoder(hidden_dim=256)
     image_encoder = FrozenImageEncoder(hidden_dim=256)
     
-    # Load all splits and concatenate
+    # Load full flat v4 dataset (single "train" split — no pre-defined splits in v4)
     logger.info("\n" + "-" * 80)
-    logger.info("Loading and concatenating all splits...")
+    logger.info("Loading full flat v4 dataset (single split)...")
     logger.info("-" * 80)
-    
-    splits = ["train", "validation", "test_in_domain"]
-    all_datasets = {}
-    split_sizes = {}
-    
-    for split in splits:
-        logger.info(f"Loading {split}...")
-        dataset = load_dataset_multi_asset(split=split, debug=args.debug)
-        all_datasets[split] = dataset
-        split_sizes[split] = len(dataset)
-        logger.info(f"✓ {split}: {len(dataset)} samples")
-    
-    # Concatenate datasets in chronological order: train → validation → test
-    logger.info("\nConcatenating datasets in order: train → validation → test...")
-    full_dataset = concatenate_datasets([
-        all_datasets["train"],
-        all_datasets["validation"],
-        all_datasets["test_in_domain"]
-    ])
-    
+
+    # v4 has ONE flat split — do NOT loop over split names.
+    # The old v3 loop called load_dataset_multi_asset(split="train/validation/test_in_domain")
+    # and concatenated 3 separate HF splits. v4 has no such splits — calling it 3 times
+    # would download the same flat dataset 3 times and triple the sequence length.
+    full_dataset = load_dataset_multi_asset(debug=args.debug)
     total_samples = len(full_dataset)
-    train_end = split_sizes["train"]
-    val_end = train_end + split_sizes["validation"]
-    
+
+    # Compute split boundaries here (70/15/15) so that dataset.py (which uses
+    # split_metadata.json) can correctly isolate the test block and apply
+    # walk-forward folds on train+val only.
+    train_end = int(0.70 * total_samples)
+    val_end   = train_end + int(0.15 * total_samples)
+
     logger.info(f"✓ Full sequence: {total_samples} samples")
-    logger.info(f"  Split boundaries:")
-    logger.info(f"    Train: [0:{train_end}]")
-    logger.info(f"    Val:   [{train_end}:{val_end}]")
-    logger.info(f"    Test:  [{val_end}:{total_samples}]")
-    
-    # Save split metadata
+    logger.info(f"  Split boundaries (70 / 15 / 15):")
+    logger.info(f"    Train block: [0          : {train_end}]")
+    logger.info(f"    Val block:   [{train_end} : {val_end}]")
+    logger.info(f"    Test block:  [{val_end}   : {total_samples}]")
+
+    # Save split metadata consumed by create_walk_forward_dataloaders()
     metadata = {
         "total_samples": total_samples,
-        "train_end_idx": int(train_end),
-        "val_end_idx": int(val_end),
-        "test_end_idx": int(total_samples),
+        "train_end_idx": train_end,
+        "val_end_idx":   val_end,
+        "test_end_idx":  total_samples,
         "split_sizes": {
-            "train": int(split_sizes["train"]),
-            "validation": int(split_sizes["validation"]),
-            "test_in_domain": int(split_sizes["test_in_domain"]),
+            "train":          train_end,
+            "validation":     val_end - train_end,
+            "test_in_domain": total_samples - val_end,
         }
     }
-    
+
     import json
     metadata_path = output_dir / "split_metadata.json"
     with open(metadata_path, "w") as f:
@@ -487,12 +486,12 @@ def main(args):
         logger.info(f"  image_embeddings: {image_shape}")
         logger.info(f"  tabular_features: {tabular_shape}")
         logger.info(f"  target_scores: {target_shape}")
-        print(f"[PROGRESS] ✓ All embeddings extracted: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
+        print(f"[PROGRESS] OK All embeddings extracted: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
     else:
         logger.warning(f"✗ Missing files")
-        print(f"[PROGRESS] ✗ Missing files")
+        print(f"[PROGRESS] FAIL Missing files")
     
-    print("[PROGRESS] ✓ Feature extraction pipeline complete!")
+    print("[PROGRESS] OK Feature extraction pipeline complete!")
     sys.stdout.flush()
 
 
@@ -521,7 +520,7 @@ def extract_target_scores(
     target_tensor = torch.tensor(target_scores, dtype=torch.float32)
     torch.save(target_tensor, output_path)
     logger.info(f"✓ Saved raw target scores to {output_path}")
-    print(f"[PROGRESS] ✓ Target scores extracted and saved ({target_tensor.shape})")
+    print(f"[PROGRESS] OK Target scores extracted and saved ({target_tensor.shape})")
     sys.stdout.flush()
 
 
@@ -549,7 +548,7 @@ def extract_target_scores_sequence(
     target_tensor = torch.tensor(target_scores, dtype=torch.float32)
     torch.save(target_tensor, output_path)
     logger.info(f"✓ Saved raw target scores to {output_path}")
-    print(f"[PROGRESS] ✓ Target scores extracted and saved ({target_tensor.shape})")
+    print(f"[PROGRESS] OK Target scores extracted and saved ({target_tensor.shape})")
     sys.stdout.flush()
 
 
@@ -607,7 +606,7 @@ def extract_tabular_features(
     tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
     torch.save(tabular_tensor, output_path)
     logger.info(f"✓ Saved raw tabular features to {output_path}")
-    print(f"[PROGRESS] ✓ Tabular features extracted and saved ({tabular_tensor.shape})")
+    print(f"[PROGRESS] OK Tabular features extracted and saved ({tabular_tensor.shape})")
     sys.stdout.flush()
 
 
@@ -616,42 +615,61 @@ def extract_tabular_features_sequence(
     output_path: Path,
 ) -> None:
     """
-    Extract RAW 7 tabular features (no scaling). Scaling done during training.
-    
-    Features: return_1h, volume, funding_rate, fear_greed_value,
-    gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume
-    
+    Extract RAW 9 tabular features (no scaling). Scaling done during training.
+
+    Features (v4):
+        1. return_1h           - Hourly % price change
+        2. volume              - Trading volume
+        3. funding_rate        - Perpetual futures funding rate
+        4. fear_greed_value    - Fear & Greed Index (0-100)
+        5. gdelt_econ_volume   - # economy/inflation articles
+        6. gdelt_econ_tone     - Sentiment tone of economic articles
+        7. gdelt_conflict_volume - # geopolitical/conflict articles
+        8. vol_30d             - 30-day realized volatility (regime indicator) [NEW v4]
+        9. mom_30d             - 30-day price momentum    (regime indicator) [NEW v4]
+
     Args:
-        dataset: Concatenated HuggingFace Dataset (train + validation + test)
-        output_path: Path to save raw features
+        dataset: Concatenated HF Dataset (flat, all splits in one)
+        output_path: Path to save raw features tensor (N, 9)
     """
-    logger.info(f"Extracting tabular features ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting tabular features (RAW, no scaling)...")
+    logger.info(f"Extracting tabular features v4 ({len(dataset)} samples, 9 features)...")
+    print("[PROGRESS] Extracting tabular features (RAW, no scaling, v4 = 9 features)...")
     sys.stdout.flush()
-    
-    # Extract 7 tabular features
-    tabular_features = []
+
     feature_names = [
-        "return_1h", "volume", "funding_rate", "fear_greed_value",
-        "gdelt_econ_volume", "gdelt_econ_tone", "gdelt_conflict_volume",
+        "return_1h",
+        "volume",
+        "funding_rate",
+        "fear_greed_value",
+        "gdelt_econ_volume",
+        "gdelt_econ_tone",
+        "gdelt_conflict_volume",
+        "vol_30d",      # NEW v4: 30-day realized volatility
+        "mom_30d",      # NEW v4: 30-day price momentum
     ]
-    
+
+    tabular_features = []
     for feature_name in feature_names:
+        if feature_name not in dataset.column_names:
+            raise KeyError(
+                f"Feature '{feature_name}' not found in dataset. "
+                f"Available: {dataset.column_names}. "
+                f"Make sure you are using the v4 HF dataset which includes vol_30d and mom_30d."
+            )
         feature_values = np.array(dataset[feature_name], dtype=np.float32)
         tabular_features.append(feature_values)
-    
-    # Stack into (total_samples, 7) array
+
+    # Stack into (total_samples, 9)
     tabular_array = np.stack(tabular_features, axis=1).astype(np.float32)
     logger.info(f"Tabular array shape: {tabular_array.shape}")
-    logger.info(f"Feature ranges (RAW):")
+    logger.info("Feature ranges (RAW):")
     for i, name in enumerate(feature_names):
         logger.info(f"  {name}: [{tabular_array[:, i].min():.4f}, {tabular_array[:, i].max():.4f}]")
-    
-    # Save raw tabular features
+
     tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
     torch.save(tabular_tensor, output_path)
     logger.info(f"✓ Saved raw tabular features to {output_path}")
-    print(f"[PROGRESS] ✓ Tabular features extracted and saved ({tabular_tensor.shape})")
+    print(f"[PROGRESS] Tabular features extracted and saved ({tabular_tensor.shape})")
     sys.stdout.flush()
 
 
@@ -714,7 +732,7 @@ def push_features_to_hf(
             commit_message="Upload pre-extracted crypto sentiment features"
         )
         logger.info(f"✓ Upload complete")
-        print(f"[PROGRESS] ✓ Features uploaded to https://huggingface.co/datasets/{repo_id}")
+        print(f"[PROGRESS] OK Features uploaded to https://huggingface.co/datasets/{repo_id}")
         sys.stdout.flush()
         
     except ImportError:
@@ -779,7 +797,7 @@ def push_features_to_kaggle(
         logger.info(f"\nTo upload to Kaggle, use the CLI:")
         logger.info(f"  cd {output_dir}")
         logger.info(f"  kaggle datasets version -m 'Updated features' -p .")
-        print(f"[PROGRESS] ✓ Metadata ready. Use CLI to upload: kaggle datasets version -p .")
+        print(f"[PROGRESS] OK Metadata ready. Use CLI to upload: kaggle datasets version -p .")
         sys.stdout.flush()
         
     except Exception as e:

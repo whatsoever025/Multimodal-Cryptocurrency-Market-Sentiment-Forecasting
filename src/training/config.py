@@ -44,6 +44,7 @@ class ModelConfig:
     """Architecture configuration."""
     hidden_dim: int = 256  # Hidden dimension in encoders/attention - MUST match embedding dimensions (256D)
     bottleneck_dim: int = 64  # Bottleneck layer: 256 -> 64 (compression before LSTM)
+    num_tabular_features: int = 9  # v4: 7 original + vol_30d + mom_30d regime features (was 7 in v3)
     lstm_layers: int = 1  # Simplified: reduced from 2 to 1
     lstm_hidden_dim: int = 64  # Simplified: reduced from 256 to 64
     lstm_dropout: float = 0.5  # AGGRESSIVE: Kill temporal memorization (prevents overfitting on sequences)

@@ -1,15 +1,12 @@
 {
-  "title": "crypto-sentiment-embeddings",
-  "id": "namkhanhng/crypto-sentiment-embeddings",
+  "title": "sentiment-crypto-features-v4",
+  "id": "namkhanhng/sentiment-crypto-features-v4",
   "licenses": [
     {
       "name": "cc-by-nc-4"
     }
   ],
   "resources": [
-    {
-      "path": "text_embeddings.pt"
-    },
     {
       "path": "image_embeddings.pt"
     },
@@ -20,7 +17,7 @@
       "path": "target_scores.pt"
     },
     {
-      "path": "split_metadata.json"
+      "path": "text_embeddings.pt"
     }
   ]
 }

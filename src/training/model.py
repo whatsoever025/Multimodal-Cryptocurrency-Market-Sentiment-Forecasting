@@ -270,7 +270,7 @@ class MultimodalFusionNet(nn.Module):
         # 1. Tabular encoder (only trainable component with backbones)
         self.tabular_encoder = TabularEncoder(
             hidden_dim=self.hidden_dim,
-            input_size=7,
+            input_size=config.model.num_tabular_features,  # v4: 9 features (was 7)
             dropout=config.model.encoder_dropout,
         )
         
