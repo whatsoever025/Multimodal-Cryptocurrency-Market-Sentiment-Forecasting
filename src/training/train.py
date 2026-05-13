@@ -854,23 +854,13 @@ def main(args):
     # Also load test set once for final evaluation
     logger.info("Also loading test set for final evaluation...")
     try:
-        from .dataset import CryptoMultimodalDataset as CryptoDataset
-        test_dataset = CryptoDataset(
-            split="test_in_domain",
-            seq_len=config.data.seq_len,
+        from training.dataset import create_test_dataloader
+        test_loader, target_scaler = create_test_dataloader(
+            config,
             features_dir=features_dir,
-            debug=debug,
-        )
-        test_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=config.data.batch_size,
-            shuffle=False,
-            collate_fn=multimodal_collate_fn,
             num_workers=0,
-            pin_memory=True,
-            drop_last=False,
+            pin_memory=True
         )
-        target_scaler = test_dataset.target_scaler
         logger.info(f"✓ Test loader created: {len(test_loader)} batches")
     except Exception as e:
         import traceback

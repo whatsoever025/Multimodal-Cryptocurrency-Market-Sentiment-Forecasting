@@ -929,8 +929,67 @@ def create_walk_forward_dataloaders(
         yield fold_num, train_loader, val_loader, scalers_dict
 
 
-
-
+def create_test_dataloader(
+    config,
+    features_dir: str = "./data/features",
+    num_workers: int = 0,
+    pin_memory: bool = True
+):
+    """
+    Creates a dataloader for the final, isolated test holdout set.
+    Applies identical normalizations to the walk-forward data.
+    """
+    import json
+    features_dir = Path(features_dir)
+    metadata_path = features_dir / "split_metadata.json"
+    
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+        
+    text_embeddings = torch.load(features_dir / "text_embeddings.pt", map_location="cpu")
+    image_embeddings = torch.load(features_dir / "image_embeddings.pt", map_location="cpu")
+    tabular_data = torch.load(features_dir / "tabular_features.pt", map_location="cpu")
+    target_scores = torch.load(features_dir / "target_scores.pt", map_location="cpu")
+    
+    # Normalization MUST exactly match train (causal rolling for tabular, fitted RobustScaler for targets)
+    rolling_window = config.data.rolling_norm_window
+    tabular_data = apply_rolling_zscore(tabular_data, window=rolling_window)
+    
+    train_end_idx = metadata["train_end_idx"]
+    target_scaler = RobustScaler()
+    target_scaler.fit(target_scores[:train_end_idx].numpy().reshape(-1, 1))
+    target_scores = torch.from_numpy(
+        target_scaler.transform(target_scores.numpy().reshape(-1, 1)).squeeze(axis=1)
+    ).float().contiguous()
+    
+    total_samples = text_embeddings.shape[0]
+    timestamps = torch.arange(total_samples, dtype=torch.long)
+    
+    val_end_idx = metadata["val_end_idx"]
+    test_end_idx = metadata["test_end_idx"]
+    test_slice = slice(val_end_idx, test_end_idx)
+    
+    test_dataset = WalkForwardDataset(
+        text_embeddings=text_embeddings,
+        image_embeddings=image_embeddings,
+        tabular_data=tabular_data,
+        target_scores=target_scores,
+        timestamps=timestamps,
+        data_slice=test_slice,
+        seq_len=config.data.seq_len,
+    )
+    
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        collate_fn=multimodal_collate_fn,
+        num_workers=0,  # Safety for Kaggle
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    
+    return test_loader, target_scaler
 
 
 if __name__ == "__main__":
