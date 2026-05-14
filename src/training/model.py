@@ -298,6 +298,17 @@ class MultimodalFusionNet(nn.Module):
             dropout=config.model.head_dropout,
         )
         
+        # 6. Regime Gate (Dynamic Volatility Scaling)
+        # Learns a multiplier between 0 and 1 from the 2 regime features (vol_30d, mom_30d)
+        self.regime_gate = nn.Sequential(
+            nn.Linear(2, 8),
+            nn.LayerNorm(8),
+            nn.SiLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid()  # Forces output to [0, 1]
+        )
+        logger.info("✓ Regime Gate initialized for volatility scaling")
+        
         logger.info("✓ MultimodalFusionNet initialized")
         
         # Print parameter counts
@@ -365,11 +376,22 @@ class MultimodalFusionNet(nn.Module):
         temporal_output = self.temporal_lstm(bottleneck_features)
         
         # ==================== PREDICTION HEAD ====================
-        # Simplified MLP head: (batch, 64) -> (batch, 1) -> reshape to (batch,)
-        # Use view(-1) instead of squeeze(dim=1) to safely handle batch_size=1:
-        # squeeze(dim=1) on shape (1,1) collapses to scalar (), breaking metric computation.
-        predictions = self.prediction_head(temporal_output)  # (batch, 1)
-        predictions = predictions.view(-1)  # (batch,) - safe for all batch sizes
+        # Simplified MLP head: (batch, 64) -> (batch, 1)
+        base_predictions = self.prediction_head(temporal_output)  # (batch, 1)
+        
+        # ==================== REGIME GATING ====================
+        # Extract regime features (vol_30d, mom_30d) from the last hour of the sequence.
+        # Tabular data shape is (batch, seq_len, 9), so we take [:, -1, 7:9]
+        regime_features = batch["tabular"][:, -1, 7:9]
+        
+        # The gate outputs a multiplier between 0 and 1
+        vol_multiplier = self.regime_gate(regime_features) # (batch, 1)
+        
+        # Dynamically scale the sentiment magnitude based on regime
+        predictions = base_predictions * vol_multiplier
+        
+        # Reshape to (batch,) - safe for all batch sizes
+        predictions = predictions.view(-1)
         
         return predictions
     
