@@ -55,6 +55,9 @@ from .utils import setup_logging, format_duration
 
 logger = logging.getLogger(__name__)
 
+# v5 target columns — one independent model is trained per target
+TARGET_NAMES = ["y_baseline", "y_heuristic", "y_pca"]
+
 
 def _reset_weights(module: nn.Module) -> None:
     """
@@ -376,7 +379,7 @@ class Trainer:
             logger.info("Scheduler: None (constant LR)")
         logger.info("Pure float32 training (no AMP)")
     
-    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
+    def train_epoch(self, train_loader: DataLoader, target_idx: int = 0) -> Dict[str, float]:
         """
         Run one training epoch with gradient accumulation and explicit gradient clipping.
         Pure float32 implementation (no AMP) for numerical stability.
@@ -445,8 +448,8 @@ class Trainer:
             
             # ========== FORWARD PASS (FLOAT32) ==========
             # Standard PyTorch forward pass - all tensors remain float32
-            predictions = self.model(batch)  # (batch,) shape
-            targets = batch["target"]  # (batch,) shape
+            predictions = self.model(batch)                    # (batch,)
+            targets = batch["target"][:, target_idx]          # (batch,) — slice one target column
             
             # ========== NUMERICAL STABILITY: CLAMP PREDICTIONS ==========
             # Prevent extreme values that can cause NaN in loss backward
@@ -607,7 +610,7 @@ class Trainer:
         
         return metrics
     
-    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
+    def validate(self, val_loader: DataLoader, target_idx: int = 0) -> Dict[str, float]:
         """
         Run validation (pure float32, no AMP) with comprehensive metrics collection.
         
@@ -642,8 +645,8 @@ class Trainer:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 
                 # Forward pass (pure float32, no AMP)
-                predictions = self.model(batch)  # (batch,)
-                targets = batch["target"]  # (batch,)
+                predictions = self.model(batch)                   # (batch,)
+                targets = batch["target"][:, target_idx]          # (batch,) — single column
                 
                 # Compute metrics on normalized scale for loss tracking.
                 # Use HuberLoss for consistency with training (robust to outliers).
@@ -677,12 +680,13 @@ class Trainer:
             # RobustScaler inverse_transform expects (n_samples, 1) shape.
             # Use squeeze(axis=1) instead of squeeze() to safely handle single-sample batches
             # (squeeze() would collapse (1,) → scalar which breaks downstream tensor ops).
-            all_predictions_denorm = self.target_scaler.inverse_transform(
-                all_predictions.numpy().reshape(-1, 1)
-            ).squeeze(axis=1)
-            all_targets_denorm = self.target_scaler.inverse_transform(
-                all_targets.numpy().reshape(-1, 1)
-            ).squeeze(axis=1)
+            # RobustScaler was fit on (N,3). To invert a single column,
+            # manually apply: x_orig = x_scaled * scale[col] + center[col]
+            col = getattr(self, "_current_target_idx", 0)
+            center = self.target_scaler.center_[col]
+            scale  = self.target_scaler.scale_[col]
+            all_predictions_denorm = all_predictions.numpy() * scale + center
+            all_targets_denorm     = all_targets.numpy()     * scale + center
             
             all_predictions = torch.from_numpy(all_predictions_denorm).float()
             all_targets = torch.from_numpy(all_targets_denorm).float()
@@ -838,25 +842,16 @@ def main(args):
     print("[PROGRESS] Starting to load datasets (this may take 1-5 minutes)...")
     sys.stdout.flush()
     
-    # Use walk-forward validation
+    # Walk-forward generators are created fresh per-target inside the target loop.
     logger.info(f"Using WALK-FORWARD VALIDATION with {num_folds} folds")
     logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
-    
-    # Create walk-forward validation generator
-    walk_forward_generator = create_walk_forward_dataloaders(
-        config,
-        features_dir=features_dir,
-        num_folds=num_folds,
-        num_workers=0,
-        pin_memory=True
-    )
     
     # Also load test set once for final evaluation
     logger.info("Also loading test set for final evaluation...")
     try:
         from .dataset import CryptoMultimodalDataset as CryptoDataset
         test_dataset = CryptoDataset(
-            split="test_in_domain",
+            split="test",
             seq_len=config.data.seq_len,
             features_dir=features_dir,
             debug=debug,
@@ -881,48 +876,23 @@ def main(args):
     sys.stdout.flush()
     
     
-    # Initialize model
-    logger.info("\n" + "-" * 80)
-    logger.info("Initializing model...")
-    model = MultimodalFusionNet(config)
-    logger.info(f"Model device: {next(model.parameters()).device}")
+    # Model and Trainer are initialised fresh per-target inside the target loop below
     
-    # Initialize trainer
-    trainer = Trainer(config, model, device=device, target_scaler=target_scaler)
-    trainer.setup_optimizer()
+    # W&B initialisation is done per-target inside the target loop below
     
-    # W&B initialization
-    if config.mlops.use_wandb and wandb is not None:
-        logger.info("\n" + "-" * 80)
-        logger.info("Initializing W&B...")
-        wandb.init(
-            project=config.mlops.wandb_project,
-            name=config.mlops.wandb_run_name,
-            config=config.to_dict(),
-            settings=wandb.Settings(
-                # Disable service ping wait to avoid timeout issues
-                _service_wait=0,
-                _disable_stats=False,
-            ),
-        )
-        logger.info(f"✓ W&B initialized: {config.mlops.wandb_project}/{config.mlops.wandb_run_name}")
-    
-    # Resume from checkpoint if requested
+    # Resume: start_epoch is applied to the first fold of the first target only.
+    # Checkpoint loading happens inside the target loop after the trainer is created.
     start_epoch = 0
+    resume_ckpt_path = None
     if resume_training:
         logger.info("\n" + "-" * 80)
         logger.info("Resuming from checkpoint...")
-        
-        # Find latest checkpoint
         checkpoint_files = sorted([
             p for p in config.mlops.checkpoint_dir.glob(f"{config.mlops.wandb_run_name}_epoch_*.pt")
         ])
-        
         if checkpoint_files:
-            latest_ckpt = checkpoint_files[-1]
-            trainer.load_checkpoint(latest_ckpt)
-            start_epoch = trainer.epoch + 1
-            logger.info(f"Resuming from epoch {start_epoch}")
+            resume_ckpt_path = checkpoint_files[-1]
+            logger.info(f"Will resume from: {resume_ckpt_path}")
         else:
             logger.warning("No checkpoint found, starting from scratch")
     
@@ -933,276 +903,335 @@ def main(args):
     print("[PROGRESS] ✓ Setup complete, training begins now...")
     sys.stdout.flush()
     
-    # ==================== WALK-FORWARD TRAINING LOOP ====================
+    # ==================== PER-TARGET TRAINING LOOP ====================
+    # v5: 3 independent models, one per target (y_baseline, y_heuristic, y_pca).
+    # Each model is re-initialised from scratch so there is zero cross-target leakage.
     logger.info("=" * 80)
-    logger.info("WALK-FORWARD VALIDATION MODE")
+    logger.info(f"OUTER LOOP: Training {len(TARGET_NAMES)} independent models")
     logger.info("=" * 80)
-    
-    fold_results = {}
-    
-    for fold_num, train_loader, val_loader, scalers_dict in walk_forward_generator:
-        logger.info("\n" + "=" * 80)
-        logger.info(f"FOLD {fold_num}")
-        logger.info("=" * 80)
-        
-        # Reset model weights for each fold.
-        # CRITICAL for generalization: without this, fold N's model is fine-tuned from
-        # fold N-1's weights — meaning by the final fold the model has implicitly seen
-        # ALL prior folds' training+val data, causing optimistic validation R² that
-        # doesn't transfer to the held-out test set.
-        # Fresh initialization per fold ensures each fold's val metric is honest.
-        model.apply(_reset_weights)
-        logger.info(f"✓ Model weights reset for Fold {fold_num}")
-        
-        # Reset trainer for each fold
-        trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
-        trainer.setup_optimizer()
-        
-        # Early stopping reset (patience=5 for faster folds, min_delta=1e-4 prevents noise resets)
-        early_stopping = EarlyStopping(
-            patience=config.training.early_stopping_patience,
-            min_delta=1e-4,
-            verbose=True
+
+    all_target_results = {}   # {target_name: {fold_results, test_metrics}}
+
+    for target_idx, target_name in enumerate(TARGET_NAMES):
+        logger.info("\n" + "#" * 80)
+        logger.info(f"TARGET {target_idx+1}/{len(TARGET_NAMES)}: {target_name}")
+        logger.info("#" * 80)
+
+        # Re-create walk-forward generator (it is a generator — exhausted after one pass)
+        walk_forward_generator = create_walk_forward_dataloaders(
+            config,
+            features_dir=features_dir,
+            num_folds=num_folds,
+            num_workers=0,
+            pin_memory=True
         )
-        
-        # Train for this fold.
-        # On resume, start_epoch > 0 for the FIRST fold only (subsequent folds always start at 0).
-        fold_start = start_epoch if fold_num == 1 else 0
-        start_epoch = 0  # Only apply resume offset to the first fold
-        for epoch in range(fold_start, config.training.max_epochs):
-            trainer.epoch = epoch
-            
-            # Train epoch
-            train_metrics = trainer.train_epoch(train_loader)
-            train_loss = train_metrics["loss"]
-            
-            logger.info(
-                f"Fold {fold_num} Epoch {epoch+1:3d} | "
-                f"Train Loss {train_loss:.6f} | "
-                f"Train R² {train_metrics['r2']:.6f}"
+
+        # Fresh model for this target
+        model = MultimodalFusionNet(config)
+        logger.info(f"  Fresh model initialised for {target_name}")
+
+        # W&B run per target
+        if config.mlops.use_wandb and wandb is not None:
+            if wandb.run is not None:
+                wandb.finish()
+            target_run_name = f"{config.mlops.wandb_run_name}_{target_name}"
+            wandb.init(
+                project=config.mlops.wandb_project,
+                name=target_run_name,
+                config={**config.to_dict(), "target_name": target_name, "target_idx": target_idx},
+                settings=wandb.Settings(_service_wait=0, _disable_stats=False),
+                reinit=True,
             )
-            
-            # Validate
-            if (epoch + 1) % config.mlops.eval_frequency == 0:
-                val_metrics = trainer.validate(val_loader)
-                # Use normalized_huber for early stopping & best-model comparison:
-                # always on normalized scale regardless of whether target_scaler is set,
-                # ensuring consistent comparisons across folds.
-                val_loss = val_metrics["normalized_huber"]
-                
+            logger.info(f"  W&B run: {target_run_name}")
+
+        # ==================== WALK-FORWARD TRAINING LOOP ====================
+        logger.info("=" * 80)
+        logger.info(f"WALK-FORWARD VALIDATION — {target_name}")
+        logger.info("=" * 80)
+
+        fold_results = {}
+
+        for fold_num, train_loader, val_loader, scalers_dict in walk_forward_generator:
+            logger.info("\n" + "=" * 80)
+            logger.info(f"FOLD {fold_num}")
+            logger.info("=" * 80)
+
+            # Reset model weights for each fold.
+            # CRITICAL for generalization: without this, fold N's model is fine-tuned from
+            # fold N-1's weights — meaning by the final fold the model has implicitly seen
+            # ALL prior folds' training+val data, causing optimistic validation R² that
+            # doesn't transfer to the held-out test set.
+            # Fresh initialization per fold ensures each fold's val metric is honest.
+            model.apply(_reset_weights)
+            logger.info(f"✓ Model weights reset for Fold {fold_num}")
+
+            # Reset trainer for each fold
+            trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
+            trainer._current_target_idx = target_idx
+            trainer.setup_optimizer()
+
+            # Resume: load checkpoint into the first fold of the first target only.
+            if resume_ckpt_path and target_idx == 0 and fold_num == 1:
+                trainer.load_checkpoint(resume_ckpt_path)
+                start_epoch = trainer.epoch + 1
+                logger.info(f"Resumed from checkpoint — starting at epoch {start_epoch}")
+
+            # Early stopping reset
+            early_stopping = EarlyStopping(
+                patience=config.training.early_stopping_patience,
+                min_delta=1e-4,
+                verbose=True
+            )
+
+            # Train for this fold.
+            # On resume, start_epoch > 0 for the FIRST fold of FIRST target only.
+            fold_start = start_epoch if (target_idx == 0 and fold_num == 1) else 0
+            start_epoch = 0  # Reset so subsequent folds/targets always start at 0
+
+            for epoch in range(fold_start, config.training.max_epochs):
+                trainer.epoch = epoch
+
+                # Train epoch
+                train_metrics = trainer.train_epoch(train_loader, target_idx=target_idx)
+                train_loss = train_metrics["loss"]
+
                 logger.info(
                     f"Fold {fold_num} Epoch {epoch+1:3d} | "
-                    f"Val HuberLoss (normalized) {val_loss:.6f} | "
-                    f"Val MSE {val_metrics['mse']:.6f} | "
-                    f"Val R² {val_metrics['r2']:.6f}"
+                    f"Train Loss {train_loss:.6f} | "
+                    f"Train R² {train_metrics['r2']:.6f}"
                 )
-                
-                # Early stopping check (based on normalized HuberLoss)
-                if early_stopping(val_loss):
-                    logger.info(f"✓ Early stopping triggered at epoch {epoch+1}")
-                    break
-                
-                # Update best model for this fold (based on normalized HuberLoss)
-                if val_loss < trainer.best_val_loss:
-                    trainer.best_val_loss = val_loss
-                    trainer.best_epoch = epoch
-        
-        # Validate on full validation set for this fold.
-        # Use a fresh validate call, but mark it so val_losses doesn't get a duplicate append.
-        # (val_losses was already appended during the per-epoch training loop above.)
-        logger.info(f"\nFinal validation for Fold {fold_num}...")
-        final_val_metrics = trainer.validate(val_loader)
-        trainer.val_losses.pop()  # Remove the extra append from this summary-only validate() call
-        
-        fold_results[fold_num] = {
-            "val_r2": final_val_metrics["r2"],
-            "val_r2_oos": final_val_metrics["r2_oos"],
-            "val_mse": final_val_metrics["mse"],
-            "val_rmse": final_val_metrics["rmse"],
-            "val_mae": final_val_metrics["mae"],
-            "val_correlation": final_val_metrics["correlation"],
-        }
-        
-        logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}, MAE={final_val_metrics['mae']:.6f}")
-        
-        # Sanity check: Display first 5 predictions vs actual values
-        logger.info("\nSanity Check - First 5 Predictions vs Actual:")
-        predictions = final_val_metrics.get("predictions", None)
-        targets = final_val_metrics.get("targets", None)
-        if predictions is not None and targets is not None:
-            for i in range(min(5, len(predictions))):
-                logger.info(f"  [{i+1}] Predicted: {predictions[i].item():.4f} | Actual: {targets[i].item():.4f} | Error: {abs(predictions[i].item() - targets[i].item()):.4f}")
-        
-        # Log per-fold metrics to W&B (with step=fold_num for combined chart)
-        if wandb is not None and wandb.run is not None:
-            fold_log_dict = {
+
+                # Validate
+                if (epoch + 1) % config.mlops.eval_frequency == 0:
+                    val_metrics = trainer.validate(val_loader, target_idx=target_idx)
+                    # Use normalized_huber for early stopping & best-model comparison:
+                    # always on normalized scale regardless of whether target_scaler is set,
+                    # ensuring consistent comparisons across folds.
+                    val_loss = val_metrics["normalized_huber"]
+
+                    logger.info(
+                        f"Fold {fold_num} Epoch {epoch+1:3d} | "
+                        f"Val HuberLoss (normalized) {val_loss:.6f} | "
+                        f"Val MSE {val_metrics['mse']:.6f} | "
+                        f"Val R² {val_metrics['r2']:.6f}"
+                    )
+
+                    # Early stopping check (based on normalized HuberLoss)
+                    if early_stopping(val_loss):
+                        logger.info(f"✓ Early stopping triggered at epoch {epoch+1}")
+                        break
+
+                    # Update best model for this fold (based on normalized HuberLoss)
+                    if val_loss < trainer.best_val_loss:
+                        trainer.best_val_loss = val_loss
+                        trainer.best_epoch = epoch
+
+            # Validate on full validation set for this fold.
+            # Use a fresh validate call, but mark it so val_losses doesn't get a duplicate append.
+            # (val_losses was already appended during the per-epoch training loop above.)
+            logger.info(f"\nFinal validation for Fold {fold_num}...")
+            final_val_metrics = trainer.validate(val_loader, target_idx=target_idx)
+            trainer.val_losses.pop()  # Remove the extra append from this summary-only validate() call
+
+            fold_results[fold_num] = {
                 "val_r2": final_val_metrics["r2"],
                 "val_r2_oos": final_val_metrics["r2_oos"],
+                "val_mse": final_val_metrics["mse"],
                 "val_rmse": final_val_metrics["rmse"],
                 "val_mae": final_val_metrics["mae"],
                 "val_correlation": final_val_metrics["correlation"],
             }
-            wandb.log(fold_log_dict, step=fold_num)
-            logger.info(f"✓ Logged Fold {fold_num} metrics to W&B")
-    
-    # Log fold summary with simple line plots
-    logger.info("\n" + "=" * 80)
-    logger.info("WALK-FORWARD VALIDATION SUMMARY")
-    logger.info("=" * 80)
-    
-    # Collect metrics across folds
-    fold_numbers = sorted(fold_results.keys())
-    r2_scores     = [fold_results[i]["val_r2"]      for i in fold_numbers]
-    r2_oos_scores = [fold_results[i]["val_r2_oos"]  for i in fold_numbers]
-    rmse_scores   = [fold_results[i]["val_rmse"]    for i in fold_numbers]
-    mae_scores    = [fold_results[i]["val_mae"]     for i in fold_numbers]
-    corr_scores   = [fold_results[i]["val_correlation"] for i in fold_numbers]
-    
-    logger.info(f"Mean R²:          {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
-    logger.info(f"Mean R²_OOS:      {np.mean(r2_oos_scores):.6f} ± {np.std(r2_oos_scores):.6f}")
-    logger.info(f"Mean RMSE:        {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
-    logger.info(f"Mean MAE:         {np.mean(mae_scores):.6f} ± {np.std(mae_scores):.6f}")
-    logger.info(f"Mean Correlation: {np.mean(corr_scores):.6f} ± {np.std(corr_scores):.6f}")
-    
-    for fold_num in fold_numbers:
-        logger.info(
-            f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}, "
-            f"R²_OOS={fold_results[fold_num]['val_r2_oos']:.6f}, "
-            f"RMSE={fold_results[fold_num]['val_rmse']:.6f}, "
-            f"MAE={fold_results[fold_num]['val_mae']:.6f}, "
-            f"Corr={fold_results[fold_num]['val_correlation']:.6f}"
-        )
-    
-    # Log fold summary statistics to W&B
-    if wandb is not None and wandb.run is not None:
-        summary_log = {
-            "fold_summary/mean_r2":          np.mean(r2_scores),
-            "fold_summary/std_r2":           np.std(r2_scores),
-            "fold_summary/mean_r2_oos":      np.mean(r2_oos_scores),
-            "fold_summary/std_r2_oos":       np.std(r2_oos_scores),
-            "fold_summary/mean_rmse":        np.mean(rmse_scores),
-            "fold_summary/std_rmse":         np.std(rmse_scores),
-            "fold_summary/mean_mae":         np.mean(mae_scores),
-            "fold_summary/std_mae":          np.std(mae_scores),
-            "fold_summary/mean_correlation": np.mean(corr_scores),
-            "fold_summary/std_correlation":  np.std(corr_scores),
-        }
-        wandb.log(summary_log)
-        logger.info("✓ Logged fold summary statistics to W&B")
-        logger.info("✓ Fold metrics plotted as line charts with fold number on x-axis")
-    
-    # ==================== TEST EVALUATION ====================
-    logger.info("\n" + "=" * 80)
-    logger.info("Evaluating on Test Set...")
-    logger.info("=" * 80)
-    
-    # Check if test_loader is available
-    if test_loader is None:
-        logger.warning("⚠ Test loader is None - skipping test evaluation (test dataset failed to load)")
-        test_metrics = None
-    else:
-        # CRITICAL: Update trainer's target_scaler to test set's scaler before evaluation
-        # The trainer currently has the last fold's scaler, which causes scale mismatch
-        if target_scaler is not None:
-            trainer.target_scaler = target_scaler
-            logger.info("✓ Updated trainer scaler to test set scaler")
-        else:
-            trainer.target_scaler = None
-            logger.info("⚠ No test set scaler available - will evaluate on normalized scale")
-        
-        test_metrics = trainer.validate(test_loader)
-    
-    # Only process test metrics if evaluation succeeded
-    if test_metrics is not None:
-        denorm_status = " (denormalized to original scale)" if test_metrics.get("is_denormalized", False) else " (normalized scale)"
-        
-        logger.info(
-            f"Test Results{denorm_status}:\n"
-            f"  MSE:    {test_metrics['mse']:.6f}\n"
-            f"  RMSE:   {test_metrics['rmse']:.6f}\n"
-            f"  MAE:    {test_metrics['mae']:.6f}\n"
-            f"  R²:     {test_metrics['r2']:.6f}\n"
-            f"  R²_OOS: {test_metrics['r2_oos']:.6f}  (Gu, Kelly & Xiu 2020)\n"
-            f"  Correlation: {test_metrics['correlation']:.6f}\n"
-            f"  Prediction Bias: {test_metrics['prediction_error_mean']:.6f}\n"
-            f"  Prediction Error Std: {test_metrics['prediction_error_std']:.6f}"
-        )
-        
-        # Log comprehensive test metrics to W&B
+
+            logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}, MAE={final_val_metrics['mae']:.6f}")
+
+            # Sanity check: Display first 5 predictions vs actual values
+            logger.info("\nSanity Check - First 5 Predictions vs Actual:")
+            predictions = final_val_metrics.get("predictions", None)
+            targets = final_val_metrics.get("targets", None)
+            if predictions is not None and targets is not None:
+                for i in range(min(5, len(predictions))):
+                    logger.info(f"  [{i+1}] Predicted: {predictions[i].item():.4f} | Actual: {targets[i].item():.4f} | Error: {abs(predictions[i].item() - targets[i].item()):.4f}")
+
+            # Log per-fold metrics to W&B (with step=fold_num for combined chart)
+            if wandb is not None and wandb.run is not None:
+                fold_log_dict = {
+                    "val_r2": final_val_metrics["r2"],
+                    "val_r2_oos": final_val_metrics["r2_oos"],
+                    "val_rmse": final_val_metrics["rmse"],
+                    "val_mae": final_val_metrics["mae"],
+                    "val_correlation": final_val_metrics["correlation"],
+                }
+                wandb.log(fold_log_dict, step=fold_num)
+                logger.info(f"✓ Logged Fold {fold_num} metrics to W&B")
+
+        # Log fold summary with simple line plots
+        logger.info("\n" + "=" * 80)
+        logger.info("WALK-FORWARD VALIDATION SUMMARY")
+        logger.info("=" * 80)
+
+        # Collect metrics across folds
+        fold_numbers = sorted(fold_results.keys())
+        r2_scores     = [fold_results[i]["val_r2"]      for i in fold_numbers]
+        r2_oos_scores = [fold_results[i]["val_r2_oos"]  for i in fold_numbers]
+        rmse_scores   = [fold_results[i]["val_rmse"]    for i in fold_numbers]
+        mae_scores    = [fold_results[i]["val_mae"]     for i in fold_numbers]
+        corr_scores   = [fold_results[i]["val_correlation"] for i in fold_numbers]
+
+        logger.info(f"Mean R²:          {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
+        logger.info(f"Mean R²_OOS:      {np.mean(r2_oos_scores):.6f} ± {np.std(r2_oos_scores):.6f}")
+        logger.info(f"Mean RMSE:        {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
+        logger.info(f"Mean MAE:         {np.mean(mae_scores):.6f} ± {np.std(mae_scores):.6f}")
+        logger.info(f"Mean Correlation: {np.mean(corr_scores):.6f} ± {np.std(corr_scores):.6f}")
+
+        for fold_num in fold_numbers:
+            logger.info(
+                f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}, "
+                f"R²_OOS={fold_results[fold_num]['val_r2_oos']:.6f}, "
+                f"RMSE={fold_results[fold_num]['val_rmse']:.6f}, "
+                f"MAE={fold_results[fold_num]['val_mae']:.6f}, "
+                f"Corr={fold_results[fold_num]['val_correlation']:.6f}"
+            )
+
+        # Log fold summary statistics to W&B
         if wandb is not None and wandb.run is not None:
-            # Log core metrics first
-            test_log_dict = {
-                "test_mse": test_metrics["mse"],
-                "test_mae": test_metrics["mae"],
-                "test_rmse": test_metrics["rmse"],
-                "test_r2": test_metrics["r2"],
-                "test_r2_oos": test_metrics["r2_oos"],
-                "test_correlation": test_metrics["correlation"],
-                "test_prediction_bias": test_metrics["prediction_error_mean"],
-                "test_prediction_error_std": test_metrics["prediction_error_std"],
-                "test_pred_min": test_metrics["pred_min"],
-                "test_pred_max": test_metrics["pred_max"],
-                "test_target_min": test_metrics["target_min"],
-                "test_target_max": test_metrics["target_max"],
-                "test_is_denormalized": test_metrics.get("is_denormalized", False),
+            summary_log = {
+                "fold_summary/mean_r2":          np.mean(r2_scores),
+                "fold_summary/std_r2":           np.std(r2_scores),
+                "fold_summary/mean_r2_oos":      np.mean(r2_oos_scores),
+                "fold_summary/std_r2_oos":       np.std(r2_oos_scores),
+                "fold_summary/mean_rmse":        np.mean(rmse_scores),
+                "fold_summary/std_rmse":         np.std(rmse_scores),
+                "fold_summary/mean_mae":         np.mean(mae_scores),
+                "fold_summary/std_mae":          np.std(mae_scores),
+                "fold_summary/mean_correlation": np.mean(corr_scores),
+                "fold_summary/std_correlation":  np.std(corr_scores),
             }
-            
-            wandb.log(test_log_dict, commit=False)
-            
-            # Create prediction error scatter plot (ground truth vs predictions)
-            predictions = test_metrics["predictions"].numpy()
-            targets = test_metrics["targets"].numpy()
-            
-            # Create scatter plot for first 500 samples (memory efficiency)
-            plot_limit = min(500, len(predictions))
-            try:
-                wandb_plot = wandb.plot.scatter(
-                    wandb.Table(data=[
-                        [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
-                    ], columns=["Ground Truth", "Prediction"]),
-                    "Ground Truth", "Prediction", title="[TEST] Predictions vs Ground Truth"
-                )
-                wandb.log({"test_predictions_scatter": wandb_plot}, commit=False)
-            except Exception as e:
-                logger.warning(f"Failed to log test scatter plot: {e}")
-            
-            # Create histogram of prediction errors
-            errors = predictions - targets
-            try:
-                wandb.log({"test_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
-            except Exception as e:
-                logger.warning(f"Failed to log test error histogram: {e}")
-            
-            # Log actual values as table for samples (first 100 samples for inspection)
-            sample_limit = min(100, len(predictions))
-            table_data = [
-                [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
-                for i in range(sample_limit)
-            ]
-            try:
-                wandb.log({
-                    "test_predictions_table": wandb.Table(
-                        data=table_data,
-                        columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+            wandb.log(summary_log)
+            logger.info("✓ Logged fold summary statistics to W&B")
+            logger.info("✓ Fold metrics plotted as line charts with fold number on x-axis")
+
+        # ==================== TEST EVALUATION ====================
+        logger.info("\n" + "=" * 80)
+        logger.info("Evaluating on Test Set...")
+        logger.info("=" * 80)
+
+        # Check if test_loader is available
+        if test_loader is None:
+            logger.warning("⚠ Test loader is None - skipping test evaluation (test dataset failed to load)")
+            test_metrics = None
+        else:
+            # CRITICAL: Update trainer's target_scaler to test set's scaler before evaluation
+            # The trainer currently has the last fold's scaler, which causes scale mismatch
+            if target_scaler is not None:
+                trainer.target_scaler = target_scaler
+                logger.info("✓ Updated trainer scaler to test set scaler")
+            else:
+                trainer.target_scaler = None
+                logger.info("⚠ No test set scaler available - will evaluate on normalized scale")
+
+            trainer._current_target_idx = target_idx
+            test_metrics = trainer.validate(test_loader, target_idx=target_idx)
+
+        # Only process test metrics if evaluation succeeded
+        if test_metrics is not None:
+            denorm_status = " (denormalized to original scale)" if test_metrics.get("is_denormalized", False) else " (normalized scale)"
+
+            logger.info(
+                f"Test Results{denorm_status}:\n"
+                f"  MSE:    {test_metrics['mse']:.6f}\n"
+                f"  RMSE:   {test_metrics['rmse']:.6f}\n"
+                f"  MAE:    {test_metrics['mae']:.6f}\n"
+                f"  R²:     {test_metrics['r2']:.6f}\n"
+                f"  R²_OOS: {test_metrics['r2_oos']:.6f}  (Gu, Kelly & Xiu 2020)\n"
+                f"  Correlation: {test_metrics['correlation']:.6f}\n"
+                f"  Prediction Bias: {test_metrics['prediction_error_mean']:.6f}\n"
+                f"  Prediction Error Std: {test_metrics['prediction_error_std']:.6f}"
+            )
+
+            # Log comprehensive test metrics to W&B
+            if wandb is not None and wandb.run is not None:
+                # Log core metrics first
+                test_log_dict = {
+                    "test_mse": test_metrics["mse"],
+                    "test_mae": test_metrics["mae"],
+                    "test_rmse": test_metrics["rmse"],
+                    "test_r2": test_metrics["r2"],
+                    "test_r2_oos": test_metrics["r2_oos"],
+                    "test_correlation": test_metrics["correlation"],
+                    "test_prediction_bias": test_metrics["prediction_error_mean"],
+                    "test_prediction_error_std": test_metrics["prediction_error_std"],
+                    "test_pred_min": test_metrics["pred_min"],
+                    "test_pred_max": test_metrics["pred_max"],
+                    "test_target_min": test_metrics["target_min"],
+                    "test_target_max": test_metrics["target_max"],
+                    "test_is_denormalized": test_metrics.get("is_denormalized", False),
+                }
+
+                wandb.log(test_log_dict, commit=False)
+
+                # Create prediction error scatter plot (ground truth vs predictions)
+                predictions = test_metrics["predictions"].numpy()
+                targets = test_metrics["targets"].numpy()
+
+                # Create scatter plot for first 500 samples (memory efficiency)
+                plot_limit = min(500, len(predictions))
+                try:
+                    wandb_plot = wandb.plot.scatter(
+                        wandb.Table(data=[
+                            [x, y] for x, y in zip(targets[:plot_limit].tolist(), predictions[:plot_limit].tolist())
+                        ], columns=["Ground Truth", "Prediction"]),
+                        "Ground Truth", "Prediction", title="[TEST] Predictions vs Ground Truth"
                     )
-                }, commit=True)  # Final commit after test evaluation
-            except Exception as e:
-                logger.warning(f"Failed to log test predictions table: {e}")
-    
-    # Final summary
+                    wandb.log({"test_predictions_scatter": wandb_plot}, commit=False)
+                except Exception as e:
+                    logger.warning(f"Failed to log test scatter plot: {e}")
+
+                # Create histogram of prediction errors
+                errors = predictions - targets
+                try:
+                    wandb.log({"test_prediction_error_histogram": wandb.Histogram(errors)}, commit=False)
+                except Exception as e:
+                    logger.warning(f"Failed to log test error histogram: {e}")
+
+                # Log actual values as table for samples (first 100 samples for inspection)
+                sample_limit = min(100, len(predictions))
+                table_data = [
+                    [i, targets[i], predictions[i], errors[i], errors[i] / max(abs(targets[i]), 1e-6)]
+                    for i in range(sample_limit)
+                ]
+                try:
+                    wandb.log({
+                        "test_predictions_table": wandb.Table(
+                            data=table_data,
+                            columns=["Sample", "Ground Truth", "Prediction", "Error", "Relative Error"]
+                        )
+                    }, commit=True)  # Final commit after test evaluation
+                except Exception as e:
+                    logger.warning(f"Failed to log test predictions table: {e}")
+
+        # Store results for this target
+        all_target_results[target_name] = {
+            "fold_results": fold_results,
+            "test_metrics": test_metrics,
+        }
+
+        # Finish W&B run for this target
+        if wandb is not None and wandb.run is not None:
+            wandb.finish()
+
+    # END of per-target loop
+    # ==================== GLOBAL SUMMARY ====================
     logger.info("\n" + "=" * 80)
-    logger.info("Training Complete!")
-    logger.info(f"Best Val Loss: {trainer.best_val_loss:.6f} (Epoch {trainer.best_epoch})")
-    if test_metrics is not None:
-        logger.info(f"Test MSE:    {test_metrics['mse']:.6f}")
-        logger.info(f"Test R²:     {test_metrics['r2']:.6f}")
-        logger.info(f"Test R²_OOS: {test_metrics['r2_oos']:.6f}")
-    logger.info(f"Best Model Checkpoint: {config.mlops.checkpoint_dir / f'{config.mlops.wandb_run_name}_best.pt'}")
+    logger.info("ALL TARGETS — TRAINING COMPLETE")
     logger.info("=" * 80)
-    
-    # Finish W&B
-    if wandb is not None and wandb.run is not None:
-        wandb.finish()
+    for tname, tresult in all_target_results.items():
+        fold_r2 = [v["val_r2"] for v in tresult["fold_results"].values()]
+        tm = tresult["test_metrics"]
+        test_str = f"  Test R²={tm['r2']:.4f} | R²_OOS={tm['r2_oos']:.4f}" if tm else "  Test: N/A"
+        logger.info(
+            f"  {tname:15s}: CV R² {np.mean(fold_r2):.4f} ± {np.std(fold_r2):.4f} |{test_str}"
+        )
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":

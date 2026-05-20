@@ -134,40 +134,42 @@ class FrozenImageEncoder(nn.Module):
         return self.dropout(projected)
 
 
-def load_dataset_multi_asset(split: str = "train", debug: bool = False):
+def load_dataset_multi_asset(debug: bool = False):
     """
     Load multi-asset dataset (BTC + ETH concatenated).
-    
+
+    v5 datasets have a SINGLE flat split ('train') — no train/val/test on HF Hub.
+    Walk-forward splits are created from this full sequence during training.
+
     Args:
-        split: "train", "validation", or "test_in_domain"
         debug: If True, load only 100 samples for testing
-    
+
     Returns:
-        Concatenated HF Dataset
+        Concatenated HF Dataset (BTC + ETH, full sequence)
     """
-    logger.info(f"Loading multi-asset dataset ({split} split)...")
-    
-    print(f"[PROGRESS] Downloading BTC dataset ({split})...")
+    logger.info("Loading multi-asset v5 dataset (single split)...")
+
+    print("[PROGRESS] Downloading BTC dataset (v5, single split)...")
     btc_dataset = load_dataset(
         "khanh252004/multimodal_crypto_sentiment_btc",
-        split=split,
+        split="train",
         cache_dir="/tmp/huggingface_cache",
     )
-    
-    print(f"[PROGRESS] Downloading ETH dataset ({split})...")
+
+    print("[PROGRESS] Downloading ETH dataset (v5, single split)...")
     eth_dataset = load_dataset(
         "khanh252004/multimodal_crypto_sentiment_eth",
-        split=split,
+        split="train",
         cache_dir="/tmp/huggingface_cache",
     )
-    
-    # Concatenate datasets
+
+    # Concatenate BTC + ETH
     dataset = concatenate_datasets([btc_dataset, eth_dataset])
-    
+
     if debug:
         dataset = dataset.select(range(min(100, len(dataset))))
-    
-    logger.info(f"Loaded {len(dataset)} samples for {split}")
+
+    logger.info(f"Loaded {len(dataset)} samples (BTC + ETH, v5)")
     return dataset
 
 
@@ -314,84 +316,53 @@ def extract_image_embeddings(
 
 def main(args):
     """
-    Main extraction script - extracts FULL SEQUENCE (no pre-split).
-    
-    Concatenates train + validation + test_in_domain, extracts embeddings,
-    and saves metadata about split boundaries for walk-forward validation.
-    
+    Main extraction script — v5 single-split full sequence.
+
+    Responsibility: extract embeddings from the FULL chronological sequence
+    and write them to disk as contiguous .pt tensors.
+
+    This script intentionally does NOT set any split boundaries.
+    Walk-forward window sizes and holdout test fractions are determined
+    at training time by train.py (e.g. --test-pct 0.15 --num-folds 5).
+
     Args:
         args: Parsed command-line arguments
     """
     setup_logging()
     logger.info("=" * 80)
-    logger.info("Offline Feature Extraction Pipeline - FULL SEQUENCE")
+    logger.info("Offline Feature Extraction Pipeline - v5 FULL SEQUENCE")
     logger.info("=" * 80)
-    
+
     # Ensure output directory exists
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
-    
+
     # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Device: {device}")
-    
+
     # Initialize encoders
     text_encoder = FrozenTextEncoder(hidden_dim=256)
     image_encoder = FrozenImageEncoder(hidden_dim=256)
-    
-    # Load all splits and concatenate
+
+    # Load full v5 dataset (single HF split, BTC + ETH concatenated)
     logger.info("\n" + "-" * 80)
-    logger.info("Loading and concatenating all splits...")
+    logger.info("Loading v5 dataset (single flat split)...")
     logger.info("-" * 80)
-    
-    splits = ["train", "validation", "test_in_domain"]
-    all_datasets = {}
-    split_sizes = {}
-    
-    for split in splits:
-        logger.info(f"Loading {split}...")
-        dataset = load_dataset_multi_asset(split=split, debug=args.debug)
-        all_datasets[split] = dataset
-        split_sizes[split] = len(dataset)
-        logger.info(f"✓ {split}: {len(dataset)} samples")
-    
-    # Concatenate datasets in chronological order: train → validation → test
-    logger.info("\nConcatenating datasets in order: train → validation → test...")
-    full_dataset = concatenate_datasets([
-        all_datasets["train"],
-        all_datasets["validation"],
-        all_datasets["test_in_domain"]
-    ])
-    
+
+    full_dataset = load_dataset_multi_asset(debug=args.debug)
     total_samples = len(full_dataset)
-    train_end = split_sizes["train"]
-    val_end = train_end + split_sizes["validation"]
-    
     logger.info(f"✓ Full sequence: {total_samples} samples")
-    logger.info(f"  Split boundaries:")
-    logger.info(f"    Train: [0:{train_end}]")
-    logger.info(f"    Val:   [{train_end}:{val_end}]")
-    logger.info(f"    Test:  [{val_end}:{total_samples}]")
-    
-    # Save split metadata
-    metadata = {
-        "total_samples": total_samples,
-        "train_end_idx": int(train_end),
-        "val_end_idx": int(val_end),
-        "test_end_idx": int(total_samples),
-        "split_sizes": {
-            "train": int(split_sizes["train"]),
-            "validation": int(split_sizes["validation"]),
-            "test_in_domain": int(split_sizes["test_in_domain"]),
-        }
-    }
-    
+
+    # Save ONLY total_samples. Walk-forward folds and the holdout test
+    # fraction are decided in train.py, not here.
     import json
+    metadata = {"total_samples": total_samples}
     metadata_path = output_dir / "split_metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
-    logger.info(f"\n✓ Split metadata saved to {metadata_path}")
+    logger.info(f"\n✓ Metadata saved: {metadata_path}  (total_samples={total_samples})")
     
     # Extract features from FULL sequence
     logger.info("\n" + "-" * 80)
@@ -501,28 +472,10 @@ def extract_target_scores(
     output_path: Path,
 ) -> None:
     """
+    [LEGACY - kept for backward compatibility]
     Extract RAW target_score (no scaling). Save to disk.
-    Scaling will be done during training on Kaggle.
-    
-    Args:
-        dataset: HuggingFace Dataset with target_score column
-        output_path: Path to save raw target scores
     """
-    logger.info(f"Extracting target_score ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting target_score (RAW, no scaling)...")
-    sys.stdout.flush()
-    
-    # Extract target scores (raw, no scaling)
-    target_scores = np.array(dataset["target_score"], dtype=np.float32)
-    logger.info(f"Target scores shape: {target_scores.shape}")
-    logger.info(f"Target scores range (RAW): [{target_scores.min():.4f}, {target_scores.max():.4f}]")
-    
-    # Save raw targets
-    target_tensor = torch.tensor(target_scores, dtype=torch.float32)
-    torch.save(target_tensor, output_path)
-    logger.info(f"✓ Saved raw target scores to {output_path}")
-    print(f"[PROGRESS] ✓ Target scores extracted and saved ({target_tensor.shape})")
-    sys.stdout.flush()
+    extract_target_scores_sequence(dataset, output_path)
 
 
 def extract_target_scores_sequence(
@@ -530,27 +483,52 @@ def extract_target_scores_sequence(
     output_path: Path,
 ) -> None:
     """
-    Extract RAW target scores (no scaling). Scaling done during training.
-    
+    Extract RAW v5 targets (no scaling). Scaling done during training.
+
+    v5 has THREE targets instead of the old single `target_score`:
+      - y_baseline  : raw funding_rate at t+1
+      - y_heuristic : weighted Z-score composite
+      - y_pca       : PC1 of Z-scored target variables
+
+    Saves as (N, 3) float32 tensor.
+    Column order: [y_baseline, y_heuristic, y_pca]
+
     Args:
-        dataset: Concatenated HuggingFace Dataset (train + validation + test)
-        output_path: Path to save raw target scores
+        dataset: HuggingFace Dataset with y_baseline/y_heuristic/y_pca columns
+        output_path: Path to save raw target tensor
     """
-    logger.info(f"Extracting target scores ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting target scores (RAW, no scaling)...")
+    logger.info(f"Extracting v5 targets ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting v5 targets (y_baseline, y_heuristic, y_pca) RAW...")
     sys.stdout.flush()
-    
-    # Extract target scores (raw, no scaling)
-    target_scores = np.array(dataset["target_score"], dtype=np.float32)
-    logger.info(f"Target scores shape: {target_scores.shape}")
-    logger.info(f"Target scores range (RAW): [{target_scores.min():.4f}, {target_scores.max():.4f}]")
-    
-    # Save raw targets
-    target_tensor = torch.tensor(target_scores, dtype=torch.float32)
+
+    target_cols = ["y_baseline", "y_heuristic", "y_pca"]
+    targets = []
+    for col in target_cols:
+        arr = np.array(dataset[col], dtype=np.float32)
+        targets.append(arr)
+        logger.info(f"  {col}: [{arr.min():.5f}, {arr.max():.5f}]")
+
+    # Stack → (N, 3)
+    target_array = np.stack(targets, axis=1)
+    target_tensor = torch.tensor(target_array, dtype=torch.float32)
+    logger.info(f"Target tensor shape: {target_tensor.shape}  (N, 3)")
+
     torch.save(target_tensor, output_path)
-    logger.info(f"✓ Saved raw target scores to {output_path}")
-    print(f"[PROGRESS] ✓ Target scores extracted and saved ({target_tensor.shape})")
+    logger.info(f"✓ Saved v5 targets to {output_path}")
+    print(f"[PROGRESS] ✓ Targets extracted and saved {target_tensor.shape}")
     sys.stdout.flush()
+
+
+# v5 tabular feature column order (7 columns)
+TABULAR_FEATURE_NAMES = [
+    "return_1h",              # 1-hour price return
+    "volume",                 # trading volume
+    "funding_rate",           # futures funding rate
+    "gdelt_econ_volume",      # GDELT economic news volume
+    "gdelt_econ_tone",        # GDELT economic news tone
+    "gdelt_conflict_volume",  # GDELT conflict news volume
+    "is_post_ETF",            # binary flag: 1 if >= 2024-01-01 (ETF approval)
+]
 
 
 def extract_tabular_features(
@@ -559,56 +537,20 @@ def extract_tabular_features(
     split: str = "train",
 ) -> None:
     """
-    Extract RAW 7 tabular features (no scaling). Scaling will be done during training.
-    
-    Features:
-    1. return_1h: Price return in 1 hour
-    2. volume: Trading volume
-    3. funding_rate: Futures funding rate
-    4. fear_greed_value: Fear & Greed Index
-    5. gdelt_econ_volume: News volume (economic)
-    6. gdelt_econ_tone: News tone (economic)
-    7. gdelt_conflict_volume: News volume (conflict)
-    
+    [LEGACY] Extract RAW 7 tabular features (v5 schema) for a single split.
+
+    v5 Features (7 columns):
+      return_1h, volume, funding_rate,
+      gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
+      is_post_ETF   ← replaces old fear_greed_value
+
     Args:
-        dataset: HuggingFace Dataset with tabular columns
+        dataset: HuggingFace Dataset with v5 tabular columns
         output_dir: Directory to save raw features
-        split: "train", "validation", or "test_in_domain"
+        split: split name used in output filename
     """
-    logger.info(f"Extracting tabular features ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting tabular features (RAW, no scaling)...")
-    sys.stdout.flush()
-    
-    # Extract 7 tabular features
-    tabular_features = []
-    feature_names = [
-        "return_1h",
-        "volume",
-        "funding_rate",
-        "fear_greed_value",
-        "gdelt_econ_volume",
-        "gdelt_econ_tone",
-        "gdelt_conflict_volume",
-    ]
-    
-    for feature_name in feature_names:
-        feature_values = np.array(dataset[feature_name], dtype=np.float32)
-        tabular_features.append(feature_values)
-    
-    # Stack into (total_samples, 7) array
-    tabular_array = np.stack(tabular_features, axis=1).astype(np.float32)
-    logger.info(f"Tabular array shape: {tabular_array.shape}")
-    logger.info(f"Feature ranges (RAW):")
-    for i, name in enumerate(feature_names):
-        logger.info(f"  {name}: [{tabular_array[:, i].min():.4f}, {tabular_array[:, i].max():.4f}]")
-    
-    # Save raw tabular features
     output_path = output_dir / f"tabular_features_{split}.pt"
-    tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
-    torch.save(tabular_tensor, output_path)
-    logger.info(f"✓ Saved raw tabular features to {output_path}")
-    print(f"[PROGRESS] ✓ Tabular features extracted and saved ({tabular_tensor.shape})")
-    sys.stdout.flush()
+    extract_tabular_features_sequence(dataset, output_path)
 
 
 def extract_tabular_features_sequence(
@@ -616,42 +558,43 @@ def extract_tabular_features_sequence(
     output_path: Path,
 ) -> None:
     """
-    Extract RAW 7 tabular features (no scaling). Scaling done during training.
-    
-    Features: return_1h, volume, funding_rate, fear_greed_value,
-    gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume
-    
+    Extract RAW 7 tabular features (v5 schema, no scaling).
+    Scaling is applied in-memory during training.
+
+    v5 Feature columns (saved in this order):
+      [return_1h, volume, funding_rate,
+       gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
+       is_post_ETF]
+
+    NOTE: `fear_greed_value` was REMOVED in v5.
+          `is_post_ETF` (binary 0/1) was ADDED in v5.
+
+    Saves as (N, 7) float32 tensor.
+
     Args:
-        dataset: Concatenated HuggingFace Dataset (train + validation + test)
-        output_path: Path to save raw features
+        dataset: HuggingFace Dataset (v5, single flat split)
+        output_path: Path to save raw tabular tensor
     """
-    logger.info(f"Extracting tabular features ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting tabular features (RAW, no scaling)...")
+    logger.info(f"Extracting v5 tabular features ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting tabular features (v5 schema, RAW, no scaling)...")
     sys.stdout.flush()
-    
-    # Extract 7 tabular features
+
     tabular_features = []
-    feature_names = [
-        "return_1h", "volume", "funding_rate", "fear_greed_value",
-        "gdelt_econ_volume", "gdelt_econ_tone", "gdelt_conflict_volume",
-    ]
-    
-    for feature_name in feature_names:
-        feature_values = np.array(dataset[feature_name], dtype=np.float32)
-        tabular_features.append(feature_values)
-    
-    # Stack into (total_samples, 7) array
+    for feature_name in TABULAR_FEATURE_NAMES:
+        arr = np.array(dataset[feature_name], dtype=np.float32)
+        tabular_features.append(arr)
+
+    # Stack → (N, 7)
     tabular_array = np.stack(tabular_features, axis=1).astype(np.float32)
     logger.info(f"Tabular array shape: {tabular_array.shape}")
-    logger.info(f"Feature ranges (RAW):")
-    for i, name in enumerate(feature_names):
+    logger.info("Feature ranges (RAW):")
+    for i, name in enumerate(TABULAR_FEATURE_NAMES):
         logger.info(f"  {name}: [{tabular_array[:, i].min():.4f}, {tabular_array[:, i].max():.4f}]")
-    
-    # Save raw tabular features
+
     tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
     torch.save(tabular_tensor, output_path)
-    logger.info(f"✓ Saved raw tabular features to {output_path}")
-    print(f"[PROGRESS] ✓ Tabular features extracted and saved ({tabular_tensor.shape})")
+    logger.info(f"✓ Saved v5 tabular features to {output_path}")
+    print(f"[PROGRESS] ✓ Tabular features extracted and saved {tabular_tensor.shape}")
     sys.stdout.flush()
 
 

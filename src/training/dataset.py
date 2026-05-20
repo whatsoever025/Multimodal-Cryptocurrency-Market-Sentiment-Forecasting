@@ -62,9 +62,10 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
     
     def __init__(
         self,
-        split: str = "train",
+        split: str = "train_val",
         seq_len: int = 24,
         features_dir: str = None,
+        test_pct: float = 0.15,
         debug: bool = False,
     ):
         """
@@ -99,6 +100,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         self.split = split
         self.seq_len = seq_len
         self.features_dir = Path(features_dir) if features_dir else None
+        self.test_pct = test_pct
         self.debug = debug
         
         # Validate: must have features directory
@@ -209,20 +211,19 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             with open(metadata_path) as f:
                 metadata = json.load(f)
             
-            # Determine slice indices for this split
-            if split == "train":
-                start_idx = 0
-                end_idx = metadata["train_end_idx"]
-            elif split == "validation":
-                start_idx = metadata["train_end_idx"]
-                end_idx = metadata["val_end_idx"]
-            elif split == "test_in_domain":
-                start_idx = metadata["val_end_idx"]
-                end_idx = metadata["test_end_idx"]
+            # v5: metadata only has total_samples; boundaries computed from test_pct
+            N = metadata["total_samples"]
+            test_start = int(N * (1.0 - self.test_pct))
+            if split == "train_val":
+                start_idx, end_idx = 0, test_start
+            elif split == "test":
+                start_idx, end_idx = test_start, N
+            elif split == "all":
+                start_idx, end_idx = 0, N
             else:
-                raise ValueError(f"Unknown split: {split}. Must be 'train', 'validation', or 'test_in_domain'")
-            
-            logger.info(f"✓ Split metadata: {split} uses indices [{start_idx}:{end_idx}]")
+                raise ValueError(f"split must be 'train_val', 'test', or 'all', got {split!r}")
+
+            logger.info(f"✓ Split {split!r}: [{start_idx}:{end_idx}] (test_pct={self.test_pct})")
             
             # Load full consolidated embeddings
             logger.info(f"[Consolidated format] Loading text embeddings from {text_embed_path}...")
@@ -297,20 +298,19 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             with open(metadata_path) as f:
                 metadata = json.load(f)
             
-            # Determine slice indices for this split
-            if split == "train":
-                start_idx = 0
-                end_idx = metadata["train_end_idx"]
-            elif split == "validation":
-                start_idx = metadata["train_end_idx"]
-                end_idx = metadata["val_end_idx"]
-            elif split == "test_in_domain":
-                start_idx = metadata["val_end_idx"]
-                end_idx = metadata["test_end_idx"]
+            # v5: metadata only has total_samples; boundaries computed from test_pct
+            N = metadata["total_samples"]
+            test_start = int(N * (1.0 - self.test_pct))
+            if split == "train_val":
+                start_idx, end_idx = 0, test_start
+            elif split == "test":
+                start_idx, end_idx = test_start, N
+            elif split == "all":
+                start_idx, end_idx = 0, N
             else:
-                raise ValueError(f"Unknown split: {split}. Must be 'train', 'validation', or 'test_in_domain'")
-            
-            logger.info(f"✓ Split metadata: {split} uses indices [{start_idx}:{end_idx}]")
+                raise ValueError(f"split must be 'train_val', 'test', or 'all', got {split!r}")
+
+            logger.info(f"✓ Split {split!r}: [{start_idx}:{end_idx}] (test_pct={self.test_pct})")
             
             # Load full consolidated files
             logger.info(f"[Consolidated format] Loading RAW tabular features from {tabular_path}...")
@@ -326,7 +326,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.info(f"✓ Raw target scores ({split}): {target_raw.shape}")
         
         # ========== APPLY SCALERS ==========
-        if split == "train":
+        if split in ("train_val", "all"):
             # TRAIN: Fit scalers on raw data, then apply
             logger.info("Fitting StandardScaler on tabular features (training split)...")
             tabular_scaler = StandardScaler()
@@ -337,14 +337,12 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.info(f"  Scaler mean: {tabular_scaler.mean_}")
             logger.info(f"  Scaler scale: {tabular_scaler.scale_}")
             
-            logger.info("Fitting RobustScaler on target scores (training split)...")
+            logger.info("Fitting RobustScaler on targets (N,3) [y_baseline,y_heuristic,y_pca]...")
             target_scaler = RobustScaler()
-            target_np = target_raw.numpy().reshape(-1, 1)  # (total_samples, 1) for sklearn
-            target_scaled_np = target_scaler.fit_transform(target_np).squeeze()  # Back to 1D
+            target_np = target_raw.numpy()  # (N, 3)
+            target_scaled_np = target_scaler.fit_transform(target_np)  # (N, 3)
             self.target_scores = torch.from_numpy(target_scaled_np).float()
-            logger.info(f"✓ RobustScaler fitted and applied: {self.target_scores.shape}")
-            logger.info(f"  Scaler center (median): {target_scaler.center_}")
-            logger.info(f"  Scaler scale (IQR): {target_scaler.scale_}")
+            logger.info(f"✓ RobustScaler fitted: {self.target_scores.shape}")
             
             # Store scalers for validation/test (will be loaded by those splits)
             self.tabular_scaler = tabular_scaler
@@ -353,9 +351,10 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             # VALIDATION/TEST: Load scalers from training split, apply to current split
             logger.info(f"Loading scalers from training split for {split}...")
             train_dataset = CryptoMultimodalDataset(
-                split="train",
+                split="train_val",
                 seq_len=self.seq_len,
                 features_dir=str(self.features_dir),
+                test_pct=self.test_pct,
                 debug=self.debug
             )
             tabular_scaler = train_dataset.tabular_scaler
@@ -369,8 +368,8 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.info(f"✓ Tabular features scaled: {self.tabular_data.shape}")
             
             logger.info(f"Applying RobustScaler from training to {split} target scores...")
-            target_np = target_raw.numpy().reshape(-1, 1)
-            target_scaled_np = target_scaler.transform(target_np).squeeze()
+            target_np = target_raw.numpy()  # (N, 3)
+            target_scaled_np = target_scaler.transform(target_np)  # (N, 3)
             self.target_scores = torch.from_numpy(target_scaled_np).float()
             logger.info(f"✓ Target scores scaled: {self.target_scores.shape}")
             
@@ -698,9 +697,6 @@ def create_walk_forward_dataloaders(
     
     logger.info(f"✓ Split metadata loaded:")
     logger.info(f"  Total samples: {metadata['total_samples']}")
-    logger.info(f"  Train end: {metadata['train_end_idx']}")
-    logger.info(f"  Val end: {metadata['val_end_idx']}")
-    logger.info(f"  Test end: {metadata['test_end_idx']}")
     
     # Load full-sequence embeddings
     print("[PROGRESS] Loading embeddings...")
@@ -731,8 +727,9 @@ def create_walk_forward_dataloaders(
     logger.info(f"  target_scores: {target_scores.shape}")
     
     # Create scalers from TRAINING portion only (to prevent data leakage)
-    train_end_idx = metadata["train_end_idx"]
-    logger.info(f"\nFitting scalers on training data [0:{train_end_idx}]...")
+    test_pct = 0.15  # holdout fraction; keep test data isolated
+    train_end_idx = int(total_samples * (1.0 - test_pct))
+    logger.info(f"\nFitting scalers on non-test data [0:{train_end_idx}] (test_pct={test_pct})...")
     
     from sklearn.preprocessing import StandardScaler, RobustScaler
     
@@ -747,7 +744,7 @@ def create_walk_forward_dataloaders(
     # CRITICAL: train.py's validate() calls target_scaler.inverse_transform() to report
     # metrics in the original scale. Must be the same scaler type used here.
     target_scaler = RobustScaler()
-    target_scaler.fit(target_scores[:train_end_idx].numpy().reshape(-1, 1))
+    target_scaler.fit(target_scores[:train_end_idx].numpy())
     logger.info(f"  Target scaler center (median): {target_scaler.center_}")
     logger.info(f"  Target scaler scale (IQR):     {target_scaler.scale_}")
     
@@ -765,7 +762,7 @@ def create_walk_forward_dataloaders(
     
     # Calculate walk-forward splits on TRAIN + VAL data ONLY (exclude test)
     # This ensures test data is completely isolated for final evaluation
-    data_len = metadata["val_end_idx"]  # ✓ Only train + validation, NOT test
+    data_len = train_end_idx  # ✓ Only non-test data; test holdout isolated
     window_size = int(0.7 * data_len)  # 70% of (train + val)
     step_size = int(0.15 * data_len) // num_folds  # 15% of (train + val) spread across folds
     
@@ -796,7 +793,7 @@ def create_walk_forward_dataloaders(
         fold_tabular_scaler.fit(tabular_data_raw[train_slice].numpy())
         
         fold_target_scaler = RobustScaler()
-        fold_target_scaler.fit(target_scores_raw[train_slice].numpy().reshape(-1, 1))
+        fold_target_scaler.fit(target_scores_raw[train_slice].numpy())
         
         logger.info(f"  Scalers fitted on fold training slice [{train_slice.start}:{train_slice.stop}]")
         
@@ -806,7 +803,7 @@ def create_walk_forward_dataloaders(
             fold_tabular_scaler.transform(tabular_data_raw[:fold_end].numpy())
         ).float().contiguous()
         target_fold_scaled = torch.from_numpy(
-            fold_target_scaler.transform(target_scores_raw[:fold_end].numpy().reshape(-1, 1)).squeeze(axis=1)
+            fold_target_scaler.transform(target_scores_raw[:fold_end].numpy())
         ).float().contiguous()
         
         # Create datasets for this fold (use fold-scaled tensors)
