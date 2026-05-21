@@ -19,18 +19,14 @@ os.chdir(REPO_DIR)
 sys.path.insert(0, REPO_DIR)
 print(f"✓ Working dir: {os.getcwd()}")
 
-# Install ONLY missing packages — do NOT reinstall torch (Kaggle pre-installed version is GPU-compatible)
+# Install ONLY packages genuinely missing from Kaggle's environment.
+# DO NOT install or upgrade: torch, transformers, datasets, huggingface_hub,
+#   scikit-learn, Pillow — they are pre-installed and compiled for this GPU.
+# Upgrading transformers pulls in CUDA ops not in Kaggle's pre-compiled torch
+# → causes "no kernel image for device" error.
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-    "transformers",
-    "datasets",
-    "wandb",
-    "huggingface_hub",
-    "scikit-learn",
-    "timm",
-    "Pillow",
-    # NOTE: torch / torchvision intentionally excluded — Kaggle's pre-installed
-    #       version is compiled for the exact GPU in this session.
-    #       Re-installing from pip causes CUDA kernel mismatch errors.
+    "wandb",    # not pre-installed on Kaggle
+    "timm",     # not always pre-installed
 ], check=True)
 print("✓ Dependencies installed")
 
