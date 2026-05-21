@@ -251,13 +251,20 @@ class MultimodalFusionNet(nn.Module):
     - VRAM: 16GB sufficient with batch_size=8, seq_len=24
     """
     
-    def __init__(self, config):
+    def __init__(self, config, ablation_mode: str = "full"):
         super().__init__()
         self.config = config
         self.hidden_dim = config.model.hidden_dim
         self.seq_len = config.data.seq_len
         
-        logger.info(f"Initializing MultimodalFusionNet (hidden_dim={self.hidden_dim})...")
+        # Ablation mode: controls which modalities are active
+        # "full"         = all modalities (default)
+        # "tabular_only" = zero-out text + image
+        # "no_text"      = zero-out text only
+        # "no_image"     = zero-out image only
+        self.ablation_mode = ablation_mode
+        
+        logger.info(f"Initializing MultimodalFusionNet (hidden_dim={self.hidden_dim}, ablation={self.ablation_mode})...")
         
         # 0. Learnable [FUSION] token (detector token for cross-modal fusion)
         # Shape: (1, 1, hidden_dim) -> expands to (batch, seq_len, hidden_dim) in forward
@@ -341,6 +348,15 @@ class MultimodalFusionNet(nn.Module):
         
         # Image embeddings: (batch, seq_len, 256) - already extracted offline
         image_features = batch["image_embedding"]  # (batch, seq_len, 256)
+        
+        # ==================== ABLATION: ZERO-OUT DISABLED MODALITIES ====================
+        if self.ablation_mode == "tabular_only":
+            text_features = torch.zeros_like(text_features)
+            image_features = torch.zeros_like(image_features)
+        elif self.ablation_mode == "no_text":
+            text_features = torch.zeros_like(text_features)
+        elif self.ablation_mode == "no_image":
+            image_features = torch.zeros_like(image_features)
         
         # ==================== CROSS-MODAL ATTENTION WITH [FUSION] TOKEN ====================
         # Stack [FUSION] token with 3 modalities: (batch, seq_len, 4, hidden_dim)

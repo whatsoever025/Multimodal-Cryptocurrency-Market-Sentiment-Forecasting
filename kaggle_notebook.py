@@ -111,10 +111,18 @@ else:
 
 
 # ============================================================
-# CELL 3 — Train (3 independent models: y_baseline / y_heuristic / y_pca)
+# CELL 3 — Train with Ablation Testing
 # ============================================================
+# Change ABLATION_MODE to test which modalities help/hurt:
+#   "tabular_only" = zero text + image (baseline — fastest diagnostic)
+#   "no_text"      = zero text, keep image + tabular
+#   "no_image"     = zero image, keep text + tabular
+#   "full"         = all modalities (default production mode)
+
+ABLATION_MODE = "tabular_only"   # ← START HERE to diagnose modality collapse
+
 print("\n" + "=" * 60)
-print("Starting training pipeline...")
+print(f"Training pipeline — ABLATION MODE: {ABLATION_MODE}")
 print("  Targets: y_baseline, y_heuristic, y_pca")
 print("  Walk-forward folds: 5")
 print("  Max epochs per fold: 60 (early stopping patience=7)")
@@ -124,12 +132,14 @@ result = subprocess.run([
     sys.executable, "-m", "src.training.train",
     "--features-dir", FEATURES_DIR,
     "--num-folds", "5",
+    "--ablation", ABLATION_MODE,
 ], capture_output=False)
 
 if result.returncode != 0:
     print("\n⚠ Training exited with non-zero code. Check logs above.")
 else:
-    print("\n✅ Training complete!")
+    print(f"\n✅ Training complete! (ablation={ABLATION_MODE})")
+
 
 
 # ============================================================

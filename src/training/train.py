@@ -796,6 +796,7 @@ def main(args):
     resume_training = getattr(args, 'resume', False)
     debug = getattr(args, 'debug', False)
     num_folds = getattr(args, 'num_folds', 5)
+    ablation_mode = getattr(args, 'ablation', 'full')
     # Setup
     setup_logging()
     logger.info("=" * 80)
@@ -835,6 +836,8 @@ def main(args):
     logger.info(f"Model: hidden_dim={config.model.hidden_dim}, frozen_backbones={config.model.frozen_backbones}")
     logger.info(f"Training: lr={config.training.learning_rate:.2e}, epochs={config.training.max_epochs}")
     logger.info(f"MLOps: wandb_run={config.mlops.wandb_run_name}")
+    if ablation_mode != "full":
+        logger.info(f"⚠ ABLATION MODE: {ablation_mode} — some modalities zeroed out")
     
     # Create dataloaders (walk-forward validation)
     logger.info("\n" + "-" * 80)
@@ -927,7 +930,7 @@ def main(args):
         )
 
         # Fresh model for this target
-        model = MultimodalFusionNet(config)
+        model = MultimodalFusionNet(config, ablation_mode=ablation_mode)
         logger.info(f"  Fresh model initialised for {target_name}")
 
         # W&B run per target
@@ -1244,6 +1247,10 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--debug", action="store_true", help="Debug mode (small dataset)")
     parser.add_argument("--num-folds", type=int, default=5, help="Number of walk-forward folds (default: 5)")
+    parser.add_argument("--ablation", type=str, default="full",
+                        choices=["full", "tabular_only", "no_text", "no_image"],
+                        help="Ablation mode: full (all modalities), tabular_only (zero text+image), "
+                             "no_text (zero text), no_image (zero image)")
     
     args = parser.parse_args()
     
