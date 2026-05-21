@@ -149,18 +149,21 @@ def load_dataset_multi_asset(debug: bool = False):
     """
     logger.info("Loading multi-asset v5 dataset (single split)...")
 
+    # Use /kaggle/working for cache on Kaggle (/tmp is small), else /tmp
+    _cache = "/kaggle/working/hf_cache" if Path("/kaggle/working").exists() else "/tmp/huggingface_cache"
+
     print("[PROGRESS] Downloading BTC dataset (v5, single split)...")
     btc_dataset = load_dataset(
         "khanh252004/multimodal_crypto_sentiment_btc",
         split="train",
-        cache_dir="/tmp/huggingface_cache",
+        cache_dir=_cache,
     )
 
     print("[PROGRESS] Downloading ETH dataset (v5, single split)...")
     eth_dataset = load_dataset(
         "khanh252004/multimodal_crypto_sentiment_eth",
         split="train",
-        cache_dir="/tmp/huggingface_cache",
+        cache_dir=_cache,
     )
 
     # Concatenate BTC + ETH
