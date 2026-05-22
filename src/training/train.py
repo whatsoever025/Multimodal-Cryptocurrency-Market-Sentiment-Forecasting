@@ -797,6 +797,7 @@ def main(args):
     debug = getattr(args, 'debug', False)
     num_folds = getattr(args, 'num_folds', 5)
     ablation_mode = getattr(args, 'ablation', 'full')
+    targets_filter = getattr(args, 'targets', None)  # e.g. ["y_baseline"] or None for all
     # Setup
     setup_logging()
     logger.info("=" * 80)
@@ -913,9 +914,17 @@ def main(args):
     logger.info(f"OUTER LOOP: Training {len(TARGET_NAMES)} independent models")
     logger.info("=" * 80)
 
+    # Filter targets if --targets specified
+    active_targets = TARGET_NAMES
+    if targets_filter:
+        active_targets = [t for t in TARGET_NAMES if t in targets_filter]
+        if not active_targets:
+            raise ValueError(f"No valid targets in {targets_filter}. Available: {TARGET_NAMES}")
+        logger.info(f"⚠ Training only selected targets: {active_targets}")
+
     all_target_results = {}   # {target_name: {fold_results, test_metrics}}
 
-    for target_idx, target_name in enumerate(TARGET_NAMES):
+    for target_idx, target_name in [(TARGET_NAMES.index(t), t) for t in active_targets]:
         logger.info("\n" + "#" * 80)
         logger.info(f"TARGET {target_idx+1}/{len(TARGET_NAMES)}: {target_name}")
         logger.info("#" * 80)
@@ -1251,6 +1260,10 @@ if __name__ == "__main__":
                         choices=["full", "tabular_only", "no_text", "no_image"],
                         help="Ablation mode: full (all modalities), tabular_only (zero text+image), "
                              "no_text (zero text), no_image (zero image)")
+    parser.add_argument("--targets", nargs="+", default=None,
+                        choices=["y_baseline", "y_heuristic", "y_pca"],
+                        help="Which targets to train (default: all 3). "
+                             "Example: --targets y_baseline")
     
     args = parser.parse_args()
     

@@ -274,10 +274,15 @@ class MultimodalFusionNet(nn.Module):
         nn.init.normal_(self.fusion_token, mean=0.0, std=0.02)
         logger.info("✓ [FUSION] token initialized (learnable 256D parameter, std=0.02)")
         
+        # Asset embedding (2 assets: BTC=0, ETH=1, 16 dimensions)
+        self.asset_embedding = nn.Embedding(2, 16)
+        logger.info("✓ Asset embedding initialized (2 → 16 dimensions)")
+        
         # 1. Tabular encoder (only trainable component with backbones)
+        # Input size: 7 tabular features + 16 asset embedding dimensions = 23
         self.tabular_encoder = TabularEncoder(
             hidden_dim=self.hidden_dim,
-            input_size=7,
+            input_size=7 + 16,
             dropout=config.model.encoder_dropout,
         )
         
@@ -338,9 +343,19 @@ class MultimodalFusionNet(nn.Module):
         # self.fusion_token: (1, 1, hidden_dim) -> (batch, seq_len, hidden_dim)
         fusion_token_expanded = self.fusion_token.expand(batch_size, seq_len, -1)
         
+        # ==================== PROCESS ASSET EMBEDDING ====================
+        # batch["asset_id"]: (batch,) -> we convert to float vector (batch, 16)
+        # then expand to (batch, seq_len, 16) to concat with tabular features
+        asset_ids = batch.get("asset_id", torch.zeros(batch_size, dtype=torch.long, device=batch["tabular"].device))
+        asset_emb = self.asset_embedding(asset_ids)  # (batch, 16)
+        asset_emb_expanded = asset_emb.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, 16)
+        
+        # Combine tabular and asset embedding
+        tabular_combined = torch.cat([batch["tabular"], asset_emb_expanded], dim=2)  # (batch, seq_len, 23)
+        
         # ==================== ENCODE TABULAR FEATURES ====================
-        # Tabular encoder: (batch, seq_len, 7) -> (batch, seq_len, hidden_dim)
-        tabular_features = self.tabular_encoder(batch["tabular"])
+        # Tabular encoder: (batch, seq_len, 23) -> (batch, seq_len, hidden_dim)
+        tabular_features = self.tabular_encoder(tabular_combined)
         
         # ==================== USE PRE-EXTRACTED EMBEDDINGS ====================
         # Text embeddings: (batch, seq_len, 256) - already extracted offline

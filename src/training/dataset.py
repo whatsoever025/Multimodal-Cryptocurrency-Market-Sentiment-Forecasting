@@ -462,6 +462,12 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
         "timestamp": torch.stack([sample["timestamp"] for sample in batch]),
     }
     
+    # Handle optional asset_id (fallback to 0 if not present)
+    if "asset_id" in batch[0]:
+        stacked["asset_id"] = torch.stack([sample["asset_id"] for sample in batch])
+    else:
+        stacked["asset_id"] = torch.zeros(len(batch), dtype=torch.long)
+        
     return stacked
 
 
@@ -593,6 +599,11 @@ class WalkForwardDataset(torch.utils.data.Dataset):
     Wraps the complete dataset and provides views for a specific train/val split.
     """
     
+class WalkForwardDataset(torch.utils.data.Dataset):
+    """
+    Walk-forward dataset supporting multi-asset panel data (BTC + ETH concatenated).
+    Ensures sliding windows never cross the boundary between assets.
+    """
     def __init__(
         self,
         text_embeddings: torch.Tensor,
@@ -600,53 +611,63 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         tabular_data: torch.Tensor,
         target_scores: torch.Tensor,
         timestamps: torch.Tensor,
-        data_slice: slice,
+        data_slice: slice,      # The slice of a SINGLE asset (e.g. 0 to 30000)
         seq_len: int = 24,
+        total_samples_per_asset: int = 44500,
     ):
-        """
-        Initialize walk-forward dataset for a specific slice.
-        
-        Args:
-            text_embeddings: Full tensor (total_samples, 256)
-            image_embeddings: Full tensor (total_samples, 256)
-            tabular_data: Full tensor (total_samples, 7) - already scaled
-            target_scores: Full tensor (total_samples,) - already scaled
-            timestamps: Full tensor (total_samples,)
-            data_slice: slice object (e.g., slice(0, 70000))
-            seq_len: Sliding window length
-        """
         self.seq_len = seq_len
+        self.total_samples_per_asset = total_samples_per_asset
         
-        # Slice data to specific fold
-        self.text_embeddings = text_embeddings[data_slice].contiguous()
-        self.image_embeddings = image_embeddings[data_slice].contiguous()
-        self.tabular_data = tabular_data[data_slice].contiguous()
-        self.target_scores = target_scores[data_slice].contiguous()
-        self.timestamps = timestamps[data_slice].contiguous()
+        # Save full data
+        self.text_full = text_embeddings
+        self.image_full = image_embeddings
+        self.tabular_full = tabular_data
+        self.target_full = target_scores
+        self.timestamps_full = timestamps
         
-        self.total_samples = self.text_embeddings.shape[0]
-        self.max_valid_idx = self.total_samples - seq_len
+        # We construct a list of valid starting indices for BTC and ETH separately
+        # to ensure no sliding window crosses the boundary at total_samples_per_asset.
+        start = data_slice.start if data_slice.start is not None else 0
+        stop = data_slice.stop if data_slice.stop is not None else total_samples_per_asset
         
-        if self.max_valid_idx <= 0:
-            raise ValueError(
-                f"Slice too small for seq_len={seq_len}. "
-                f"Got {self.total_samples}, need at least {seq_len + 1}"
-            )
-    
+        # Valid starts for BTC (within the slice)
+        btc_valid_starts = list(range(start, min(stop - seq_len + 1, total_samples_per_asset - seq_len + 1)))
+        
+        # Valid starts for ETH (shifted by total_samples_per_asset)
+        eth_valid_starts = list(range(
+            start + total_samples_per_asset, 
+            min(stop - seq_len + 1 + total_samples_per_asset, 2 * total_samples_per_asset - seq_len + 1)
+        ))
+        
+        # Combine valid start indices for both assets
+        self.valid_starts = btc_valid_starts + eth_valid_starts
+        
+        logger.info(
+            f"  Created WalkForwardDataset slice [{start}:{stop}] -> "
+            f"BTC starts: {len(btc_valid_starts)}, ETH starts: {len(eth_valid_starts)} (Total: {len(self.valid_starts)})"
+        )
+
     def __len__(self) -> int:
-        return self.max_valid_idx
-    
+        return len(self.valid_starts)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         if idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds for length {len(self)}")
+            
+        real_idx = self.valid_starts[idx]
+        
+        # Determine asset ID: 0 = BTC (real_idx < total_samples_per_asset), 1 = ETH (otherwise)
+        asset_id = 0 if real_idx < self.total_samples_per_asset else 1
         
         return {
-            "tabular": self.tabular_data[idx:idx + self.seq_len],
-            "text_embedding": self.text_embeddings[idx:idx + self.seq_len],
-            "image_embedding": self.image_embeddings[idx:idx + self.seq_len],
-            "target": self.target_scores[idx + self.seq_len],
-            "timestamp": self.timestamps[idx + self.seq_len],
+            "tabular": self.tabular_full[real_idx : real_idx + self.seq_len],
+            "text_embedding": self.text_full[real_idx : real_idx + self.seq_len],
+            "image_embedding": self.image_full[real_idx : real_idx + self.seq_len],
+            "target": self.target_full[real_idx + self.seq_len],
+            "timestamp": self.timestamps_full[real_idx + self.seq_len],
+            "asset_id": torch.tensor(asset_id, dtype=torch.long),
         }
+
 
 
 def create_walk_forward_dataloaders(
@@ -724,110 +745,90 @@ def create_walk_forward_dataloaders(
     logger.info(f"  text_embeddings: {text_embeddings.shape}")
     logger.info(f"  image_embeddings: {image_embeddings.shape}")
     logger.info(f"  tabular_data: {tabular_data.shape}")
-    logger.info(f"  target_scores: {target_scores.shape}")
+      # Split calculation is done per asset
+    total_samples_per_asset = total_samples // 2  # 44500
     
-    # Create scalers from TRAINING portion only (to prevent data leakage)
-    test_pct = 0.15  # holdout fraction; keep test data isolated
-    train_end_idx = int(total_samples * (1.0 - test_pct))
-    logger.info(f"\nFitting scalers on non-test data [0:{train_end_idx}] (test_pct={test_pct})...")
+    test_pct = 0.15  # holdout fraction
+    train_end_idx_per_asset = int(total_samples_per_asset * (1.0 - test_pct))  # 37825
     
-    from sklearn.preprocessing import StandardScaler, RobustScaler
+    logger.info(f"✓ Scalers fitted dynamically per asset (total_samples_per_asset={total_samples_per_asset})")
     
-    # Fit tabular scaler on training data only (StandardScaler: zero-mean, unit-variance)
-    tabular_scaler = StandardScaler()
-    tabular_scaler.fit(tabular_data[:train_end_idx].numpy())
-    logger.info(f"  Tabular scaler mean:  {tabular_scaler.mean_}")
-    logger.info(f"  Tabular scaler scale: {tabular_scaler.scale_}")
-    
-    # Fit target scaler on training data only.
-    # RobustScaler: uses median + IQR → robust to outliers in financial return distributions.
-    # CRITICAL: train.py's validate() calls target_scaler.inverse_transform() to report
-    # metrics in the original scale. Must be the same scaler type used here.
-    target_scaler = RobustScaler()
-    target_scaler.fit(target_scores[:train_end_idx].numpy())
-    logger.info(f"  Target scaler center (median): {target_scaler.center_}")
-    logger.info(f"  Target scaler scale (IQR):     {target_scaler.scale_}")
-    
-    logger.info(f"✓ Scalers fitted on training data [0:{train_end_idx}]")
-    
-    # Keep raw tensors for per-fold scaling inside the fold loop.
-    # Each fold will fit its own scaler on its training slice only → zero look-ahead leakage.
-    # (The global scalers above were only for logging reference statistics.)
     tabular_data_raw = tabular_data    # (N, 7)  raw float32
-    target_scores_raw = target_scores  # (N,)   raw float32
-    
-    # Create timestamps as long integers (sequential index, consistent with CryptoMultimodalDataset)
+    target_scores_raw = target_scores  # (N, 3)  raw float32
     timestamps = torch.arange(total_samples, dtype=torch.long)
-
     
-    # Calculate walk-forward splits on TRAIN + VAL data ONLY (exclude test)
-    # This ensures test data is completely isolated for final evaluation
-    data_len = train_end_idx  # ✓ Only non-test data; test holdout isolated
-    window_size = int(0.7 * data_len)  # 70% of (train + val)
-    step_size = int(0.15 * data_len) // num_folds  # 15% of (train + val) spread across folds
+    # Calculate walk-forward splits on the timeline of a SINGLE asset
+    data_len = train_end_idx_per_asset  # 37825
+    window_size = int(0.7 * data_len)   # 70%
+    step_size = int(0.15 * data_len) // num_folds
     
-    logger.info(f"\nWalk-Forward Configuration (excluding test data):")
-    logger.info(f"  Train + Val samples: {data_len} (test={total_samples - data_len} isolated)")
-    logger.info(f"  Initial train window: {window_size} ({window_size/data_len*100:.1f}%)")
-    logger.info(f"  Validation fold size: {step_size} ({step_size/data_len*100:.1f}%)")
+    logger.info(f"\nWalk-Forward Configuration (Simultaneous Dual-Asset):")
+    logger.info(f"  Asset Timeline Len: {data_len} (test={total_samples_per_asset - data_len} isolated)")
+    logger.info(f"  Initial train window: {window_size}")
+    logger.info(f"  Validation fold size: {step_size}")
     logger.info(f"  Number of folds: {num_folds}")
     
     # Generate folds
     fold_num = 0
     for train_slice, val_slice in walk_forward_split(data_len, window_size, step_size):
         fold_num += 1
-        
         if fold_num > num_folds:
             break
         
         logger.info(f"\n" + "-" * 80)
         logger.info(f"Creating Fold {fold_num}/{num_folds}")
-        logger.info(f"  Train: [{train_slice.start}:{train_slice.stop}] ({train_slice.stop - train_slice.start} samples)")
-        logger.info(f"  Val:   [{val_slice.start}:{val_slice.stop}] ({val_slice.stop - val_slice.start} samples)")
+        logger.info(f"  Train slice (relative): [{train_slice.start}:{train_slice.stop}]")
+        logger.info(f"  Val slice (relative):   [{val_slice.start}:{val_slice.stop}]")
         
-        # ========== PER-FOLD SCALER FITTING ==========
-        # Fit scalers ONLY on this fold's training slice → zero look-ahead leakage.
-        # Using a single global scaler (fitted on train_end_idx) would "leak" statistics
-        # from later folds' training data into earlier folds' scalers.
-        fold_tabular_scaler = StandardScaler()
-        fold_tabular_scaler.fit(tabular_data_raw[train_slice].numpy())
+        # ========== PER-FOLD SCALER FITTING (INDEPENDENT PER ASSET) ==========
+        # 1. Fit BTC scalers
+        btc_train_idx = slice(train_slice.start, train_slice.stop)
+        btc_scaler_tab = StandardScaler().fit(tabular_data_raw[btc_train_idx].numpy())
+        btc_scaler_tgt = RobustScaler().fit(target_scores_raw[btc_train_idx].numpy())
         
-        fold_target_scaler = RobustScaler()
-        fold_target_scaler.fit(target_scores_raw[train_slice].numpy())
+        # 2. Fit ETH scalers (offset by total_samples_per_asset)
+        eth_train_idx = slice(train_slice.start + total_samples_per_asset, train_slice.stop + total_samples_per_asset)
+        eth_scaler_tab = StandardScaler().fit(tabular_data_raw[eth_train_idx].numpy())
+        eth_scaler_tgt = RobustScaler().fit(target_scores_raw[eth_train_idx].numpy())
         
-        logger.info(f"  Scalers fitted on fold training slice [{train_slice.start}:{train_slice.stop}]")
+        # ========== APPLY SCALERS SEPARATELY TO PREVENT CROSS-CONTAMINATION ==========
+        # Prepare target arrays for transformation
+        tabular_scaled = tabular_data_raw.clone()
+        target_scaled = target_scores_raw.clone()
         
-        # Apply per-fold scalers to train+val region (safe: test is excluded from data_len)
-        fold_end = val_slice.stop  # last index needed for this fold
-        tabular_fold_scaled = torch.from_numpy(
-            fold_tabular_scaler.transform(tabular_data_raw[:fold_end].numpy())
-        ).float().contiguous()
-        target_fold_scaled = torch.from_numpy(
-            fold_target_scaler.transform(target_scores_raw[:fold_end].numpy())
-        ).float().contiguous()
+        # Transform BTC region
+        btc_full_idx = slice(0, total_samples_per_asset)
+        tabular_scaled[btc_full_idx] = torch.from_numpy(btc_scaler_tab.transform(tabular_data_raw[btc_full_idx].numpy())).float()
+        target_scaled[btc_full_idx] = torch.from_numpy(btc_scaler_tgt.transform(target_scores_raw[btc_full_idx].numpy())).float()
         
-        # Create datasets for this fold (use fold-scaled tensors)
+        # Transform ETH region
+        eth_full_idx = slice(total_samples_per_asset, 2 * total_samples_per_asset)
+        tabular_scaled[eth_full_idx] = torch.from_numpy(eth_scaler_tab.transform(tabular_data_raw[eth_full_idx].numpy())).float()
+        target_scaled[eth_full_idx] = torch.from_numpy(eth_scaler_tgt.transform(target_scores_raw[eth_full_idx].numpy())).float()
+        
+        # Create datasets for this fold (use scaled tensors)
         train_dataset = WalkForwardDataset(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
-            tabular_data=tabular_fold_scaled,
-            target_scores=target_fold_scaled,
-            timestamps=timestamps[:fold_end],
+            tabular_data=tabular_scaled,
+            target_scores=target_scaled,
+            timestamps=timestamps,
             data_slice=train_slice,
             seq_len=config.data.seq_len,
+            total_samples_per_asset=total_samples_per_asset,
         )
         
         val_dataset = WalkForwardDataset(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
-            tabular_data=tabular_fold_scaled,
-            target_scores=target_fold_scaled,
-            timestamps=timestamps[:fold_end],
+            tabular_data=tabular_scaled,
+            target_scores=target_scaled,
+            timestamps=timestamps,
             data_slice=val_slice,
             seq_len=config.data.seq_len,
+            total_samples_per_asset=total_samples_per_asset,
         )
         
-        logger.info(f"  ✓ Train dataset: {len(train_dataset)} sequences")
         logger.info(f"  ✓ Val dataset: {len(val_dataset)} sequences")
         
         # Create dataloaders
@@ -851,12 +852,11 @@ def create_walk_forward_dataloaders(
             drop_last=False,
         )
         
-        logger.info(f"  ✓ Train loader: {len(train_loader)} batches")
-        logger.info(f"  ✓ Val loader: {len(val_loader)} batches")
-        
+        # Keep BTC target scaler as the default for target inverse transformation in logs
         scalers_dict = {
-            "tabular_scaler": fold_tabular_scaler,
-            "target_scaler": fold_target_scaler,
+            "tabular_scaler": btc_scaler_tab,
+            "target_scaler": btc_scaler_tgt,
+            "eth_target_scaler": eth_scaler_tgt,  # Keep both in case we want to use them
         }
         
         yield fold_num, train_loader, val_loader, scalers_dict
