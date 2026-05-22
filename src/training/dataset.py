@@ -740,6 +740,21 @@ def create_walk_forward_dataloaders(
         map_location="cpu"
     )
     
+    # ========== TARGET ENGINEERING ADJUSTMENTS ==========
+    logger.info("Applying Target Engineering adjustments...")
+    
+    # 1. Scale y_baseline (index 0) by 1000.0 to prevent underflow / vanishing gradients
+    target_scores[:, 0] = target_scores[:, 0] * 1000.0
+    logger.info("  ✓ y_baseline scaled up by 1000.0")
+    
+    # 2. Clip y_heuristic (index 1) to [-5.0, 5.0] to handle high kurtosis outliers
+    target_scores[:, 1] = torch.clamp(target_scores[:, 1], min=-5.0, max=5.0)
+    logger.info("  ✓ y_heuristic clipped to [-5.0, 5.0]")
+    
+    # 3. y_pca (index 2) - Keep as is (analyzed as mostly noise)
+    logger.info("  ✓ y_pca loaded as-is")
+
+    
     total_samples = text_embeddings.shape[0]
     logger.info(f"\u2713 Embeddings loaded: {total_samples} samples")
     logger.info(f"  text_embeddings: {text_embeddings.shape}")
