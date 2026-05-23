@@ -603,6 +603,7 @@ class WalkForwardDataset(torch.utils.data.Dataset):
     """
     Walk-forward dataset supporting multi-asset panel data (BTC + ETH concatenated).
     Ensures sliding windows never cross the boundary between assets.
+    Predicts baseline target 8 hours ahead, and other targets 1 hour ahead.
     """
     def __init__(
         self,
@@ -625,25 +626,29 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         self.target_full = target_scores
         self.timestamps_full = timestamps
         
-        # We construct a list of valid starting indices for BTC and ETH separately
-        # to ensure no sliding window crosses the boundary at total_samples_per_asset.
+        # We construct a list of valid starting indices for BTC and ETH separately.
+        # Since we predict y_baseline at t+8, we must ensure the index real_idx + seq_len + 7
+        # is always within the asset boundaries. Thus we subtract 7 from the max index.
         start = data_slice.start if data_slice.start is not None else 0
         stop = data_slice.stop if data_slice.stop is not None else total_samples_per_asset
         
+        # Buffer of 7 steps to prevent index overflow on the 8h target
+        buffer = 7
+        
         # Valid starts for BTC (within the slice)
-        btc_valid_starts = list(range(start, min(stop - seq_len + 1, total_samples_per_asset - seq_len + 1)))
+        btc_valid_starts = list(range(start, min(stop - seq_len - buffer + 1, total_samples_per_asset - seq_len - buffer + 1)))
         
         # Valid starts for ETH (shifted by total_samples_per_asset)
         eth_valid_starts = list(range(
             start + total_samples_per_asset, 
-            min(stop - seq_len + 1 + total_samples_per_asset, 2 * total_samples_per_asset - seq_len + 1)
+            min(stop - seq_len - buffer + 1 + total_samples_per_asset, 2 * total_samples_per_asset - seq_len - buffer + 1)
         ))
         
         # Combine valid start indices for both assets
         self.valid_starts = btc_valid_starts + eth_valid_starts
         
         logger.info(
-            f"  Created WalkForwardDataset slice [{start}:{stop}] -> "
+            f"  Created 8h-shifted WalkForwardDataset slice [{start}:{stop}] -> "
             f"BTC starts: {len(btc_valid_starts)}, ETH starts: {len(eth_valid_starts)} (Total: {len(self.valid_starts)})"
         )
 
@@ -659,11 +664,21 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         # Determine asset ID: 0 = BTC (real_idx < total_samples_per_asset), 1 = ETH (otherwise)
         asset_id = 0 if real_idx < self.total_samples_per_asset else 1
         
+        # Target splitting:
+        # Col 0 (y_baseline) is target_raw_funding, predict at t+8 (real_idx + seq_len + 7)
+        target_baseline = self.target_full[real_idx + self.seq_len + 7, 0]
+        
+        # Col 1 (y_heuristic) and Col 2 (y_pca) remain at t+1 (real_idx + seq_len)
+        target_heuristic = self.target_full[real_idx + self.seq_len, 1]
+        target_pca = self.target_full[real_idx + self.seq_len, 2]
+        
+        target_vector = torch.stack([target_baseline, target_heuristic, target_pca])
+        
         return {
             "tabular": self.tabular_full[real_idx : real_idx + self.seq_len],
             "text_embedding": self.text_full[real_idx : real_idx + self.seq_len],
             "image_embedding": self.image_full[real_idx : real_idx + self.seq_len],
-            "target": self.target_full[real_idx + self.seq_len],
+            "target": target_vector,
             "timestamp": self.timestamps_full[real_idx + self.seq_len],
             "asset_id": torch.tensor(asset_id, dtype=torch.long),
         }

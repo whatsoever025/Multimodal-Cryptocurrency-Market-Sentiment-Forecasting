@@ -56,7 +56,7 @@ from .utils import setup_logging, format_duration
 logger = logging.getLogger(__name__)
 
 # v5 target columns — one independent model is trained per target
-TARGET_NAMES = ["y_baseline", "y_heuristic", "y_pca"]
+TARGET_NAMES = ["y_baseline", "y_heuristic"]
 
 
 def _reset_weights(module: nn.Module) -> None:
@@ -1261,8 +1261,8 @@ if __name__ == "__main__":
                         help="Ablation mode: full (all modalities), tabular_only (zero text+image), "
                              "no_text (zero text), no_image (zero image)")
     parser.add_argument("--targets", nargs="+", default=None,
-                        choices=["y_baseline", "y_heuristic", "y_pca"],
-                        help="Which targets to train (default: all 3). "
+                        choices=["y_baseline", "y_heuristic"],
+                        help="Which targets to train (default: all 2). "
                              "Example: --targets y_baseline")
     
     args = parser.parse_args()
