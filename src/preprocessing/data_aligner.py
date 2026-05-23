@@ -23,9 +23,9 @@ TARGET ENGINEERING (t vs t+1 — NO DATA LEAKAGE):
     target_delta_conflict -> delta_conflict shifted to t
 
   Final targets:
-    y_baseline  = target_delta_funding
-    y_heuristic = weighted sum of Z-scored target variables
-    y_pca       = PC1 of Z-scored target variables (sklearn PCA)
+    y_baseline       = target_delta_funding
+    y_heuristic      = weighted sum of Z-scored target variables
+    y_vol_adj_return = Volatility-Adjusted Log Return
 
 OUTPUT: Single DataFrame (no train/val/test split here).
 """
@@ -38,7 +38,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
@@ -81,9 +80,9 @@ class DataAligner:
       text_content, image_path
 
     Targets (3):
-      y_baseline  — raw delta_funding at t+1
-      y_heuristic — weighted Z-score composite at t+1
-      y_pca       — PCA(1) of Z-scored target variables at t+1
+      y_baseline       — raw delta_funding at t+1
+      y_heuristic      — weighted Z-score composite at t+1
+      y_vol_adj_return — Volatility-Adjusted Log Return at t+1
     """
 
     def __init__(
@@ -409,27 +408,39 @@ class DataAligner:
         )
 
         # ------------------------------------------------------------------
-        # TARGET 3: y_pca — first principal component of Z-scored variables
+        # TARGET 3: y_vol_adj_return — Volatility-Adjusted Log Return at t+1
         # ------------------------------------------------------------------
-        scaler_p = StandardScaler()
-        z_for_pca = scaler_p.fit_transform(target_df.values)  # shape (N, 4)
-
-        pca = PCA(n_components=1, random_state=42)
-        pc1 = pca.fit_transform(z_for_pca)          # shape (N, 1)
-        self.df["y_pca"] = pc1[:, 0]
-
-        explained = pca.explained_variance_ratio_[0] * 100
+        # Calculate hourly log returns: R_t = ln(Close_t / Close_{t-1})
+        log_ret = np.log(self.df["close"] / self.df["close"].shift(1))
+        log_ret_future = log_ret.shift(-1)  # R_{t+1}
+        
+        # Calculate historical volatility: std of log return over past 168 hours (7 days)
+        # ddof=1 for sample standard deviation
+        vol_168 = log_ret.rolling(window=168, min_periods=24).std(ddof=1)
+        # Fallback for NaNs at the beginning of the series
+        overall_std = log_ret.std()
+        vol_168 = vol_168.fillna(overall_std)
+        # Clamp to avoid division by zero
+        vol_168 = np.clip(vol_168.values, 1e-6, None)
+        
+        # Formula: Target_Score_{t+1} = R_{t+1} / (vol_t + 1e-6)
+        vol_adj_ret = log_ret_future.values / (vol_168 + 1e-6)
+        
+        self.df["y_vol_adj_return"] = vol_adj_ret
+        
+        # Clean any newly introduced NaN rows at the end of the series due to shift(-1)
+        self.df = self.df.dropna(subset=["y_vol_adj_return"]).copy()
+        
         logger.info(
-            f"  ✓ y_pca = PC1 of Z-scored target variables "
-            f"(explains {explained:.1f}% variance)"
+            "  ✓ y_vol_adj_return = log_ret(t+1) / (vol_168(t) + 1e-6) (raw un-clipped)"
         )
 
         logger.info(f"  → Final dataset shape: {self.df.shape}")
         logger.info(
             f"  Target ranges:\n"
-            f"    y_baseline  [{self.df['y_baseline'].min():.5f}, {self.df['y_baseline'].max():.5f}]\n"
-            f"    y_heuristic [{self.df['y_heuristic'].min():.4f}, {self.df['y_heuristic'].max():.4f}]\n"
-            f"    y_pca       [{self.df['y_pca'].min():.4f}, {self.df['y_pca'].max():.4f}]"
+            f"    y_baseline        [{self.df['y_baseline'].min():.5f}, {self.df['y_baseline'].max():.5f}]\n"
+            f"    y_heuristic       [{self.df['y_heuristic'].min():.4f}, {self.df['y_heuristic'].max():.4f}]\n"
+            f"    y_vol_adj_return  [{self.df['y_vol_adj_return'].min():.4f}, {self.df['y_vol_adj_return'].max():.4f}]"
         )
 
     # =========================================================================
@@ -446,7 +457,7 @@ class DataAligner:
                     gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
                     is_post_ETF
           MODAL:    text_content, image_path
-          TARGETS:  y_baseline, y_heuristic, y_pca
+          TARGETS:  y_baseline, y_heuristic, y_vol_adj_return
         """
         logger.info("=" * 70)
         logger.info("PHASE 5: Assembling final dataset")
@@ -467,7 +478,7 @@ class DataAligner:
             # Targets
             "y_baseline",
             "y_heuristic",
-            "y_pca",
+            "y_vol_adj_return",
         ]
 
         existing = [c for c in final_columns if c in self.df.columns]
@@ -490,7 +501,7 @@ class DataAligner:
         logger.info(f"    is_post_ETF : {df_out.iloc[0]['is_post_ETF']}")
         logger.info(f"    y_baseline  : {df_out.iloc[0]['y_baseline']:.6f}")
         logger.info(f"    y_heuristic : {df_out.iloc[0]['y_heuristic']:.4f}")
-        logger.info(f"    y_pca       : {df_out.iloc[0]['y_pca']:.4f}")
+        logger.info(f"    y_vol_adj_return: {df_out.iloc[0]['y_vol_adj_return']:.4f}")
 
         return df_out
 
@@ -548,14 +559,33 @@ class DataAligner:
             logger.warning(f"  Could not purge repo (may be new): {e}")
         # -----------------------------------------------------------------------
 
-        logger.info(f"Pushing {len(df)} rows to {repo_id} ...")
-        ds = Dataset.from_pandas(df)
+        # Temporal split: Train (85%) and Test (15%)
+        split_idx = int(len(df) * 0.85)
+        df_train = df.iloc[:split_idx].copy()
+        df_test = df.iloc[split_idx:].copy()
 
-        if "image_path" in ds.column_names:
-            ds = ds.cast_column("image_path", HFImage())
+        logger.info(
+            f"Splitting dataset: Train ({len(df_train)} rows, 85%) | "
+            f"Test ({len(df_test)} rows, 15%)"
+        )
+        logger.info(f"Pushing splits to {repo_id} ...")
+        
+        ds_train = Dataset.from_pandas(df_train)
+        ds_test = Dataset.from_pandas(df_test)
 
-        ds.push_to_hub(repo_id=repo_id, private=private, token=hf_token)
-        logger.info(f"  ✓ Dataset pushed → https://huggingface.co/datasets/{repo_id}")
+        if "image_path" in ds_train.column_names:
+            ds_train = ds_train.cast_column("image_path", HFImage())
+        if "image_path" in ds_test.column_names:
+            ds_test = ds_test.cast_column("image_path", HFImage())
+
+        from datasets import DatasetDict
+        ds_dict = DatasetDict({
+            "train": ds_train,
+            "test": ds_test
+        })
+
+        ds_dict.push_to_hub(repo_id=repo_id, private=private, token=hf_token)
+        logger.info(f"  ✓ DatasetDict pushed → https://huggingface.co/datasets/{repo_id}")
 
     # =========================================================================
     # MAIN ORCHESTRATION

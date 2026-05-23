@@ -34,7 +34,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
     - Text embeddings (256-dim, pre-extracted by FinBERT)
     - Image embeddings (256-dim, pre-extracted by Vision Transformer ViT)
     - Tabular features (7 columns, RAW - will be scaled)
-    - Target scores (RAW - will be scaled)
+    - Target scores (3 columns, RAW - will be scaled)
     
     All RAW data is loaded from Kaggle .pt files. NO HuggingFace dataset loading.
     Scaling is applied in-memory during initialization:
@@ -45,7 +45,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
     - text_embeddings: (total_samples, 256)
     - image_embeddings: (total_samples, 256)
     - tabular_features: (total_samples, 7) ← scaled by StandardScaler during init
-    - target_scores: (total_samples,) ← scaled by RobustScaler during init
+    - target_scores: (total_samples, 3) ← scaled by RobustScaler during init
     
     Example:
         dataset = CryptoMultimodalDataset(
@@ -57,7 +57,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
         # sample["tabular"]: (24, 7) ← scaled in-memory
         # sample["text_embedding"]: (24, 256)
         # sample["image_embedding"]: (24, 256)
-        # sample["target"]: scalar ← scaled in-memory
+        # sample["target"]: (3,) tensor ← scaled in-memory
     """
     
     def __init__(
@@ -337,7 +337,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
             logger.info(f"  Scaler mean: {tabular_scaler.mean_}")
             logger.info(f"  Scaler scale: {tabular_scaler.scale_}")
             
-            logger.info("Fitting RobustScaler on targets (N,3) [y_baseline,y_heuristic,y_pca]...")
+            logger.info("Fitting RobustScaler on targets (N,3) [y_baseline,y_heuristic,y_vol_adj_return]...")
             target_scaler = RobustScaler()
             target_np = target_raw.numpy()  # (N, 3)
             target_scaled_np = target_scaler.fit_transform(target_np)  # (N, 3)
@@ -418,7 +418,7 @@ class CryptoMultimodalDataset(torch.utils.data.Dataset):
                 - tabular: (seq_len, 7) float32 view ← ALREADY SCALED
                 - text_embedding: (seq_len, 256) float32 view
                 - image_embedding: (seq_len, 256) float32 view
-                - target: scalar float32 tensor ← ALREADY SCALED
+                - target: (3,) float32 tensor ← ALREADY SCALED
                 - timestamp: scalar int64 tensor
         
         Raises:
@@ -451,7 +451,7 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
             - tabular: (batch_size, seq_len, 7)
             - text_embedding: (batch_size, seq_len, 256)
             - image_embedding: (batch_size, seq_len, 256)
-             - target: (batch_size,)
+             - target: (batch_size, 3)
             - timestamp: (batch_size,)
     """
     stacked = {
@@ -594,13 +594,6 @@ def walk_forward_split(data_len: int, window_size: int, step_size: int):
 
 class WalkForwardDataset(torch.utils.data.Dataset):
     """
-    Walk-forward dataset that slices pre-loaded embeddings/features for a given fold.
-    
-    Wraps the complete dataset and provides views for a specific train/val split.
-    """
-    
-class WalkForwardDataset(torch.utils.data.Dataset):
-    """
     Walk-forward dataset supporting multi-asset panel data (BTC + ETH concatenated).
     Ensures sliding windows never cross the boundary between assets.
     Predicts baseline target 8 hours ahead, and other targets 1 hour ahead.
@@ -615,9 +608,15 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         data_slice: slice,      # The slice of a SINGLE asset (e.g. 0 to 30000)
         seq_len: int = 24,
         total_samples_per_asset: int = 44500,
+        btc_len: int = None,
+        eth_len: int = None,
     ):
         self.seq_len = seq_len
-        self.total_samples_per_asset = total_samples_per_asset
+        # Fallback to total_samples_per_asset if dynamic lengths are not provided
+        self.btc_len = btc_len if btc_len is not None else total_samples_per_asset
+        self.eth_len = eth_len if eth_len is not None else total_samples_per_asset
+        # Maintain total_samples_per_asset for asset ID mapping and compatibility
+        self.total_samples_per_asset = self.btc_len
         
         # Save full data
         self.text_full = text_embeddings
@@ -626,22 +625,19 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         self.target_full = target_scores
         self.timestamps_full = timestamps
         
-        # We construct a list of valid starting indices for BTC and ETH separately.
-        # Since we predict y_baseline at t+8, we must ensure the index real_idx + seq_len + 7
-        # is always within the asset boundaries. Thus we subtract 7 from the max index.
         start = data_slice.start if data_slice.start is not None else 0
-        stop = data_slice.stop if data_slice.stop is not None else total_samples_per_asset
+        stop = data_slice.stop if data_slice.stop is not None else self.btc_len
         
         # Buffer of 7 steps to prevent index overflow on the 8h target
         buffer = 7
         
         # Valid starts for BTC (within the slice)
-        btc_valid_starts = list(range(start, min(stop - seq_len - buffer + 1, total_samples_per_asset - seq_len - buffer + 1)))
+        btc_valid_starts = list(range(start, min(stop - seq_len - buffer + 1, self.btc_len - seq_len - buffer + 1)))
         
-        # Valid starts for ETH (shifted by total_samples_per_asset)
+        # Valid starts for ETH (shifted by btc_len)
         eth_valid_starts = list(range(
-            start + total_samples_per_asset, 
-            min(stop - seq_len - buffer + 1 + total_samples_per_asset, 2 * total_samples_per_asset - seq_len - buffer + 1)
+            start + self.btc_len, 
+            min(stop - seq_len - buffer + 1 + self.btc_len, self.btc_len + self.eth_len - seq_len - buffer + 1)
         ))
         
         # Combine valid start indices for both assets
@@ -668,11 +664,11 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         # Col 0 (y_baseline) is target_raw_funding, predict at t+8 (real_idx + seq_len + 7)
         target_baseline = self.target_full[real_idx + self.seq_len + 7, 0]
         
-        # Col 1 (y_heuristic) and Col 2 (y_pca) remain at t+1 (real_idx + seq_len)
+        # Col 1 (y_heuristic) and Col 2 (y_vol_adj_return) remain at t+1 (real_idx + seq_len)
         target_heuristic = self.target_full[real_idx + self.seq_len, 1]
-        target_pca = self.target_full[real_idx + self.seq_len, 2]
+        target_vol_adj_return = self.target_full[real_idx + self.seq_len, 2]
         
-        target_vector = torch.stack([target_baseline, target_heuristic, target_pca])
+        target_vector = torch.stack([target_baseline, target_heuristic, target_vol_adj_return])
         
         return {
             "tabular": self.tabular_full[real_idx : real_idx + self.seq_len],
@@ -716,45 +712,69 @@ def create_walk_forward_dataloaders(
     features_dir = Path(features_dir) if features_dir else Path("./data/features")
     
     logger.info("=" * 80)
-    logger.info("WALK-FORWARD VALIDATION: Loading embeddings")
+    logger.info("WALK-FORWARD VALIDATION: Loading dynamic asset features")
     logger.info("=" * 80)
     
-    # Load split metadata
-    metadata_path = features_dir / "split_metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(
-            f"Split metadata not found at {metadata_path}. "
-            "Make sure to extract full-sequence embeddings first."
-        )
+    # Check if subdirectory-based dynamic layout exists (BTC and ETH folders)
+    btc_subdir = features_dir / "BTC"
+    eth_subdir = features_dir / "ETH"
     
-    import json
-    with open(metadata_path) as f:
-        metadata = json.load(f)
-    
-    logger.info(f"✓ Split metadata loaded:")
-    logger.info(f"  Total samples: {metadata['total_samples']}")
-    
-    # Load full-sequence embeddings
-    print("[PROGRESS] Loading embeddings...")
-    sys.stdout.flush()
-    
-    text_embeddings = torch.load(
-        features_dir / "text_embeddings.pt",
-        map_location="cpu"
-    )
-    image_embeddings = torch.load(
-        features_dir / "image_embeddings.pt",
-        map_location="cpu"
-    )
-    tabular_data = torch.load(
-        features_dir / "tabular_features.pt",
-        map_location="cpu"
-    )
-    target_scores = torch.load(
-        features_dir / "target_scores.pt",
-        map_location="cpu"
-    )
-    
+    if btc_subdir.exists() and eth_subdir.exists():
+        logger.info("Detecting dynamic asset feature layout (separate BTC / ETH subdirectories)")
+        print("[PROGRESS] Loading separate BTC and ETH embeddings...")
+        sys.stdout.flush()
+        
+        # Load BTC
+        btc_text = torch.load(btc_subdir / "text_embeddings.pt", map_location="cpu")
+        btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
+        btc_tab = torch.load(btc_subdir / "tabular_features.pt", map_location="cpu")
+        btc_tgt = torch.load(btc_subdir / "target_scores.pt", map_location="cpu")
+        
+        # Load ETH
+        eth_text = torch.load(eth_subdir / "text_embeddings.pt", map_location="cpu")
+        eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
+        eth_tab = torch.load(eth_subdir / "tabular_features.pt", map_location="cpu")
+        eth_tgt = torch.load(eth_subdir / "target_scores.pt", map_location="cpu")
+        
+        btc_len = btc_text.shape[0]
+        eth_len = eth_text.shape[0]
+        logger.info(f"✓ Dynamic asset lengths read: BTC={btc_len} samples, ETH={eth_len} samples")
+        
+        # Concatenate on first dimension (sequence panel stack)
+        text_embeddings = torch.cat([btc_text, eth_text], dim=0)
+        image_embeddings = torch.cat([btc_image, eth_image], dim=0)
+        tabular_data = torch.cat([btc_tab, eth_tab], dim=0)
+        target_scores = torch.cat([btc_tgt, eth_tgt], dim=0)
+        
+        total_samples = text_embeddings.shape[0]
+    else:
+        # Backward compatibility mode
+        logger.info("Using legacy single-directory layout")
+        metadata_path = features_dir / "split_metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"Split metadata not found at {metadata_path}. "
+                "Make sure to extract full-sequence embeddings first."
+            )
+        
+        import json
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        
+        logger.info(f"✓ Split metadata loaded: total_samples={metadata['total_samples']}")
+        
+        print("[PROGRESS] Loading embeddings...")
+        sys.stdout.flush()
+        
+        text_embeddings = torch.load(features_dir / "text_embeddings.pt", map_location="cpu")
+        image_embeddings = torch.load(features_dir / "image_embeddings.pt", map_location="cpu")
+        tabular_data = torch.load(features_dir / "tabular_features.pt", map_location="cpu")
+        target_scores = torch.load(features_dir / "target_scores.pt", map_location="cpu")
+        
+        total_samples = text_embeddings.shape[0]
+        btc_len = total_samples // 2
+        eth_len = total_samples // 2
+
     # ========== TARGET ENGINEERING ADJUSTMENTS ==========
     logger.info("Applying Target Engineering adjustments...")
     
@@ -766,34 +786,31 @@ def create_walk_forward_dataloaders(
     target_scores[:, 1] = torch.clamp(target_scores[:, 1], min=-5.0, max=5.0)
     logger.info("  ✓ y_heuristic clipped to [-5.0, 5.0]")
     
-    # 3. y_pca (index 2) - Keep as is (analyzed as mostly noise)
-    logger.info("  ✓ y_pca loaded as-is")
+    # 3. y_vol_adj_return (index 2) - Keep raw un-clipped values
+    logger.info("  ✓ y_vol_adj_return loaded as raw un-clipped values")
 
-    
-    total_samples = text_embeddings.shape[0]
-    logger.info(f"\u2713 Embeddings loaded: {total_samples} samples")
+    logger.info(f"✓ Embeddings loaded: {total_samples} samples")
     logger.info(f"  text_embeddings: {text_embeddings.shape}")
     logger.info(f"  image_embeddings: {image_embeddings.shape}")
     logger.info(f"  tabular_data: {tabular_data.shape}")
-      # Split calculation is done per asset
-    total_samples_per_asset = total_samples // 2  # 44500
     
+    # Split calculation is done per asset timeline (using BTC length)
     test_pct = 0.15  # holdout fraction
-    train_end_idx_per_asset = int(total_samples_per_asset * (1.0 - test_pct))  # 37825
+    train_end_idx_per_asset = int(btc_len * (1.0 - test_pct))
     
-    logger.info(f"✓ Scalers fitted dynamically per asset (total_samples_per_asset={total_samples_per_asset})")
+    logger.info(f"✓ Scalers fitted dynamically per asset (btc_len={btc_len}, eth_len={eth_len})")
     
     tabular_data_raw = tabular_data    # (N, 7)  raw float32
     target_scores_raw = target_scores  # (N, 3)  raw float32
     timestamps = torch.arange(total_samples, dtype=torch.long)
     
-    # Calculate walk-forward splits on the timeline of a SINGLE asset
-    data_len = train_end_idx_per_asset  # 37825
+    # Calculate walk-forward splits on the timeline of a SINGLE asset (using BTC as anchor)
+    data_len = train_end_idx_per_asset
     window_size = int(0.7 * data_len)   # 70%
     step_size = int(0.15 * data_len) // num_folds
     
     logger.info(f"\nWalk-Forward Configuration (Simultaneous Dual-Asset):")
-    logger.info(f"  Asset Timeline Len: {data_len} (test={total_samples_per_asset - data_len} isolated)")
+    logger.info(f"  Asset Timeline Len: {data_len} (test={btc_len - data_len} isolated)")
     logger.info(f"  Initial train window: {window_size}")
     logger.info(f"  Validation fold size: {step_size}")
     logger.info(f"  Number of folds: {num_folds}")
@@ -816,8 +833,8 @@ def create_walk_forward_dataloaders(
         btc_scaler_tab = StandardScaler().fit(tabular_data_raw[btc_train_idx].numpy())
         btc_scaler_tgt = RobustScaler().fit(target_scores_raw[btc_train_idx].numpy())
         
-        # 2. Fit ETH scalers (offset by total_samples_per_asset)
-        eth_train_idx = slice(train_slice.start + total_samples_per_asset, train_slice.stop + total_samples_per_asset)
+        # 2. Fit ETH scalers (offset by btc_len)
+        eth_train_idx = slice(train_slice.start + btc_len, train_slice.stop + btc_len)
         eth_scaler_tab = StandardScaler().fit(tabular_data_raw[eth_train_idx].numpy())
         eth_scaler_tgt = RobustScaler().fit(target_scores_raw[eth_train_idx].numpy())
         
@@ -827,12 +844,12 @@ def create_walk_forward_dataloaders(
         target_scaled = target_scores_raw.clone()
         
         # Transform BTC region
-        btc_full_idx = slice(0, total_samples_per_asset)
+        btc_full_idx = slice(0, btc_len)
         tabular_scaled[btc_full_idx] = torch.from_numpy(btc_scaler_tab.transform(tabular_data_raw[btc_full_idx].numpy())).float()
         target_scaled[btc_full_idx] = torch.from_numpy(btc_scaler_tgt.transform(target_scores_raw[btc_full_idx].numpy())).float()
         
         # Transform ETH region
-        eth_full_idx = slice(total_samples_per_asset, 2 * total_samples_per_asset)
+        eth_full_idx = slice(btc_len, btc_len + eth_len)
         tabular_scaled[eth_full_idx] = torch.from_numpy(eth_scaler_tab.transform(tabular_data_raw[eth_full_idx].numpy())).float()
         target_scaled[eth_full_idx] = torch.from_numpy(eth_scaler_tgt.transform(target_scores_raw[eth_full_idx].numpy())).float()
         
@@ -845,7 +862,8 @@ def create_walk_forward_dataloaders(
             timestamps=timestamps,
             data_slice=train_slice,
             seq_len=config.data.seq_len,
-            total_samples_per_asset=total_samples_per_asset,
+            btc_len=btc_len,
+            eth_len=eth_len,
         )
         
         val_dataset = WalkForwardDataset(
@@ -856,7 +874,8 @@ def create_walk_forward_dataloaders(
             timestamps=timestamps,
             data_slice=val_slice,
             seq_len=config.data.seq_len,
-            total_samples_per_asset=total_samples_per_asset,
+            btc_len=btc_len,
+            eth_len=eth_len,
         )
         
         logger.info(f"  ✓ Val dataset: {len(val_dataset)} sequences")

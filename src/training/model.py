@@ -21,10 +21,10 @@ Architecture (Offline Feature Extraction):
 5. Temporal LSTM:
    - Captures temporal dynamics across seq_len timesteps
    - Input/Hidden: 256D (from [FUSION] token)
-   - 2 layers with dropout
+   - 1 layer with dropout
 
 6. Prediction Head:
-   - MLP reducing to single continuous output (-100 to +100)
+   - MLP reducing to scaled single continuous output
    - Input: 256D (from LSTM final hidden state)
 
 Innovation: Learnable [FUSION] token replaces mean pooling for better fusion.
@@ -32,7 +32,7 @@ Innovation: Learnable [FUSION] token replaces mean pooling for better fusion.
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
+from typing import Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -199,7 +199,7 @@ class PredictionHead(nn.Module):
     Simplified MLP prediction head for continuous sentiment score.
     
     Input: (batch, lstm_hidden_dim=64)
-    Output: (batch, 1) - continuous score in range [-100, 100]
+    Output: (batch, 1) - scaled continuous score
     """
     
     def __init__(self, input_dim: int = 64, dropout: float = 0.4):
@@ -446,7 +446,7 @@ if __name__ == "__main__":
         model.eval()
         with torch.no_grad():
             output = model(batch)
-        print(f"   ✓ Output shape: {output.shape} (expected: (4, 1))")
+        print(f"   ✓ Output shape: {output.shape} (expected: (4,))")
         print(f"   ✓ Output values: min={output.min():.4f}, max={output.max():.4f}")
         
         print("\n" + "=" * 80)

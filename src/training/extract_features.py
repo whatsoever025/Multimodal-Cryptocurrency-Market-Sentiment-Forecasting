@@ -5,7 +5,7 @@ Extracts embeddings from frozen FinBERT and Vision Transformer (ViT) once, saves
 Eliminates per-batch backbone computations and I/O overhead during training.
 
 Usage:
-    python src/data/extract_features.py --asset MULTI --output_dir /path/to/features
+    python src/training/extract_features.py --asset MULTI --output_dir /path/to/features
 """
 
 import os
@@ -134,46 +134,36 @@ class FrozenImageEncoder(nn.Module):
         return self.dropout(projected)
 
 
-def load_dataset_multi_asset(debug: bool = False):
+def load_asset_dataset(asset: str, debug: bool = False):
     """
-    Load multi-asset dataset (BTC + ETH concatenated).
-
-    v5 datasets have a SINGLE flat split ('train') — no train/val/test on HF Hub.
-    Walk-forward splits are created from this full sequence during training.
+    Load a single asset dataset (BTC or ETH), concatenating train and test splits
+    to reconstruct the full chronological sequence for walk-forward validation.
 
     Args:
+        asset: "BTC" or "ETH"
         debug: If True, load only 100 samples for testing
 
     Returns:
-        Concatenated HF Dataset (BTC + ETH, full sequence)
+        Concatenated HF Dataset (full sequence)
     """
-    logger.info("Loading multi-asset v5 dataset (single split)...")
+    logger.info(f"Loading {asset} v5 dataset splits (train + test)...")
 
     # Use /kaggle/working for cache on Kaggle (/tmp is small), else /tmp
     _cache = "/kaggle/working/hf_cache" if Path("/kaggle/working").exists() else "/tmp/huggingface_cache"
+    repo_name = f"khanh252004/multimodal_crypto_sentiment_{asset.lower()}"
 
-    print("[PROGRESS] Downloading BTC dataset (v5, single split)...")
-    btc_dataset = load_dataset(
-        "khanh252004/multimodal_crypto_sentiment_btc",
-        split="train",
-        cache_dir=_cache,
-    )
+    print(f"[PROGRESS] Downloading {asset} dataset from Hugging Face ({repo_name})...")
+    ds_dict = load_dataset(repo_name, cache_dir=_cache)
 
-    print("[PROGRESS] Downloading ETH dataset (v5, single split)...")
-    eth_dataset = load_dataset(
-        "khanh252004/multimodal_crypto_sentiment_eth",
-        split="train",
-        cache_dir=_cache,
-    )
-
-    # Concatenate BTC + ETH
-    dataset = concatenate_datasets([btc_dataset, eth_dataset])
+    # Concatenate train and test splits to preserve full chronological sequence
+    dataset = concatenate_datasets([ds_dict["train"], ds_dict["test"]])
 
     if debug:
         dataset = dataset.select(range(min(100, len(dataset))))
 
-    logger.info(f"Loaded {len(dataset)} samples (BTC + ETH, v5)")
+    logger.info(f"Loaded {len(dataset)} samples for {asset} (train={len(ds_dict['train'])}, test={len(ds_dict['test'])})")
     return dataset
+
 
 
 def extract_text_embeddings(
@@ -319,153 +309,141 @@ def extract_image_embeddings(
 
 def main(args):
     """
-    Main extraction script — v5 single-split full sequence.
-
-    Responsibility: extract embeddings from the FULL chronological sequence
-    and write them to disk as contiguous .pt tensors.
-
-    This script intentionally does NOT set any split boundaries.
-    Walk-forward window sizes and holdout test fractions are determined
-    at training time by train.py (e.g. --test-pct 0.15 --num-folds 5).
-
-    Args:
-        args: Parsed command-line arguments
+    Main extraction script — v5 full sequence.
+    Extracts embeddings for each specified asset and saves them to asset-specific subdirectories.
     """
     setup_logging()
     logger.info("=" * 80)
     logger.info("Offline Feature Extraction Pipeline - v5 FULL SEQUENCE")
     logger.info("=" * 80)
 
-    # Ensure output directory exists
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Output directory: {output_dir}")
-
     # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Device: {device}")
+
+    # Determine assets to process
+    if args.asset == "MULTI":
+        assets_to_process = ["BTC", "ETH"]
+    else:
+        assets_to_process = [args.asset]
 
     # Initialize encoders
     text_encoder = FrozenTextEncoder(hidden_dim=256)
     image_encoder = FrozenImageEncoder(hidden_dim=256)
 
-    # Load full v5 dataset (single HF split, BTC + ETH concatenated)
-    logger.info("\n" + "-" * 80)
-    logger.info("Loading v5 dataset (single flat split)...")
-    logger.info("-" * 80)
+    base_output_dir = Path(args.output_dir)
 
-    full_dataset = load_dataset_multi_asset(debug=args.debug)
-    total_samples = len(full_dataset)
-    logger.info(f"✓ Full sequence: {total_samples} samples")
+    for asset in assets_to_process:
+        logger.info("\n" + "=" * 80)
+        logger.info(f"PROCESSING ASSET: {asset}")
+        logger.info("=" * 80)
 
-    # Save ONLY total_samples. Walk-forward folds and the holdout test
-    # fraction are decided in train.py, not here.
-    import json
-    metadata = {"total_samples": total_samples}
-    metadata_path = output_dir / "split_metadata.json"
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    logger.info(f"\n✓ Metadata saved: {metadata_path}  (total_samples={total_samples})")
-    
-    # Extract features from FULL sequence
-    logger.info("\n" + "-" * 80)
-    logger.info("Extracting embeddings from full sequence...")
-    logger.info("-" * 80)
-    
-    # Text embeddings
-    text_output_path = output_dir / "text_embeddings.pt"
-    if text_output_path.exists() and not args.force:
-        logger.info(f"✓ Text embeddings already exist: {text_output_path}")
-        print(f"[PROGRESS] Skipping text extraction (file exists)")
-    else:
-        start_time = time.time()
-        extract_text_embeddings(
-            full_dataset,
-            text_encoder,
-            text_output_path,
-            batch_size=32,
-            device=device,
-        )
-        elapsed = time.time() - start_time
-        logger.info(f"Text extraction took {format_duration(elapsed)}")
-        print(f"[PROGRESS] Text extraction complete ({format_duration(elapsed)})")
-    
-    # Image embeddings
-    image_output_path = output_dir / "image_embeddings.pt"
-    if image_output_path.exists() and not args.force:
-        logger.info(f"✓ Image embeddings already exist: {image_output_path}")
-        print(f"[PROGRESS] Skipping image extraction (file exists)")
-    else:
-        start_time = time.time()
-        extract_image_embeddings(
-            full_dataset,
-            image_encoder,
-            image_output_path,
-            batch_size=32,
-            device=device,
-        )
-        elapsed = time.time() - start_time
-        logger.info(f"Image extraction took {format_duration(elapsed)}")
-        print(f"[PROGRESS] Image extraction complete ({format_duration(elapsed)})")
-    
-    # Tabular features (raw, no scaling)
-    tabular_output_path = output_dir / "tabular_features.pt"
-    if tabular_output_path.exists() and not args.force:
-        logger.info(f"✓ Tabular features already exist: {tabular_output_path}")
-        print(f"[PROGRESS] Skipping tabular extraction (file exists)")
-    else:
-        start_time = time.time()
-        extract_tabular_features_sequence(
-            full_dataset,
-            tabular_output_path,
-        )
-        elapsed = time.time() - start_time
-        logger.info(f"Tabular extraction took {format_duration(elapsed)}")
-        print(f"[PROGRESS] Tabular extraction complete ({format_duration(elapsed)})")
-    
-    # Target scores (raw, no scaling)
-    target_output_path = output_dir / "target_scores.pt"
-    if target_output_path.exists() and not args.force:
-        logger.info(f"✓ Target scores already exist: {target_output_path}")
-        print(f"[PROGRESS] Skipping target extraction (file exists)")
-    else:
-        start_time = time.time()
-        extract_target_scores_sequence(
-            full_dataset,
-            target_output_path,
-        )
-        elapsed = time.time() - start_time
-        logger.info(f"Target extraction took {format_duration(elapsed)}")
-        print(f"[PROGRESS] Target extraction complete ({format_duration(elapsed)})")
-    
-    sys.stdout.flush()
-    
-    # Verify all files
-    logger.info("\n" + "-" * 80)
-    logger.info("Extraction Complete!")
-    logger.info("-" * 80)
-    
-    text_path = output_dir / "text_embeddings.pt"
-    image_path = output_dir / "image_embeddings.pt"
-    tabular_path = output_dir / "tabular_features.pt"
-    target_path = output_dir / "target_scores.pt"
-    
-    if (text_path.exists() and image_path.exists() and 
-        tabular_path.exists() and target_path.exists()):
-        text_shape = torch.load(text_path, map_location="cpu").shape
-        image_shape = torch.load(image_path, map_location="cpu").shape
-        tabular_shape = torch.load(tabular_path, map_location="cpu").shape
-        target_shape = torch.load(target_path, map_location="cpu").shape
-        logger.info(f"✓ Extraction complete:")
-        logger.info(f"  text_embeddings: {text_shape}")
-        logger.info(f"  image_embeddings: {image_shape}")
-        logger.info(f"  tabular_features: {tabular_shape}")
-        logger.info(f"  target_scores: {target_shape}")
-        print(f"[PROGRESS] ✓ All embeddings extracted: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
-    else:
-        logger.warning(f"✗ Missing files")
-        print(f"[PROGRESS] ✗ Missing files")
-    
+        # Create asset-specific output directory
+        asset_output_dir = base_output_dir / asset
+        asset_output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Asset output directory: {asset_output_dir}")
+
+        # Load full sequence for the asset (concatenating train + test splits)
+        full_dataset = load_asset_dataset(asset, debug=args.debug)
+        total_samples = len(full_dataset)
+        logger.info(f"✓ {asset} sequence length: {total_samples} samples")
+
+        # Save metadata containing total_samples for this asset
+        import json
+        metadata = {"total_samples": total_samples}
+        metadata_path = asset_output_dir / "split_metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        logger.info(f"✓ Metadata saved: {metadata_path} (total_samples={total_samples})")
+
+        # Text embeddings
+        text_output_path = asset_output_dir / "text_embeddings.pt"
+        if text_output_path.exists() and not args.force:
+            logger.info(f"✓ Text embeddings already exist for {asset}: {text_output_path}")
+            print(f"[PROGRESS] ({asset}) Skipping text extraction (file exists)")
+        else:
+            start_time = time.time()
+            extract_text_embeddings(
+                full_dataset,
+                text_encoder,
+                text_output_path,
+                batch_size=32,
+                device=device,
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"{asset} text extraction took {format_duration(elapsed)}")
+            print(f"[PROGRESS] ({asset}) Text extraction complete ({format_duration(elapsed)})")
+
+        # Image embeddings
+        image_output_path = asset_output_dir / "image_embeddings.pt"
+        if image_output_path.exists() and not args.force:
+            logger.info(f"✓ Image embeddings already exist for {asset}: {image_output_path}")
+            print(f"[PROGRESS] ({asset}) Skipping image extraction (file exists)")
+        else:
+            start_time = time.time()
+            extract_image_embeddings(
+                full_dataset,
+                image_encoder,
+                image_output_path,
+                batch_size=32,
+                device=device,
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"{asset} image extraction took {format_duration(elapsed)}")
+            print(f"[PROGRESS] ({asset}) Image extraction complete ({format_duration(elapsed)})")
+
+        # Tabular features (raw, no scaling)
+        tabular_output_path = asset_output_dir / "tabular_features.pt"
+        if tabular_output_path.exists() and not args.force:
+            logger.info(f"✓ Tabular features already exist for {asset}: {tabular_output_path}")
+            print(f"[PROGRESS] ({asset}) Skipping tabular extraction (file exists)")
+        else:
+            start_time = time.time()
+            extract_tabular_features_sequence(
+                full_dataset,
+                tabular_output_path,
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"{asset} tabular extraction took {format_duration(elapsed)}")
+            print(f"[PROGRESS] ({asset}) Tabular extraction complete ({format_duration(elapsed)})")
+
+        # Target scores (raw, no scaling)
+        target_output_path = asset_output_dir / "target_scores.pt"
+        if target_output_path.exists() and not args.force:
+            logger.info(f"✓ Target scores already exist for {asset}: {target_output_path}")
+            print(f"[PROGRESS] ({asset}) Skipping target extraction (file exists)")
+        else:
+            start_time = time.time()
+            extract_target_scores_sequence(
+                full_dataset,
+                target_output_path,
+            )
+            elapsed = time.time() - start_time
+            logger.info(f"{asset} target extraction took {format_duration(elapsed)}")
+            print(f"[PROGRESS] ({asset}) Target extraction complete ({format_duration(elapsed)})")
+
+        # Verify files for this asset
+        text_path = asset_output_dir / "text_embeddings.pt"
+        image_path = asset_output_dir / "image_embeddings.pt"
+        tabular_path = asset_output_dir / "tabular_features.pt"
+        target_path = asset_output_dir / "target_scores.pt"
+
+        if (text_path.exists() and image_path.exists() and 
+            tabular_path.exists() and target_path.exists()):
+            text_shape = torch.load(text_path, map_location="cpu").shape
+            image_shape = torch.load(image_path, map_location="cpu").shape
+            tabular_shape = torch.load(tabular_path, map_location="cpu").shape
+            target_shape = torch.load(target_path, map_location="cpu").shape
+            logger.info(f"✓ {asset} Verification:")
+            logger.info(f"  text_embeddings: {text_shape}")
+            logger.info(f"  image_embeddings: {image_shape}")
+            logger.info(f"  tabular_features: {tabular_shape}")
+            logger.info(f"  target_scores: {target_shape}")
+            print(f"[PROGRESS] ✓ {asset} features ready: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
+        else:
+            logger.warning(f"✗ {asset} features missing files!")
+            print(f"[PROGRESS] ✗ {asset} features missing files!")
+
     print("[PROGRESS] ✓ Feature extraction pipeline complete!")
     sys.stdout.flush()
 
@@ -476,7 +454,7 @@ def extract_target_scores(
 ) -> None:
     """
     [LEGACY - kept for backward compatibility]
-    Extract RAW target_score (no scaling). Save to disk.
+    Extract RAW v5 targets (y_baseline, y_heuristic, y_vol_adj_return). Save to disk.
     """
     extract_target_scores_sequence(dataset, output_path)
 
@@ -489,22 +467,22 @@ def extract_target_scores_sequence(
     Extract RAW v5 targets (no scaling). Scaling done during training.
 
     v5 has THREE targets instead of the old single `target_score`:
-      - y_baseline  : raw funding_rate at t+1
-      - y_heuristic : weighted Z-score composite
-      - y_pca       : PC1 of Z-scored target variables
+      - y_baseline       : raw funding_rate at t+1
+      - y_heuristic      : weighted Z-score composite
+      - y_vol_adj_return : Volatility-Adjusted Log Return
 
     Saves as (N, 3) float32 tensor.
-    Column order: [y_baseline, y_heuristic, y_pca]
+    Column order: [y_baseline, y_heuristic, y_vol_adj_return]
 
     Args:
-        dataset: HuggingFace Dataset with y_baseline/y_heuristic/y_pca columns
+        dataset: HuggingFace Dataset with y_baseline/y_heuristic/y_vol_adj_return columns
         output_path: Path to save raw target tensor
     """
     logger.info(f"Extracting v5 targets ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting v5 targets (y_baseline, y_heuristic, y_pca) RAW...")
+    print("[PROGRESS] Extracting v5 targets (y_baseline, y_heuristic, y_vol_adj_return) RAW...")
     sys.stdout.flush()
 
-    target_cols = ["y_baseline", "y_heuristic", "y_pca"]
+    target_cols = ["y_baseline", "y_heuristic", "y_vol_adj_return"]
     targets = []
     for col in target_cols:
         arr = np.array(dataset[col], dtype=np.float32)
@@ -820,9 +798,14 @@ if __name__ == "__main__":
             print("[ERROR] --hf-repo-id required when --push-to-hf is set")
             sys.exit(1)
         
-        output_dir = Path(args.output_dir)
+        # If single asset, upload from the asset subdirectory. If MULTI, upload parent directory.
+        if args.asset == "MULTI":
+            upload_dir = Path(args.output_dir)
+        else:
+            upload_dir = Path(args.output_dir) / args.asset
+            
         push_features_to_hf(
-            output_dir=output_dir,
+            output_dir=upload_dir,
             repo_id=args.hf_repo_id,
             token=args.token,
             private=args.private,
@@ -834,7 +817,11 @@ if __name__ == "__main__":
             print("[ERROR] --kaggle-dataset-name required when --push-to-kaggle is set")
             sys.exit(1)
         
-        output_dir = Path(args.output_dir)
+        # If single asset, prepare metadata in the asset subdirectory. If MULTI, in parent.
+        if args.asset == "MULTI":
+            upload_dir = Path(args.output_dir)
+        else:
+            upload_dir = Path(args.output_dir) / args.asset
         
         # Get Kaggle credentials
         kaggle_username = args.kaggle_username
@@ -855,7 +842,7 @@ if __name__ == "__main__":
             sys.exit(1)
         
         push_features_to_kaggle(
-            output_dir=output_dir,
+            output_dir=upload_dir,
             dataset_name=args.kaggle_dataset_name,
             kaggle_username=kaggle_username,
             kaggle_key=kaggle_key,

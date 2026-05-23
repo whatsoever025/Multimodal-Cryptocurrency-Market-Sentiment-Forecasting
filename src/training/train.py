@@ -56,7 +56,7 @@ from .utils import setup_logging, format_duration
 logger = logging.getLogger(__name__)
 
 # v5 target columns — one independent model is trained per target
-TARGET_NAMES = ["y_baseline", "y_heuristic"]
+TARGET_NAMES = ["y_baseline", "y_heuristic", "y_vol_adj_return"]
 
 
 def _reset_weights(module: nn.Module) -> None:
@@ -91,6 +91,10 @@ def _reset_weights(module: nn.Module) -> None:
     elif isinstance(module, nn.LayerNorm):
         nn.init.ones_(module.weight)
         nn.init.zeros_(module.bias)
+    
+    # Reset learnable [FUSION] token if present on the module
+    if hasattr(module, "fusion_token") and isinstance(module.fusion_token, nn.Parameter):
+        nn.init.normal_(module.fusion_token, mean=0.0, std=0.02)
 
 def check_for_nan(loss: torch.Tensor, batch_idx: int, predictions: torch.Tensor, targets: torch.Tensor) -> bool:
     """
@@ -421,7 +425,7 @@ class Trainer:
             train_loader: Training DataLoader
         
         Returns:
-            Dict with keys: 'loss', 'mse', 'mae', 'rmse', 'r2', 'correlation',
+            Dict with keys: 'loss', 'mse', 'mae', 'rmse', 'r2', 'r2_oos', 'correlation',
                           'prediction_error_mean', 'prediction_error_std',
                           'predictions', 'targets'
         """
@@ -626,9 +630,10 @@ class Trainer:
             val_loader: Validation DataLoader
         
         Returns:
-            Dict with keys: 'mse', 'mae', 'rmse', 'r2', 'correlation', 
+            Dict with keys: 'mse', 'mae', 'rmse', 'r2', 'r2_oos', 'correlation', 
                           'prediction_error_mean', 'prediction_error_std',
-                          'predictions', 'targets', 'is_denormalized'
+                          'predictions', 'targets', 'is_denormalized',
+                          'normalized_huber', 'normalized_mae'
         """
         self.model.eval()
         total_huber = 0.0  # Accumulates HuberLoss (NOT MSE) — used for val_losses tracking
@@ -908,7 +913,7 @@ def main(args):
     sys.stdout.flush()
     
     # ==================== PER-TARGET TRAINING LOOP ====================
-    # v5: 3 independent models, one per target (y_baseline, y_heuristic, y_pca).
+    # v5: 3 independent models, one per target (y_baseline, y_heuristic, y_vol_adj_return).
     # Each model is re-initialised from scratch so there is zero cross-target leakage.
     logger.info("=" * 80)
     logger.info(f"OUTER LOOP: Training {len(TARGET_NAMES)} independent models")
@@ -1261,8 +1266,8 @@ if __name__ == "__main__":
                         help="Ablation mode: full (all modalities), tabular_only (zero text+image), "
                              "no_text (zero text), no_image (zero image)")
     parser.add_argument("--targets", nargs="+", default=None,
-                        choices=["y_baseline", "y_heuristic"],
-                        help="Which targets to train (default: all 2). "
+                        choices=["y_baseline", "y_heuristic", "y_vol_adj_return"],
+                        help="Which targets to train (default: all 3). "
                              "Example: --targets y_baseline")
     
     args = parser.parse_args()
