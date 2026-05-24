@@ -1114,12 +1114,15 @@ def main(args):
             # On resume, start_epoch > 0 for the FIRST fold of FIRST target only.
             fold_start = start_epoch if (target_idx == 0 and fold_num == 1) else 0
             start_epoch = 0  # Reset so subsequent folds/targets always start at 0
+            
+            final_train_metrics = None  # Track final train metrics for fold summary
 
             for epoch in range(fold_start, config.training.max_epochs):
                 trainer.epoch = epoch
 
                 # Train epoch
                 train_metrics = trainer.train_epoch(train_loader, target_idx=target_idx)
+                final_train_metrics = train_metrics  # Store for fold summary
                 train_loss = train_metrics["loss"]
 
                 logger.info(
@@ -1128,18 +1131,20 @@ def main(args):
                     f"Train R² {train_metrics['r2']:.6f}"
                 )
                 
-                # Log train metrics to W&B
+                # Log train metrics to W&B (committed immediately)
                 if wandb is not None and wandb.run is not None:
                     train_log_dict = {
                         "train_loss": train_loss,
                         "train_r2": train_metrics["r2"],
+                        "train_r2_oos": train_metrics["r2_oos"],
                         "train_rmse": train_metrics["rmse"],
                         "train_mae": train_metrics["mae"],
+                        "train_correlation": train_metrics["correlation"],
                         "train_avg_gradient_norm": train_metrics["avg_gradient_norm"],
                         "train_max_gradient_norm": train_metrics["max_gradient_norm"],
                         "fold_num": fold_num,  # Track which fold this belongs to
                     }
-                    wandb.log(train_log_dict, step=trainer.global_step, commit=False)
+                    wandb.log(train_log_dict, step=trainer.global_step, commit=True)
 
                 # Validate
                 if (epoch + 1) % config.mlops.eval_frequency == 0:
@@ -1156,7 +1161,7 @@ def main(args):
                         f"Val R² {val_metrics['r2']:.6f}"
                     )
                     
-                    # Log val metrics to W&B
+                    # Log val metrics to W&B (separate commit)
                     if wandb is not None and wandb.run is not None:
                         val_log_dict = {
                             "val_loss_normalized": val_loss,
@@ -1208,7 +1213,10 @@ def main(args):
 
             # Log per-fold metrics to W&B (with step=fold_num for combined chart)
             if wandb is not None and wandb.run is not None:
+                # Include BOTH train and val R² in fold summary for easy comparison
                 fold_log_dict = {
+                    "train_r2_final": final_train_metrics["r2"] if final_train_metrics else 0.0,
+                    "train_r2_oos_final": final_train_metrics["r2_oos"] if final_train_metrics else 0.0,
                     "val_r2": final_val_metrics["r2"],
                     "val_r2_oos": final_val_metrics["r2_oos"],
                     "val_rmse": final_val_metrics["rmse"],
@@ -1216,7 +1224,7 @@ def main(args):
                     "val_correlation": final_val_metrics["correlation"],
                 }
                 wandb.log(fold_log_dict, step=fold_num)
-                logger.info(f"✓ Logged Fold {fold_num} metrics to W&B")
+                logger.info(f"✓ Logged Fold {fold_num} metrics to W&B (train R²={fold_log_dict['train_r2_final']:.6f}, val R²={fold_log_dict['val_r2']:.6f})")
 
         # Fold results logged during per-fold training
 
