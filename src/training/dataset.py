@@ -138,8 +138,12 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         start = data_slice.start if data_slice.start is not None else 0
         stop = data_slice.stop if data_slice.stop is not None else self.btc_len
         
-        # Buffer of 7 steps to prevent index overflow on the 8h target
-        buffer = 7
+        # Buffer to prevent index overflow on the 8h-ahead target.
+        # __getitem__ accesses target_full[real_idx + seq_len + 7], so we need:
+        #   real_idx + seq_len + 7  <=  N - 1   →   real_idx  <=  N - seq_len - 8
+        # With range(..., N - seq_len - buffer + 1) the last value is N - seq_len - buffer,
+        # so buffer must equal 8 (not 7) for the last target index to be N - 1.
+        buffer = 8
         
         # Valid starts for BTC (within the slice)
         btc_valid_starts = list(range(start, min(stop - seq_len - buffer + 1, self.btc_len - seq_len - buffer + 1)))
