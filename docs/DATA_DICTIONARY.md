@@ -385,11 +385,11 @@ timestamp,gdelt_econ_volume,gdelt_econ_tone,gdelt_conflict_volume
 
 ---
 
-## v3 Implementation: 10-Field Multimodal Structure
+## v5 Implementation: 13-Field Multimodal Structure
 
 ### Final Dataset Fields (After Alignment & Processing)
 
-The **data_aligner.py** pipeline produces a **10-field multimodal dataset** with chronological train/val/test splits:
+The **data_aligner.py** pipeline produces a **13-field multimodal dataset** (10 features + 3 targets) with chronological train/test splits:
 
 #### 1. Meta Group (1 field)
 | Field | Type | Source | Purpose |
@@ -402,10 +402,10 @@ The **data_aligner.py** pipeline produces a **10-field multimodal dataset** with
 | `return_1h` | float (%) | OHLCV | Endogenous: hourly % price change |
 | `volume` | float | OHLCV | Trading activity (asset units) |
 | `funding_rate` | float | Binance funding rates | Derivatives sentiment (8-hour ffill) |
-| `fear_greed_value` | int (0-100) | Fear & Greed Index | Crypto market sentiment (daily ffill) |
 | `gdelt_econ_volume` | int | GDELT exogenous | # macro news articles (economy) |
 | `gdelt_econ_tone` | float (-100 to +100) | GDELT exogenous | Sentiment tone of economic news |
 | `gdelt_conflict_volume` | int | GDELT exogenous | # geopolitical/conflict articles |
+| `is_post_ETF` | int (0 or 1) | Calendar date | Regime flag: 1 if >= 2024-01-01 (post-ETF approval) |
 
 #### 3. Textual Data Group (1 field) - For BERT/LLM
 | Field | Type | Source | Purpose |
@@ -417,39 +417,38 @@ The **data_aligner.py** pipeline produces a **10-field multimodal dataset** with
 |-------|------|--------|----------|
 | `image_path` | image (224×224 PNG) | chart_generator.py | Candlestick + MA7/MA25/RSI/MACD |
 
-#### 5. Target Label (1 field)
-| Field | Type | Formula | Purpose |
-|-------|------|---------|----------|
-| `target_score` | float (-100 to +100) | tanh(R/(1.5*σ)) * 100 | 24-hour sentiment target (continuous) |
+#### 5. Target Labels (3 fields)
+| Field | Type | Description | Purpose |
+|-------|------|-------------|---------|
+| `y_baseline` | float | `target_raw_funding` | Raw perpetual funding rate at t+1 (shifted to t+8 in dataset.py) |
+| `y_heuristic` | float | Z-score composite of changes at t+1 | Weighted sum: 0.4*Z(delta_funding) + 0.3*Z(return) + 0.2*Z(delta_tone) - 0.1*Z(delta_conflict) |
+| `y_vol_adj_return` | float | Volatility-Adjusted Log Return at t+1 | Formula: `log_return(t+1) / (vol_168(t) + 1e-6)` (un-clipped) |
 
-**Total: 10 features + 1 target = 11 columns per row**
+**Total: 10 features + 3 targets = 13 columns per row**
 
-### Data Alignment Process (Phases 1-7)
+### Data Alignment Process (Phases 1-5)
 
 | Phase | Operation | Input | Output |
 |-------|-----------|-------|--------|
-| **1** | Load 5 sources | CSV files | 44,545 rows × 12 cols (raw merged) |
-| **2** | Calculate target | Close prices + volatility | +target_score col |
-| **3** | Map & validate images | Image directory | Drop 44 rows (missing images) |
-| **4-5** | Assemble + split | 44,477 rows | Train: 31,133 / Val: 6,671 / Test: 6,625 |
-| **6** | Create DatasetDict | DataFrames → HF Datasets | Image casting (224×224) |
-| **7** | Push to Hub | DatasetDict | Public repos on HF Hub |
+| **1** | Load 4 sources | CSV files | Hourly index alignment (raw merged) |
+| **2** | Map & validate images | Image directory | Drop missing image rows |
+| **3** | Feature engineering | Close returns + ETF flag | 7 tabular features |
+| **4** | Target engineering | Volatility + diffs | +3 target columns (y_baseline, y_heuristic, y_vol_adj_return) |
+| **5** | Final Assembly & Split | Chronological split | Train (85%) / Test (15%) |
 
-### Chronological Split with Embargo
+### Chronological Split
 
-**Key Feature:** 24-hour embargo buffers prevent look-ahead bias
+**Key Feature:** Chronological splitting isolates the last 15% of each asset's timeline for final testing, preventing data leakage. Walk-forward cross-validation dynamically splits the first 85% into train/val folds.
 
 ```
 Timeline (Chronological):
-|------------- Train (70%) --------------|[24h embargo]|-- Val (15%) --|[24h embargo]|-- Test (15%) --|
-│                                       │                                │                             │
-🕐 2020-01-02 21:00 UTC               2023-07-24 00:00              2024-04-28 00:00        2025-01-30 00:00
-│ ← 31,133 rows                       24 rows dropped              24 rows dropped           6,625 rows →
+|-------------------------- Train Split (85%) --------------------------|-------- Test Split (15%) --------|
+│                                                                        │                                   │
+🕐 2020-01-02 21:00 UTC                                                2024-04-29 00:00                2025-01-30 00:00
 ```
 
-- **Train boundary:** 2023-07-24 (drop 24 hours)
-- **Val boundary:** 2024-04-28 (drop 24 hours)
-- **Total usable:** 44,429 rows after embargo
+- **Train/Val Fold Splitting:** Performed in-memory via `create_walk_forward_dataloaders`.
+- **Test Set Isolation:** Kept strictly separate for final evaluation. (A sliding window buffer of 8 steps prevents overlap).
 
 ---
 
@@ -535,24 +534,24 @@ Timeline (Chronological):
 - Target: Next 1-24 hour price movement
 - Files: BTC/ETH klines, funding rates, fear_greed, GDELT
 
-### 2. **Multimodal Sentiment Forecasting (v3)**
-- Input: OHLCV (return_1h, volume) + funding_rate + fear_greed_value + GDELT exogenous (3 fields) + text_content + image_path
-- Target: target_score (24-hour ahead sentiment, continuous -100 to +100)
-- Architecture: LSTM/MLP + BERT + CNN/ViT (multi-branch fusion)
-- Files: Hugging Face Hub (BTC/ETH datasets v3)
-- Training: 31,133 rows per asset (70% train split)
+### 2. Multimodal Sentiment Forecasting (v5)
+- Input: OHLCV (`return_1h`, `volume`) + `funding_rate` + `is_post_ETF` + GDELT exogenous (3 fields) + `text_content` + `image_path`
+- Target: 3 targets (`y_baseline` predicted 8 hours ahead, `y_heuristic` predicted 1 hour ahead, `y_vol_adj_return` predicted 1 hour ahead)
+- Architecture: LSTM/MLP + FinBERT + ViT (multi-branch fusion with learnable [FUSION] token)
+- Files: Hugging Face Hub (BTC/ETH datasets v5)
+- Training: ~37,688 rows per asset (85% train split, dynamically split into walk-forward folds)
 
-### 3. **Liquidation Cascade Detection**
+### 3. Liquidation Cascade Detection
 - Input: Liquidation volume + OI changes + L/S ratio extreme values
 - Target: Detect potential price reversals
 - Files: coinalyze_liquidations, coinalyze_open_interest, coinalyze_long_short_ratio
 
-### 4. **Sentiment Features**
-- Input: Fear/Greed classification + GDELT exogenous (econ volume/tone + conflict) + news volume
+### 4. Sentiment Features
+- Input: GDELT exogenous (econ volume/tone + conflict) + news volume + is_post_ETF
 - Use as: Feature for machine learning models
-- Files: fear_greed_index, gdelt_exogenous_data
+- Files: gdelt_exogenous_data
 
-### 5. **Risk Management**
+### 5. Risk Management
 - Monitor funding rates for leverage extremes
 - Track liquidation volumes for capitulation signals
 - Check macro sentiment for systemic risk
@@ -582,7 +581,7 @@ Timeline (Chronological):
 
 ---
 
-**Generated:** 2026-03-25  
+**Generated:** 2026-05-24  
 **Total Data Points:** 515,000+ records (229,172 HF news + 105,487 market/on-chain + 179,524 sentiment)  
 **Total Chart Images:** 89,048 candlestick charts (BTC: 44,524 + ETH: 44,524) with technical indicators  
 **Historical Data Time Span:** 2019-10-29 to 2025-02-01 (HuggingFace news articles)  
@@ -591,13 +590,14 @@ Timeline (Chronological):
 **Fear & Greed Index Span:** 2018-02-01 to 2026-03-24 (8+ years)  
 
 #### Recent Updates:
-- **2026-03-26:** v3 Implementation Complete - Multimodal Datasets Pushed to Hub
-  - **BTC Dataset:** `khanh252004/multimodal_crypto_sentiment_btc` (31,133/6,671/6,625 splits, 11 cols)
-  - **ETH Dataset:** `khanh252004/multimodal_crypto_sentiment_eth` (31,133/6,671/6,625 splits, 11 cols)
+- **2026-05-24:** Fixed IndexError in `WalkForwardDataset` by updating target index buffer from 7 to 8 steps to prevent index overflow on the 8h target at slice endpoints. Legacy dataset loading logic and unused wrappers removed.
+- **2026-03-26:** v5 Implementation Complete - Multimodal Datasets Pushed to Hub
+  - **BTC Dataset:** `khanh252004/multimodal_crypto_sentiment_btc` (splits: train 85% / test 15%, 13 cols)
+  - **ETH Dataset:** `khanh252004/multimodal_crypto_sentiment_eth` (splits: train 85% / test 15%, 13 cols)
   - Replaced GDELT macro with gdelt_exogenous_data.csv (dual-focus: economy + conflict)
   - Implemented return_1h (% price change) replacing raw OHLCV
-  - 10-field structure: 1 meta + 7 tabular + 1 text + 1 visual + 1 target
-  - Chronological splits with 24-hour embargo to prevent look-ahead bias
+  - 13-field structure: 1 meta + 7 tabular + 1 text + 1 visual + 3 targets
+  - Chronological splits with dynamic per-fold validation in train pipeline
   - 100% image coverage: 44,477 valid images per asset (224×224 candlestick charts)
 - **2026-03-25:** Complete data pipeline overhaul
   - Added HuggingFace `crypto-news-coindesk-2020-2025` dataset: 229,172 articles (2019-2025)

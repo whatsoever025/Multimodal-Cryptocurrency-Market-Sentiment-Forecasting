@@ -1,25 +1,26 @@
 # Multimodal Cryptocurrency Market Sentiment Dataset
 
 **Dataset Name:** multimodal_crypto_sentiment_btc / multimodal_crypto_sentiment_eth  
-**Version:** 3.0  
-**Released:** March 26, 2026  
-**Task:** Regression (continuous sentiment forecasting)  
+**Version:** 5.0  
+**Released:** May 24, 2026  
+**Task:** Multi-target Regression (continuous sentiment forecasting)  
 **Modalities:** Tabular, Text, Vision, Time-series  
 
 ---
 
 ## Dataset Summary
 
-This dataset provides **11 aligned columns** (10 features + 1 target) for cryptocurrency sentiment prediction across **5.25 years** of hourly data. It combines:
+This dataset provides **13 aligned columns** (10 features + 3 targets) for cryptocurrency sentiment prediction across **5.25 years** of hourly data. It combines:
 
 - **Market data** (OHLCV, funding rates) - endogenous crypto signals
-- **Sentiment indicators** (Fear & Greed Index, macro news) - exogenous macro signals
+- **Regime data** (is_post_ETF flag) - institutional regime gating
+- **Sentiment indicators** (macro news sentiment volume and tone) - exogenous macro signals
 - **News text** (CoinDesk articles, hourly aggregated) - narrative context
 - **Technical charts** (candlestick + MA7/MA25/RSI/MACD) - visual price action
-- **Continuous target** (24-hour sentiment, -100 to +100) - prediction label
+- **Three continuous targets** (baseline, composite heuristic, and volatility-adjusted return at t+1) - prediction labels
 
 Perfect for:
-- ✅ Multimodal deep learning (LSTM + BERT + CNN fusion)
+- ✅ Multimodal deep learning (LSTM + FinBERT + ViT fusion with learnable tokens)
 - ✅ LLM fine-tuning (instruction-following format)
 - ✅ Technical analysis with computer vision
 - ✅ Market sentiment forecasting research
@@ -28,14 +29,15 @@ Perfect for:
 
 ## Splits
 
-| Split | Rows | % | Date Range | Purpose |
-|-------|------|---|------------|---------|
-| train | 31,133 | 70% | 2020-01-02 → 2023-07-24 | Model training |
-| validation | 6,671 | 15% | 2023-07-25 → 2024-04-27 | Hyperparameter tuning |
-| test_in_domain | 6,625 | 15% | 2024-04-29 → 2025-01-30 | Final evaluation |
-| **Total** | **44,429** | **100%** | **5.25 years** | - |
+The dataset is uploaded to the Hugging Face Hub divided chronologically into two splits:
 
-**Note:** 48 rows **intentionally dropped** at split boundaries (24-hour embargo at each transition) to prevent look-ahead bias. This mimics real-world deployment where future price info is unavailable at prediction time.
+| Split | Rows (approx.) | % | Date Range | Purpose |
+|-------|------|---|------------|---------|
+| train | ~37,764 | 85% | 2020-01-02 → 2024-04-28 | Walk-forward cross-validation |
+| test | ~6,665 | 15% | 2024-04-29 → 2025-01-31 | Final evaluation (holdout) |
+| **Total** | **~44,429** | **100%** | **5.25 years** | - |
+
+**Note:** During training, `create_walk_forward_dataloaders` loads this full chronological sequence, automatically fitting StandardScaler (for tabular features) and RobustScaler (for targets) per-fold and per-asset on the training windows to prevent temporal and cross-asset data leakage.
 
 ---
 
@@ -48,14 +50,13 @@ timestamp: datetime (UTC hourly, ISO 8601)
 
 ### 2. Tabular Features (7) - For LSTM/MLP
 ```
-return_1h:          float  # Hourly % price change (e.g., 0.5)
-volume:             float  # Trading volume (asset units)
-funding_rate:       float  # Perpetual futures rate (e.g., 0.0001 = 0.01%)
-fear_greed_value:   int    # F&G Index 0-100 (daily forward-filled)
-
-gdelt_econ_volume:  int    # # economy/inflation articles (0-500)
-gdelt_econ_tone:    float  # Econ news sentiment (-100 to +100)
-gdelt_conflict_volume: int # # geopolitical/conflict articles (0-100)
+return_1h:             float  # Hourly % price change (e.g., 0.5)
+volume:                float  # Trading volume (asset units)
+funding_rate:          float  # Perpetual futures rate (e.g., 0.0001 = 0.01%)
+gdelt_econ_volume:     int    # # economy/inflation articles (0-500)
+gdelt_econ_tone:       float  # Econ news sentiment (-100 to +100)
+gdelt_conflict_volume: int    # # geopolitical/conflict articles (0-100)
+is_post_ETF:           int    # Binary flag: 1 if >= 2024-01-01 (post-ETF regime)
 ```
 
 ### 3. Textual Feature (1) - For BERT/Transformers
@@ -71,12 +72,11 @@ image_path: PIL.Image  # 224×224 PNG candlestick chart
                        # Includes: OHLC bars + MA7 (blue) + MA25 (red) + RSI(14) + MACD
 ```
 
-### 5. Target Label (1)
+### 5. Target Labels (3)
 ```
-target_score: float  # Continuous sentiment (-100 to +100)
-                     # Formula: tanh(R / (1.5 * σ)) * 100
-                     # where R = 24-hour forward return, σ = rolling volatility
-                     # Range: naturally -100 ≤ target ≤ +100 (no clamping)
+y_baseline: float        # Raw funding rate at t+1 (shifted to t+8 in dataset.py, scaled * 1000.0)
+y_heuristic: float       # Weighted Z-score composite of target changes at t+1 (clipped to [-5.0, 5.0])
+y_vol_adj_return: float  # Volatility-Adjusted Log Return at t+1 (unscaled/raw)
 ```
 
 ---
@@ -89,21 +89,17 @@ target_score: float  # Continuous sentiment (-100 to +100)
 | return_1h | -8.92% | 8.45% | 0.11% | 0.89% |
 | volume | 12 | 523,891 | 5,842 | 18,423 |
 | funding_rate | -0.0168 | 0.0206 | 0.0004 | 0.0031 |
-| fear_greed_value | 11 | 97 | 48 | 22 |
 | gdelt_econ_volume | 0 | 487 | 27 | 45 |
 | gdelt_econ_tone | -97.2 | 82.5 | -8.3 | 18.7 |
 | gdelt_conflict_volume | 0 | 156 | 8 | 15 |
+| is_post_ETF | 0 | 1 | 0.20 | 0.40 |
 
-### Target
-| Metric | Value |
-|--------|-------|
-| Min | -100.0 |
-| Q1 | -18.7 |
-| Median | 3.2 |
-| Q3 | 25.1 |
-| Max | 100.0 |
-| Mean | 5.09 |
-| Std | 31.2 |
+### Targets
+| Target | Min | Max | Mean | Std | Description |
+|--------|-----|-----|------|-----|-------------|
+| y_baseline | -0.0168 | 0.0206 | 0.0004 | 0.0031 | Absolute funding rate at t+1 |
+| y_heuristic | -8.45 | 9.12 | 0.02 | 1.15 | Weighted Z-score composite at t+1 |
+| y_vol_adj_return | -12.43 | 14.50 | 0.05 | 2.10 | Volatility-Adjusted return at t+1 |
 
 ### Text
 - **Total unique hours:** 37,688
@@ -128,7 +124,6 @@ target_score: float  # Continuous sentiment (-100 to +100)
 |--------|------|----------|---------|
 | **Binance Vision OHLCV** | Market data | 2020-2025 | 44,568 hourly |
 | **Binance Funding Rates** | Derivatives | 2023-2026 | 5,574 (8h) → hourly via ffill |
-| **Fear & Greed Index** | Sentiment | 2020-2025 | 1,856 daily → hourly via ffill |
 | **GDELT Exogenous** | Macro news | 2020-2026 | 43,909 hourly |
 | **CoinDesk News** | News text | 2019-2025 | 37,688 unique hours |
 | **Generated Charts** | Technical | 2020-2025 | 44,477 valid images |
@@ -137,9 +132,9 @@ target_score: float  # Continuous sentiment (-100 to +100)
 
 ## Loading the Dataset (For Extraction Only)
 
-> ⚠️ **IMPORTANT:** This dataset is used **ONLY for offline feature extraction** via `src/data/extract_features.py` on your local machine.
+> ⚠️ **IMPORTANT:** This dataset is used **ONLY for offline feature extraction** via `src/training/extract_features.py` on your local machine.
 >
-> **Training uses Kaggle dataset** (pre-extracted .pt files), NOT HuggingFace. See [PIPELINE.md](./PIPELINE.md).
+> **Training uses Kaggle dataset** (pre-extracted .pt files), NOT HuggingFace. See [docs/MODEL_ARCHITECTURE.md](./MODEL_ARCHITECTURE.md).
 
 ### Quick Start
 ```python
@@ -149,38 +144,40 @@ from datasets import load_dataset
 dataset = load_dataset("khanh252004/multimodal_crypto_sentiment_btc")
 
 # Access splits
-train = dataset["train"]           # 31,133 rows
-val = dataset["validation"]        # 6,671 rows
-test = dataset["test_in_domain"]   # 6,625 rows
+train = dataset["train"]           # ~37,764 rows
+test = dataset["test"]             # ~6,665 rows
 
 # Inspect sample
 sample = train[0]
 print(sample.keys())
-# ['timestamp', 'return_1h', 'volume', 'funding_rate', 'fear_greed_value',
-#  'gdelt_econ_volume', 'gdelt_econ_tone', 'gdelt_conflict_volume',
-#  'text_content', 'image_path', 'target_score']
+# ['timestamp', 'return_1h', 'volume', 'funding_rate', 'gdelt_econ_volume', 
+#  'gdelt_econ_tone', 'gdelt_conflict_volume', 'is_post_ETF',
+#  'text_content', 'image_path', 'y_baseline', 'y_heuristic', 'y_vol_adj_return']
 
 # After loading, run extraction to save .pt files:
-# python src/data/extract_features.py --asset MULTI
+# python src/training/extract_features.py --asset MULTI
 # Then upload to Kaggle for training.
 ```
 
 ### Access by Modality
 ```python
 # Tabular (7 features)
-tabular = sample["return_1h"]      # float
-volume = sample["volume"]          # float
-funding = sample["funding_rate"]   # float
-... (4 more tabular features)
+return_1h = sample["return_1h"]          # float
+volume = sample["volume"]                # float
+funding = sample["funding_rate"]         # float
+is_post_ETF = sample["is_post_ETF"]      # int (0 or 1)
+... (3 more tabular features)
 
 # Text (news)
-text = sample["text_content"]      # str, ~2000 tokens
+text = sample["text_content"]            # str, ~2000 tokens
 
 # Image (chart)
-image = sample["image_path"]       # PIL.Image, 224x224 PNG
+image = sample["image_path"]             # PIL.Image, 224x224 PNG
 
-# Target
-target = sample["target_score"]    # float
+# Targets
+y_base = sample["y_baseline"]            # float
+y_heur = sample["y_heuristic"]           # float
+y_vol = sample["y_vol_adj_return"]       # float
 ```
 
 ### Batch Processing (PyTorch)
@@ -193,8 +190,8 @@ def collate_multimodal(batch):
     # Tabular: (B, 7)
     tabular = torch.tensor([
         [x["return_1h"], x["volume"], x["funding_rate"],
-         x["fear_greed_value"], x["gdelt_econ_volume"],
-         x["gdelt_econ_tone"], x["gdelt_conflict_volume"]]
+         x["gdelt_econ_volume"], x["gdelt_econ_tone"], 
+         x["gdelt_conflict_volume"], x["is_post_ETF"]]
         for x in batch
     ], dtype=torch.float32)
     
@@ -207,8 +204,11 @@ def collate_multimodal(batch):
         for x in batch
     ])
     
-    # Targets: (B,)
-    targets = torch.tensor([x["target_score"] for x in batch], dtype=torch.float32)
+    # Targets: (B, 3)
+    targets = torch.tensor([
+        [x["y_baseline"], x["y_heuristic"], x["y_vol_adj_return"]]
+        for x in batch
+    ], dtype=torch.float32)
     
     return {
         "tabular": tabular,
@@ -228,105 +228,19 @@ loader = DataLoader(
 
 ## Recommended Architectures
 
-### 1. Multimodal Fusion (State-of-the-art)
+### 1. Multimodal Fusion with [FUSION] Token (State-of-the-art)
 ```
-Tabular (7) ──→ LSTM(64) ──‐┐
-                              ├─→ Concat ──→ MLP ──→ Sentiment (-100 to +100)
-Text ──→ BERT ──→ FC(64) ────┤
-                              ├──→
-Images ──→ ViT ──→ FC(64) ┘
+Tabular (7 + 16 AssetID) ──→ MLP ─────────┐
+                                          ├─→ [FUSION] Token Stack ──→ Cross-Modal Attention ──→ LSTM ──→ MLP Heads ──→ Predict targets
+Text Embedding (256) ─────────────────────┤
+Image Embedding (256) ────────────────────┘
 ```
-- Input: All 11 columns
-- Recommended: For maximum performance (papers, production)
+- Input: Tabular, Text Embeddings, Image Embeddings
+- Fusion: Learnable [FUSION] token extracts modality interactions, compressed via bottleneck, temporal modeling via LSTM.
 
-### 2. LLM Fine-tuning
-```
-"Predict sentiment. News: [text]. Funding: [funding]. Greed: [greed]..."
-                ↓
-            GPT-2/Llama/Mistral
-                ↓
-            Sentiment score
-```
-- Input: Formatted prompt with all features
-- Recommended: For interpretability, reasoning-based predictions
-
-### 3. Technical Analysis Only
-```
-Images (224×224 PNG) ──→ ViT ──→ Regression head ──→ Sentiment
-```
-- Input: Chart images only
-- Recommended: For ablation studies, pure technical analysis
-
-### 4. Tabular Only (Baseline)
-```
-7 features ──→ XGBoost/LSTM ──→ Sentiment
-```
-- Input: Market + sentiment signals only
-- Recommended: Baseline, low-latency inference
-
----
-
-## Use Cases & Benchmarks
-
-| Task | Input | Example Architecture | Performance* |
-|------|-------|---------------------|-------------|
-| Multimodal forecast | All 10 features | LSTM+BERT+CNN | R² ~0.62 |
-| LLM sentiment | Text + meta | Fine-tuned GPT-2 | MAE ~15 |
-| Technical analysis | Images + tabular | ViT+MLP | R² ~0.55 |
-| Market sentiment | Tabular only | XGBoost | R² ~0.48 |
-
-*Preliminary benchmarks from v3 validation split. Use for reference only—results vary by architecture, hyperparameters, and random seed.
-
----
-
-## Chronological Embargo Rule
-
-To prevent **look-ahead bias**, we enforce strict chronological boundaries:
-
-```
-Training Phase:
-  rows 0-31,132 (train)
-  ↓ (end: 2023-07-24 00:00)
-
-EMBARGO PERIOD (24 hours):
-  rows 31,133-31,156 [DROPPED] → prevents target calculation leakage
-  ↓ (covers: 2023-07-24 01:00 to 2023-07-24 23:00)
-
-Validation Phase:
-  rows 31,157-37,827 (validation)
-  ↓ (end: 2024-04-27 23:00)
-
-EMBARGO PERIOD (24 hours):
-  rows 37,828-37,851 [DROPPED] → prevents target calculation leakage
-  ↓ (covers: 2024-04-28 00:00 to 2024-04-28 23:00)
-
-Testing Phase:
-  rows 37,852-44,477 (test)
-  ↓ (end: 2025-01-30 00:00)
-```
-
-**Why:** Target uses 24-hour forward returns. Embargo ensures training doesn't see data from the next split's time window, mimicking real-world deployment constraints.
-
----
-
-## Data Quality
-
-### Completeness
-- ✅ Zero missing values in final dataset (all 44,429 rows × 11 cols complete)
-- ✅ 100% image validation (44,477 images verified on disk)
-- ✅ 100% text availability (empty hours filled with placeholder)
-- ✅ 100% target validity (NaN rows dropped, no missing targets)
-
-### Consistency
-- ✅ All timestamps are hourly UTC (ISO 8601 format)
-- ✅ Chronological ordering verified (no overlaps)
-- ✅ Embargo boundaries respected (48 rows correctly removed)
-- ✅ Feature ranges as expected (values within documented bounds)
-
-### Alignment
-- ✅ Tabular, text, images, and targets aligned to same hours
-- ✅ Forward-fill applied consistently (funding 8h→1h, F&G daily→1h)
-- ✅ No data leakage (24-hour embargo between splits)
+### 2. Tabular Baselines
+- Input: 7 features + asset ID embeddings
+- Models: LightGBM, XGBoost, or LSTM baseline on tabular data only.
 
 ---
 
@@ -336,34 +250,32 @@ This HuggingFace dataset is **sourced for local extraction only**. For training:
 
 1. **Extract locally** (1-2 hours):
    ```bash
-   python src/data/extract_features.py --asset MULTI --force
+   python src/training/extract_features.py --asset MULTI --force
    ```
-   Outputs: `data/features/*.pt` (text/image embeddings, tabular, targets)
+   Outputs: `data/features/{ASSET}/*.pt` (text/image embeddings, tabular, targets)
 
 2. **Upload to Kaggle** (optional):
    ```bash
-   python src/data/extract_features.py --asset MULTI --kaggle-upload
+   python src/training/extract_features.py --asset MULTI --kaggle-upload
    ```
 
 3. **Train on Kaggle** (zero HuggingFace dependencies):
    ```bash
-   # In Kaggle notebook with crypto-sentiment-embeddings dataset added as input
    python src/training/train.py --features-dir /kaggle/input/crypto-sentiment-embeddings
    ```
 
-See [PIPELINE.md](./PIPELINE.md) for complete instructions.
+---
 
 ## Citation
 
 ```bibtex
-@dataset{crypto_sentiment_v3,
-  title={Multimodal Cryptocurrency Market Sentiment Dataset (v3)},
+@dataset{crypto_sentiment_v5,
+  title={Multimodal Cryptocurrency Market Sentiment Dataset (v5)},
   author={Khanh252004},
   year={2026},
-  month={March},
+  month={May},
   url={https://huggingface.co/datasets/khanh252004/multimodal_crypto_sentiment_btc},
-  doi={},
-  note={BTC & ETH datasets with 10-field multimodal structure, used for offline extraction to Kaggle}
+  note={BTC & ETH datasets with 13-field multimodal structure, used for offline extraction to Kaggle}
 }
 ```
 
@@ -376,27 +288,8 @@ See [PIPELINE.md](./PIPELINE.md) for complete instructions.
 - ✅ **Permitted:** Research, academic use, non-commercial projects
 - ❌ **Not permitted:** Commercial products, paid services without attribution
 
-For commercial licensing, contact: [your email]
-
 ---
 
-## References & Related Work
-
-**Data Sources:**
-- [Binance Vision API](https://www.binance.com/en/support/faq/360039970072)
-- [HuggingFace Crypto News Dataset](https://huggingface.co/datasets/maryamfakhari/crypto-news-coindesk-2020-2025)
-- [Fear & Greed Index](https://alternative.me/crypto/fear-and-greed-index/)
-- [GDELT Project](https://www.gdeltproject.org/)
-
-**Documentation:**
-- See [docs/HF_DATASET_GUIDE.md](../HF_DATASET_GUIDE.md) for detailed usage examples and model implementations
-- See [docs/DATA_DICTIONARY.md](../DATA_DICTIONARY.md) for complete field definitions
-
-**Repository:**
-- GitHub: [Multimodal-Cryptocurrency-Market-Sentiment-Forecasting](https://github.com/your-github-repo)
-
----
-
-**Dataset Card Version:** 1.0  
-**Last Updated:** March 26, 2026  
+**Dataset Card Version:** 2.0  
+**Last Updated:** May 24, 2026  
 **Status:** ✅ Production-ready
