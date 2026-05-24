@@ -855,18 +855,105 @@ def main(args):
     logger.info(f"Using WALK-FORWARD VALIDATION with {num_folds} folds")
     logger.info(f"DataLoader settings: batch_size={config.data.batch_size}, num_workers=0 (forced), pin_memory=True")
     
-    # Also load test set once for final evaluation
+    # Also load test set once for final evaluation.
+    # Load directly from BTC/ETH subdirs, mirroring the logic in
+    # create_walk_forward_dataloaders (test slice = last 15% of each asset).
     logger.info("Also loading test set for final evaluation...")
+    test_loader = None
+    target_scaler = None
     try:
-        from .dataset import CryptoMultimodalDataset as CryptoDataset
-        test_dataset = CryptoDataset(
-            split="test",
+        from .dataset import WalkForwardDataset
+        import json
+
+        _features_dir = Path(features_dir)
+        btc_subdir = _features_dir / "BTC"
+        eth_subdir = _features_dir / "ETH"
+
+        if btc_subdir.exists() and eth_subdir.exists():
+            # ---- load per-asset tensors and concatenate ----
+            _btc_text  = torch.load(btc_subdir / "text_embeddings.pt",  map_location="cpu")
+            _btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
+            _btc_tab   = torch.load(btc_subdir / "tabular_features.pt", map_location="cpu")
+            _btc_tgt   = torch.load(btc_subdir / "target_scores.pt",    map_location="cpu")
+
+            _eth_text  = torch.load(eth_subdir / "text_embeddings.pt",  map_location="cpu")
+            _eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
+            _eth_tab   = torch.load(eth_subdir / "tabular_features.pt", map_location="cpu")
+            _eth_tgt   = torch.load(eth_subdir / "target_scores.pt",    map_location="cpu")
+
+            _btc_len = _btc_text.shape[0]
+            _eth_len = _eth_text.shape[0]
+
+            _test_text  = torch.cat([_btc_text,  _eth_text],  dim=0)
+            _test_image = torch.cat([_btc_image, _eth_image], dim=0)
+            _test_tab   = torch.cat([_btc_tab,   _eth_tab],   dim=0)
+            _test_tgt   = torch.cat([_btc_tgt,   _eth_tgt],   dim=0)
+        else:
+            # Fallback: single consolidated files + split_metadata.json
+            _test_text  = torch.load(_features_dir / "text_embeddings.pt",  map_location="cpu")
+            _test_image = torch.load(_features_dir / "image_embeddings.pt", map_location="cpu")
+            _test_tab   = torch.load(_features_dir / "tabular_features.pt", map_location="cpu")
+            _test_tgt   = torch.load(_features_dir / "target_scores.pt",    map_location="cpu")
+            _total = _test_text.shape[0]
+            _btc_len = _total // 2
+            _eth_len = _total // 2
+
+        # ---- target engineering (must match create_walk_forward_dataloaders) ----
+        _test_tgt[:, 0] = _test_tgt[:, 0] * 1000.0
+        _test_tgt[:, 1] = torch.clamp(_test_tgt[:, 1], min=-5.0, max=5.0)
+
+        _total_samples = _test_text.shape[0]
+        _timestamps = torch.arange(_total_samples, dtype=torch.long)
+
+        # ---- compute test slice boundaries (last 15%) per asset ----
+        _test_pct = 0.15
+        _train_end_per_asset = int(_btc_len * (1.0 - _test_pct))
+        _test_slice = slice(_train_end_per_asset, _btc_len)
+
+        # ---- fit scalers on train portion only (no data leakage) ----
+        from sklearn.preprocessing import StandardScaler, RobustScaler
+
+        _btc_train_sl = slice(0, _train_end_per_asset)
+        _btc_scaler_tab = StandardScaler().fit(_test_tab[_btc_train_sl].numpy())
+        _btc_scaler_tgt = RobustScaler().fit(_test_tgt[_btc_train_sl].numpy())
+
+        _eth_train_sl = slice(_btc_len, _btc_len + _train_end_per_asset)
+        _eth_scaler_tab = StandardScaler().fit(_test_tab[_eth_train_sl].numpy())
+        _eth_scaler_tgt = RobustScaler().fit(_test_tgt[_eth_train_sl].numpy())
+
+        # Apply scalers per-asset
+        _tab_scaled = _test_tab.clone()
+        _tgt_scaled = _test_tgt.clone()
+
+        _tab_scaled[:_btc_len] = torch.from_numpy(
+            _btc_scaler_tab.transform(_test_tab[:_btc_len].numpy())
+        ).float()
+        _tgt_scaled[:_btc_len] = torch.from_numpy(
+            _btc_scaler_tgt.transform(_test_tgt[:_btc_len].numpy())
+        ).float()
+
+        _tab_scaled[_btc_len:_btc_len + _eth_len] = torch.from_numpy(
+            _eth_scaler_tab.transform(_test_tab[_btc_len:_btc_len + _eth_len].numpy())
+        ).float()
+        _tgt_scaled[_btc_len:_btc_len + _eth_len] = torch.from_numpy(
+            _eth_scaler_tgt.transform(_test_tgt[_btc_len:_btc_len + _eth_len].numpy())
+        ).float()
+
+        # ---- create WalkForwardDataset for the test slice ----
+        _test_ds = WalkForwardDataset(
+            text_embeddings=_test_text,
+            image_embeddings=_test_image,
+            tabular_data=_tab_scaled,
+            target_scores=_tgt_scaled,
+            timestamps=_timestamps,
+            data_slice=_test_slice,
             seq_len=config.data.seq_len,
-            features_dir=features_dir,
-            debug=debug,
+            btc_len=_btc_len,
+            eth_len=_eth_len,
         )
+
         test_loader = torch.utils.data.DataLoader(
-            test_dataset,
+            _test_ds,
             batch_size=config.data.batch_size,
             shuffle=False,
             collate_fn=multimodal_collate_fn,
@@ -874,10 +961,14 @@ def main(args):
             pin_memory=True,
             drop_last=False,
         )
-        target_scaler = test_dataset.target_scaler
-        logger.info(f"✓ Test loader created: {len(test_loader)} batches")
+        target_scaler = _btc_scaler_tgt  # BTC scaler used as default for denorm
+        logger.info(f"✓ Test loader created: {len(test_loader)} batches "
+                    f"(BTC test=[{_train_end_per_asset}:{_btc_len}], ETH test=[{_btc_len + _train_end_per_asset}:{_btc_len + _eth_len}])")
+
+        # Clean up large temporaries
+        del _test_text, _test_image, _test_tab, _test_tgt, _tab_scaled, _tgt_scaled
     except Exception as e:
-        logger.warning(f"Failed to load test set: {e}")
+        logger.warning(f"Failed to load test set: {e}", exc_info=True)
         test_loader = None
         target_scaler = None
     

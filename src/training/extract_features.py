@@ -448,15 +448,6 @@ def main(args):
     sys.stdout.flush()
 
 
-def extract_target_scores(
-    dataset,
-    output_path: Path,
-) -> None:
-    """
-    [LEGACY - kept for backward compatibility]
-    Extract RAW v5 targets (y_baseline, y_heuristic, y_vol_adj_return). Save to disk.
-    """
-    extract_target_scores_sequence(dataset, output_path)
 
 
 def extract_target_scores_sequence(
@@ -512,26 +503,6 @@ TABULAR_FEATURE_NAMES = [
 ]
 
 
-def extract_tabular_features(
-    dataset,
-    output_dir: Path,
-    split: str = "train",
-) -> None:
-    """
-    [LEGACY] Extract RAW 7 tabular features (v5 schema) for a single split.
-
-    v5 Features (7 columns):
-      return_1h, volume, funding_rate,
-      gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
-      is_post_ETF   ← replaces old fear_greed_value
-
-    Args:
-        dataset: HuggingFace Dataset with v5 tabular columns
-        output_dir: Directory to save raw features
-        split: split name used in output filename
-    """
-    output_path = output_dir / f"tabular_features_{split}.pt"
-    extract_tabular_features_sequence(dataset, output_path)
 
 
 def extract_tabular_features_sequence(

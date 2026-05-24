@@ -65,13 +65,13 @@
 **Data Leakage Prevention:** Scaler's fit() ONLY sees training data; transform() applies to all splits
 
 ### Implementation Details
-**Location:** `src/training/dataset.py` → `CryptoMultimodalDataset` class  
-**Key Method:** `_load_tabular_and_targets(split):`
-- If `split == "train"`: Fit StandardScaler & RobustScaler on raw training data, apply scaling
-- If `split == "validation"` or `"test_in_domain"`: Load scalers from training split, apply to current split
-- Scaling happens ONCE during dataset initialization (in-memory, no disk I/O)
+**Location:** `src/training/dataset.py` → `create_walk_forward_dataloaders` function  
+**Key Logic:** Per-fold, per-asset scaler fitting:
+- For each walk-forward fold: Fit StandardScaler & RobustScaler **independently** on BTC training window and ETH training window
+- Apply each asset's scalers only to that asset's data (prevents cross-asset contamination)
+- Scaling happens ONCE per fold during dataloader creation (in-memory, no disk I/O)
 
-**Critical:** Both scalers are stored in the training dataset and reused by validation/test datasets to prevent data leakage. Validation and test data are scaled using training statistics.
+**Critical:** Scalers are fitted per-fold and per-asset to prevent both temporal and cross-asset data leakage.
 
 ---
 
