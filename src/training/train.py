@@ -327,6 +327,7 @@ class Trainer:
         self.train_losses = []
         self.val_losses = []
         self.val_metrics_history = []  # Store all validation metrics for comparison
+        self.gradient_norms = []  # Track gradient norms for monitoring
         
         logger.info(f"Trainer initialized (device={device})")
         if self.target_scaler is not None:
@@ -446,6 +447,8 @@ class Trainer:
             unit="batch",
         )
         
+        epoch_gradient_norms = []  # Collect gradient norms for this epoch
+        
         for batch_idx, batch in enumerate(pbar):
             # Move batch to device (float32 by default)
             batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -536,6 +539,9 @@ class Trainer:
                     norm_type=2.0,  # L2 norm (standard)
                 )
                 
+                # Track gradient norm for monitoring
+                epoch_gradient_norms.append(total_norm)
+                
                 # Log if clipping occurred (indicator of training instability)
                 if total_norm > self.config.model.grad_clip:
                     logger.debug(
@@ -596,6 +602,11 @@ class Trainer:
         avg_loss = total_loss / num_steps
         self.train_losses.append(avg_loss)
         
+        # Compute epoch-level gradient norm statistics
+        avg_gradient_norm = float(np.mean(epoch_gradient_norms)) if epoch_gradient_norms else 0.0
+        max_gradient_norm = float(np.max(epoch_gradient_norms)) if epoch_gradient_norms else 0.0
+        self.gradient_norms.append(avg_gradient_norm)
+        
         # Concatenate all predictions and targets
         all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
         all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
@@ -605,11 +616,14 @@ class Trainer:
         metrics["loss"] = avg_loss
         metrics["predictions"] = all_predictions
         metrics["targets"] = all_targets
+        metrics["avg_gradient_norm"] = avg_gradient_norm
+        metrics["max_gradient_norm"] = max_gradient_norm
         
         logger.info(
             f"Epoch {self.epoch+1} completed | Avg Loss: {avg_loss:.6f} | MSE: {metrics['mse']:.6f} | "
             f"MAE: {metrics['mae']:.6f} | RMSE: {metrics['rmse']:.6f} | "
-            f"R²: {metrics['r2']:.6f} | R²_OOS: {metrics['r2_oos']:.6f}"
+            f"R²: {metrics['r2']:.6f} | R²_OOS: {metrics['r2_oos']:.6f} | "
+            f"Avg Grad Norm: {avg_gradient_norm:.6f}"
         )
         
         return metrics
@@ -1077,6 +1091,11 @@ def main(args):
             trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
             trainer._current_target_idx = target_idx
             trainer.setup_optimizer()
+            
+            # Reset global_step for this fold (for proper W&B metric visualization)
+            # Each fold is independent with reset weights, so step counter should reset per fold
+            trainer.global_step = 0
+            logger.info(f"✓ Global step reset to 0 for Fold {fold_num}")
 
             # Resume: load checkpoint into the first fold of the first target only.
             if resume_ckpt_path and target_idx == 0 and fold_num == 1:
@@ -1108,6 +1127,19 @@ def main(args):
                     f"Train Loss {train_loss:.6f} | "
                     f"Train R² {train_metrics['r2']:.6f}"
                 )
+                
+                # Log train metrics to W&B
+                if wandb is not None and wandb.run is not None:
+                    train_log_dict = {
+                        "train_loss": train_loss,
+                        "train_r2": train_metrics["r2"],
+                        "train_rmse": train_metrics["rmse"],
+                        "train_mae": train_metrics["mae"],
+                        "train_avg_gradient_norm": train_metrics["avg_gradient_norm"],
+                        "train_max_gradient_norm": train_metrics["max_gradient_norm"],
+                        "fold_num": fold_num,  # Track which fold this belongs to
+                    }
+                    wandb.log(train_log_dict, step=trainer.global_step, commit=False)
 
                 # Validate
                 if (epoch + 1) % config.mlops.eval_frequency == 0:
@@ -1123,6 +1155,20 @@ def main(args):
                         f"Val MSE {val_metrics['mse']:.6f} | "
                         f"Val R² {val_metrics['r2']:.6f}"
                     )
+                    
+                    # Log val metrics to W&B
+                    if wandb is not None and wandb.run is not None:
+                        val_log_dict = {
+                            "val_loss_normalized": val_loss,
+                            "val_mse": val_metrics["mse"],
+                            "val_rmse": val_metrics["rmse"],
+                            "val_mae": val_metrics["mae"],
+                            "val_r2": val_metrics["r2"],
+                            "val_r2_oos": val_metrics["r2_oos"],
+                            "val_correlation": val_metrics["correlation"],
+                            "fold_num": fold_num,  # Track which fold this belongs to
+                        }
+                        wandb.log(val_log_dict, step=trainer.global_step, commit=True)
 
                     # Early stopping check (based on normalized HuberLoss)
                     if early_stopping(val_loss):
@@ -1172,51 +1218,7 @@ def main(args):
                 wandb.log(fold_log_dict, step=fold_num)
                 logger.info(f"✓ Logged Fold {fold_num} metrics to W&B")
 
-        # Log fold summary with simple line plots
-        logger.info("\n" + "=" * 80)
-        logger.info("WALK-FORWARD VALIDATION SUMMARY")
-        logger.info("=" * 80)
-
-        # Collect metrics across folds
-        fold_numbers = sorted(fold_results.keys())
-        r2_scores     = [fold_results[i]["val_r2"]      for i in fold_numbers]
-        r2_oos_scores = [fold_results[i]["val_r2_oos"]  for i in fold_numbers]
-        rmse_scores   = [fold_results[i]["val_rmse"]    for i in fold_numbers]
-        mae_scores    = [fold_results[i]["val_mae"]     for i in fold_numbers]
-        corr_scores   = [fold_results[i]["val_correlation"] for i in fold_numbers]
-
-        logger.info(f"Mean R²:          {np.mean(r2_scores):.6f} ± {np.std(r2_scores):.6f}")
-        logger.info(f"Mean R²_OOS:      {np.mean(r2_oos_scores):.6f} ± {np.std(r2_oos_scores):.6f}")
-        logger.info(f"Mean RMSE:        {np.mean(rmse_scores):.6f} ± {np.std(rmse_scores):.6f}")
-        logger.info(f"Mean MAE:         {np.mean(mae_scores):.6f} ± {np.std(mae_scores):.6f}")
-        logger.info(f"Mean Correlation: {np.mean(corr_scores):.6f} ± {np.std(corr_scores):.6f}")
-
-        for fold_num in fold_numbers:
-            logger.info(
-                f"  Fold {fold_num}: R²={fold_results[fold_num]['val_r2']:.6f}, "
-                f"R²_OOS={fold_results[fold_num]['val_r2_oos']:.6f}, "
-                f"RMSE={fold_results[fold_num]['val_rmse']:.6f}, "
-                f"MAE={fold_results[fold_num]['val_mae']:.6f}, "
-                f"Corr={fold_results[fold_num]['val_correlation']:.6f}"
-            )
-
-        # Log fold summary statistics to W&B
-        if wandb is not None and wandb.run is not None:
-            summary_log = {
-                "fold_summary/mean_r2":          np.mean(r2_scores),
-                "fold_summary/std_r2":           np.std(r2_scores),
-                "fold_summary/mean_r2_oos":      np.mean(r2_oos_scores),
-                "fold_summary/std_r2_oos":       np.std(r2_oos_scores),
-                "fold_summary/mean_rmse":        np.mean(rmse_scores),
-                "fold_summary/std_rmse":         np.std(rmse_scores),
-                "fold_summary/mean_mae":         np.mean(mae_scores),
-                "fold_summary/std_mae":          np.std(mae_scores),
-                "fold_summary/mean_correlation": np.mean(corr_scores),
-                "fold_summary/std_correlation":  np.std(corr_scores),
-            }
-            wandb.log(summary_log)
-            logger.info("✓ Logged fold summary statistics to W&B")
-            logger.info("✓ Fold metrics plotted as line charts with fold number on x-axis")
+        # Fold results logged during per-fold training
 
         # ==================== TEST EVALUATION ====================
         logger.info("\n" + "=" * 80)
