@@ -539,8 +539,8 @@ class Trainer:
                     norm_type=2.0,  # L2 norm (standard)
                 )
                 
-                # Track gradient norm for monitoring
-                epoch_gradient_norms.append(total_norm)
+                # Track gradient norm for monitoring (convert to scalar immediately)
+                epoch_gradient_norms.append(total_norm.item() if isinstance(total_norm, torch.Tensor) else float(total_norm))
                 
                 # Log if clipping occurred (indicator of training instability)
                 if total_norm > self.config.model.grad_clip:
@@ -603,8 +603,13 @@ class Trainer:
         self.train_losses.append(avg_loss)
         
         # Compute epoch-level gradient norm statistics
-        avg_gradient_norm = float(np.mean(epoch_gradient_norms)) if epoch_gradient_norms else 0.0
-        max_gradient_norm = float(np.max(epoch_gradient_norms)) if epoch_gradient_norms else 0.0
+        # (All values in epoch_gradient_norms are already scalars, converted at append time)
+        if epoch_gradient_norms:
+            avg_gradient_norm = float(np.mean(epoch_gradient_norms))
+            max_gradient_norm = float(np.max(epoch_gradient_norms))
+        else:
+            avg_gradient_norm = 0.0
+            max_gradient_norm = 0.0
         self.gradient_norms.append(avg_gradient_norm)
         
         # Concatenate all predictions and targets
