@@ -759,6 +759,8 @@ class Trainer:
         
         # Apply inverse transform if scaler is available
         is_denormalized = False
+        train_targets_mean_for_metrics = train_targets_mean  # Default: use as-is
+        
         if self.target_scaler is not None:
             logger.debug("Applying inverse transform to predictions and targets...")
             # RobustScaler inverse_transform expects (n_samples, 1) shape.
@@ -775,6 +777,15 @@ class Trainer:
             all_predictions = torch.from_numpy(all_predictions_denorm).float()
             all_targets = torch.from_numpy(all_targets_denorm).float()
             is_denormalized = True
+            
+            # CRITICAL: Also denormalize train_targets_mean to match test targets scale
+            # train_targets_mean was calculated from normalized training targets
+            # When test targets are denormalized, train_targets_mean must also be denormalized
+            # for R² OOS historical mean benchmark to be correct
+            if train_targets_mean is not None:
+                train_targets_mean_for_metrics = train_targets_mean * scale + center
+                logger.debug(f"✓ Denormalized train_targets_mean: {train_targets_mean:.6f} → {train_targets_mean_for_metrics:.6f}")
+            
             logger.debug("✓ Inverse transform applied (metrics computed on original scale)")
         
         # Compute all metrics via shared helper.
@@ -782,7 +793,7 @@ class Trainer:
         # When is_denormalized=False, they are in normalized scale.
         # 'normalized_huber' is always in normalized scale and is what drives early stopping.
         target_name = TARGET_NAMES[target_idx] if target_idx < len(TARGET_NAMES) else None
-        metrics = _compute_metrics(all_predictions, all_targets, target_name=target_name, train_targets_mean=train_targets_mean)
+        metrics = _compute_metrics(all_predictions, all_targets, target_name=target_name, train_targets_mean=train_targets_mean_for_metrics)
         metrics["normalized_huber"] = avg_huber       # Always normalized — use for early stopping
         metrics["normalized_mae"] = avg_mae_normalized  # Always normalized
         metrics["is_denormalized"] = is_denormalized
