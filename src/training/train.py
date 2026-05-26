@@ -144,22 +144,57 @@ def check_gradients(model: nn.Module, batch_idx: int) -> bool:
     return has_issues
 
 
-def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
+def compute_train_targets_mean(train_loader: DataLoader, target_idx: int = 0) -> float:
     """
-    Compute comprehensive regression metrics.
+    Compute mean of training targets for a specific target variable.
+    Used as benchmark for R² OOS historical mean formula.
+    
+    Args:
+        train_loader: Training DataLoader
+        target_idx: Target index (0=y_baseline, 1=y_heuristic, 2=y_vol_adj_return)
+    
+    Returns:
+        Mean of training targets (scalar float)
+    """
+    all_targets = []
+    for batch in train_loader:
+        targets = batch["target"][:, target_idx]  # (batch_size,)
+        all_targets.append(targets)
+    
+    all_targets = torch.cat(all_targets, dim=0)
+    train_mean = all_targets.mean().item()
+    return train_mean
+
+
+def _compute_metrics(
+    predictions: torch.Tensor, 
+    targets: torch.Tensor,
+    target_name: Optional[str] = None,
+    train_targets_mean: Optional[float] = None
+) -> Dict[str, float]:
+    """
+    Compute comprehensive regression metrics with target-specific R² OOS formula.
     
     Args:
         predictions: Model predictions (torch.Tensor)
         targets: Ground truth targets (torch.Tensor)
+        target_name: One of "y_baseline", "y_heuristic", "y_vol_adj_return"
+                     Determines which R² OOS benchmark to use.
+        train_targets_mean: Mean of training targets (for historical mean benchmark).
+                           Required if target_name is "y_baseline".
     
     Returns:
         Dict with keys: 'mse', 'mae', 'rmse',
                        'r2'     - Standard R² (benchmarks against test-set mean ȳ)
-                       'r2_oos' - OOS R² from Gu, Kelly & Xiu (2020) "Empirical Asset
-                                  Pricing via Machine Learning", Rev. of Financial Studies.
-                                  Formula: 1 - SS_res / sum(y²)
-                                  Benchmarks against zero-predictor (ŷ=0), not test-set mean.
-                                  More conservative and correct for OOS financial forecasting.
+                       'r2_oos' - OOS R² with target-specific benchmark:
+                                  * y_vol_adj_return: Zero-predictor (Gu, Kelly & Xiu 2020)
+                                    Benchmark: ŷ=0 (not test mean, since true mean ≈ 0)
+                                  * y_baseline: Historical mean (structural funding rate positive bias)
+                                    Benchmark: ŷ=mean(y_train)
+                                  * y_heuristic: Zero-predictor (Z-score normalized, mean ≈ 0)
+                                    Benchmark: ŷ=0
+                       'r2_oos_benchmark_zero' - Always GKX 2020 (debug)
+                       'r2_oos_benchmark_historical_mean' - Always historical mean (debug)
                        'correlation', 'prediction_error_mean', 'prediction_error_std',
                        'pred_min', 'pred_max', 'target_min', 'target_max'
     """
@@ -168,23 +203,45 @@ def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[s
     mae = torch.mean(torch.abs(predictions - targets)).item()
     rmse = np.sqrt(mse)
     
-    # Residual sum of squares (shared by both R² variants)
+    # Residual sum of squares (shared by all R² variants)
     ss_res = torch.sum((predictions - targets) ** 2).item()
 
     # --- Standard R² ---
     # Denominator: sum((y - ȳ)²) — benchmarks against predicting the test-set mean.
-    # Appropriate for in-sample evaluation or when test-set mean is a known baseline.
     ss_tot = torch.sum((targets - targets.mean()) ** 2).item()
     r2_score = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    # --- OOS R² (Gu, Kelly & Xiu, 2020) ---
-    # Denominator: sum(y²) — benchmarks against the zero-predictor (ŷ_i = 0).
-    # The correct OOS benchmark for financial return/sentiment forecasting:
-    #   - Does NOT use the test-set mean (unknown at forecast time in a real deployment)
-    #   - Always more conservative: R²_OOS ≤ R²_standard, with equality only when ȳ = 0
-    #   - Relationship: sum(y²) = sum((y-ȳ)²) + n*ȳ²  →  larger denom → lower R²
-    ss_tot_oos = torch.sum(targets ** 2).item()
-    r2_oos = 1.0 - (ss_res / ss_tot_oos) if ss_tot_oos > 0 else 0.0
+    # --- R² OOS Variant 1: GKX 2020 (Zero-predictor) ---
+    # Benchmark: ŷ_i = 0 (appropriate for returns with mean ≈ 0)
+    ss_tot_oos_gkx = torch.sum(targets ** 2).item()
+    r2_oos_gkx = 1.0 - (ss_res / ss_tot_oos_gkx) if ss_tot_oos_gkx > 0 else 0.0
+
+    # --- R² OOS Variant 2: Historical Mean Benchmark ---
+    # Benchmark: ŷ_i = mean(y_train) (appropriate for series with structural mean ≠ 0)
+    # Formula: 1 - SS_res / sum((y_test - mean(y_train))²)
+    if train_targets_mean is not None:
+        ss_tot_oos_hist = torch.sum((targets - train_targets_mean) ** 2).item()
+        r2_oos_hist = 1.0 - (ss_res / ss_tot_oos_hist) if ss_tot_oos_hist > 0 else 0.0
+    else:
+        r2_oos_hist = 0.0
+    
+    # --- Select appropriate R² OOS formula based on target ---
+    # (See docstring for rationale)
+    if target_name == "y_baseline":
+        # Funding rate: has structural positive bias, not mean=0
+        # Benchmark: mean(y_train)
+        r2_oos_primary = r2_oos_hist
+    elif target_name == "y_heuristic":
+        # Z-score normalized heuristic: mean ≈ 0
+        # Both formulas equivalent; use GKX for consistency
+        r2_oos_primary = r2_oos_gkx
+    elif target_name == "y_vol_adj_return":
+        # 1h return: extremely noisy, mean ≈ 0.0001
+        # GKX 2020 is academically correct for financial returns
+        r2_oos_primary = r2_oos_gkx
+    else:
+        # Fallback: use GKX
+        r2_oos_primary = r2_oos_gkx
     
     # Correlation
     pred_mean = predictions.mean()
@@ -209,7 +266,9 @@ def _compute_metrics(predictions: torch.Tensor, targets: torch.Tensor) -> Dict[s
         "mae": mae,
         "rmse": rmse,
         "r2": r2_score,
-        "r2_oos": r2_oos,
+        "r2_oos": r2_oos_primary,
+        "r2_oos_benchmark_zero": r2_oos_gkx,  # Debug: always GKX 2020
+        "r2_oos_benchmark_historical_mean": r2_oos_hist,  # Debug: always historical mean
         "correlation": correlation,
         "prediction_error_mean": prediction_error_mean,
         "prediction_error_std": prediction_error_std,
@@ -384,7 +443,7 @@ class Trainer:
             logger.info("Scheduler: None (constant LR)")
         logger.info("Pure float32 training (no AMP)")
     
-    def train_epoch(self, train_loader: DataLoader, target_idx: int = 0) -> Dict[str, float]:
+    def train_epoch(self, train_loader: DataLoader, target_idx: int = 0, train_targets_mean: Optional[float] = None) -> Dict[str, float]:
         """
         Run one training epoch with gradient accumulation and explicit gradient clipping.
         Pure float32 implementation (no AMP) for numerical stability.
@@ -617,7 +676,8 @@ class Trainer:
         all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
         
         # Compute metrics using shared helper
-        metrics = _compute_metrics(all_predictions, all_targets)
+        target_name = TARGET_NAMES[target_idx] if target_idx < len(TARGET_NAMES) else None
+        metrics = _compute_metrics(all_predictions, all_targets, target_name=target_name, train_targets_mean=train_targets_mean)
         metrics["loss"] = avg_loss
         metrics["predictions"] = all_predictions
         metrics["targets"] = all_targets
@@ -633,7 +693,7 @@ class Trainer:
         
         return metrics
     
-    def validate(self, val_loader: DataLoader, target_idx: int = 0) -> Dict[str, float]:
+    def validate(self, val_loader: DataLoader, target_idx: int = 0, train_targets_mean: Optional[float] = None) -> Dict[str, float]:
         """
         Run validation (pure float32, no AMP) with comprehensive metrics collection.
         
@@ -721,7 +781,8 @@ class Trainer:
         # When is_denormalized=True, mse/mae/rmse/r2 are in original (denormalized) scale.
         # When is_denormalized=False, they are in normalized scale.
         # 'normalized_huber' is always in normalized scale and is what drives early stopping.
-        metrics = _compute_metrics(all_predictions, all_targets)
+        target_name = TARGET_NAMES[target_idx] if target_idx < len(TARGET_NAMES) else None
+        metrics = _compute_metrics(all_predictions, all_targets, target_name=target_name, train_targets_mean=train_targets_mean)
         metrics["normalized_huber"] = avg_huber       # Always normalized — use for early stopping
         metrics["normalized_mae"] = avg_mae_normalized  # Always normalized
         metrics["is_denormalized"] = is_denormalized
@@ -1083,6 +1144,10 @@ def main(args):
             logger.info(f"FOLD {fold_num}")
             logger.info("=" * 80)
 
+            # Compute training set targets mean for R² OOS benchmark
+            train_targets_mean = compute_train_targets_mean(train_loader, target_idx=target_idx)
+            logger.info(f"  Train targets mean (for R² OOS benchmark): {train_targets_mean:.6f}")
+
             # Reset model weights for each fold.
             # CRITICAL for generalization: without this, fold N's model is fine-tuned from
             # fold N-1's weights — meaning by the final fold the model has implicitly seen
@@ -1097,10 +1162,10 @@ def main(args):
             trainer._current_target_idx = target_idx
             trainer.setup_optimizer()
             
-            # Reset global_step for this fold (for proper W&B metric visualization)
-            # Each fold is independent with reset weights, so step counter should reset per fold
-            trainer.global_step = 0
-            logger.info(f"✓ Global step reset to 0 for Fold {fold_num}")
+            # Initialize fold-specific step counter for W&B logging
+            # Each fold will have its own step counter (1 → max_epochs)
+            # This creates separate, clean curves per fold instead of monotonic global_step
+            logger.info(f"✓ Fold {fold_num} initialized with clean per-fold step counter")
 
             # Resume: load checkpoint into the first fold of the first target only.
             if resume_ckpt_path and target_idx == 0 and fold_num == 1:
@@ -1124,9 +1189,10 @@ def main(args):
 
             for epoch in range(fold_start, config.training.max_epochs):
                 trainer.epoch = epoch
+                fold_step = epoch - fold_start + 1  # Per-fold step (1, 2, 3, ...)
 
                 # Train epoch
-                train_metrics = trainer.train_epoch(train_loader, target_idx=target_idx)
+                train_metrics = trainer.train_epoch(train_loader, target_idx=target_idx, train_targets_mean=train_targets_mean)
                 final_train_metrics = train_metrics  # Store for fold summary
                 train_loss = train_metrics["loss"]
 
@@ -1136,7 +1202,8 @@ def main(args):
                     f"Train R² {train_metrics['r2']:.6f}"
                 )
                 
-                # Log train metrics to W&B (committed immediately)
+                # Log train metrics to W&B with per-fold step counter
+                # Each fold: step 1→max_epochs, creating separate curves
                 if wandb is not None and wandb.run is not None:
                     train_log_dict = {
                         "train_loss": train_loss,
@@ -1149,11 +1216,11 @@ def main(args):
                         "train_max_gradient_norm": train_metrics["max_gradient_norm"],
                         "fold_num": fold_num,  # Track which fold this belongs to
                     }
-                    wandb.log(train_log_dict, step=trainer.global_step, commit=True)
+                    wandb.log(train_log_dict, step=fold_step, commit=True)
 
                 # Validate
                 if (epoch + 1) % config.mlops.eval_frequency == 0:
-                    val_metrics = trainer.validate(val_loader, target_idx=target_idx)
+                    val_metrics = trainer.validate(val_loader, target_idx=target_idx, train_targets_mean=train_targets_mean)
                     # Use normalized_huber for early stopping & best-model comparison:
                     # always on normalized scale regardless of whether target_scaler is set,
                     # ensuring consistent comparisons across folds.
@@ -1166,7 +1233,7 @@ def main(args):
                         f"Val R² {val_metrics['r2']:.6f}"
                     )
                     
-                    # Log val metrics to W&B (separate commit)
+                    # Log val metrics to W&B with per-fold step counter
                     if wandb is not None and wandb.run is not None:
                         val_log_dict = {
                             "val_loss_normalized": val_loss,
@@ -1178,7 +1245,7 @@ def main(args):
                             "val_correlation": val_metrics["correlation"],
                             "fold_num": fold_num,  # Track which fold this belongs to
                         }
-                        wandb.log(val_log_dict, step=trainer.global_step, commit=True)
+                        wandb.log(val_log_dict, step=fold_step, commit=True)
 
                     # Early stopping check (based on normalized HuberLoss)
                     if early_stopping(val_loss):
@@ -1194,7 +1261,7 @@ def main(args):
             # Use a fresh validate call, but mark it so val_losses doesn't get a duplicate append.
             # (val_losses was already appended during the per-epoch training loop above.)
             logger.info(f"\nFinal validation for Fold {fold_num}...")
-            final_val_metrics = trainer.validate(val_loader, target_idx=target_idx)
+            final_val_metrics = trainer.validate(val_loader, target_idx=target_idx, train_targets_mean=train_targets_mean)
             trainer.val_losses.pop()  # Remove the extra append from this summary-only validate() call
 
             fold_results[fold_num] = {
@@ -1231,6 +1298,9 @@ def main(args):
                 wandb.log(fold_log_dict, step=fold_num)
                 logger.info(f"✓ Logged Fold {fold_num} metrics to W&B (train R²={fold_log_dict['train_r2_final']:.6f}, val R²={fold_log_dict['val_r2']:.6f})")
 
+        # Store train_targets_mean from last fold for test evaluation
+        last_fold_train_targets_mean = train_targets_mean
+
         # Fold results logged during per-fold training
 
         # ==================== TEST EVALUATION ====================
@@ -1253,7 +1323,7 @@ def main(args):
                 logger.info("⚠ No test set scaler available - will evaluate on normalized scale")
 
             trainer._current_target_idx = target_idx
-            test_metrics = trainer.validate(test_loader, target_idx=target_idx)
+            test_metrics = trainer.validate(test_loader, target_idx=target_idx, train_targets_mean=last_fold_train_targets_mean)
 
         # Only process test metrics if evaluation succeeded
         if test_metrics is not None:
