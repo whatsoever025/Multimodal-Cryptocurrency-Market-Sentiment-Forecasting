@@ -1143,6 +1143,13 @@ def main(args):
             )
             logger.info(f"  W&B run: {target_run_name}")
 
+            # --- Define custom x-axes ---
+            # 'fold_num' drives fold_summary/* (final metrics per fold, X=fold).
+            # Per-epoch train/val metrics use step=epoch_in_fold and are registered
+            # per fold inside the fold loop via define_metric calls below.
+            wandb.define_metric("fold_num")  # custom x-axis for fold-level charts
+            wandb.define_metric("fold_summary/*", step_metric="fold_num")
+
         # ==================== WALK-FORWARD TRAINING LOOP ====================
         logger.info("=" * 80)
         logger.info(f"WALK-FORWARD VALIDATION — {target_name}")
@@ -1173,10 +1180,29 @@ def main(args):
             trainer._current_target_idx = target_idx
             trainer.setup_optimizer()
             
-            # Initialize fold-specific step counter for W&B logging
-            # Each fold will have its own step counter (1 → max_epochs)
-            # This creates separate, clean curves per fold instead of monotonic global_step
-            logger.info(f"✓ Fold {fold_num} initialized with clean per-fold step counter")
+            # Global step offset: each fold's epochs are offset by (fold_num-1)*max_epochs
+            # so fold1 uses steps 1..max_epochs, fold2 uses max_epochs+1..2*max_epochs, etc.
+            # This makes all folds visible as SEPARATE curves in WandB (no overlap).
+            fold_step_offset = (fold_num - 1) * config.training.max_epochs
+            logger.info(f"✓ Fold {fold_num} initialized | WandB step offset: {fold_step_offset}")
+
+            # Register per-fold metrics so WandB uses epoch_in_fold as x-axis.
+            # Each fold gets its own set of curves (fold_1/train_loss, fold_2/train_loss, ...).
+            # X-axis = epoch_in_fold (1 → max_epochs), same scale across all folds
+            # → easy visual comparison of training convergence per fold.
+            if wandb is not None and wandb.run is not None:
+                epoch_axis = f"fold_{fold_num}/epoch"
+                wandb.define_metric(epoch_axis)
+                for metric_name in [
+                    f"fold_{fold_num}/train_loss", f"fold_{fold_num}/train_r2",
+                    f"fold_{fold_num}/train_r2_oos", f"fold_{fold_num}/train_rmse",
+                    f"fold_{fold_num}/train_mae", f"fold_{fold_num}/train_correlation",
+                    f"fold_{fold_num}/train_avg_grad_norm", f"fold_{fold_num}/train_max_grad_norm",
+                    f"fold_{fold_num}/val_loss_normalized", f"fold_{fold_num}/val_r2",
+                    f"fold_{fold_num}/val_r2_oos", f"fold_{fold_num}/val_rmse",
+                    f"fold_{fold_num}/val_mae", f"fold_{fold_num}/val_correlation",
+                ]:
+                    wandb.define_metric(metric_name, step_metric=epoch_axis)
 
             # Resume: load checkpoint into the first fold of the first target only.
             if resume_ckpt_path and target_idx == 0 and fold_num == 1:
@@ -1185,11 +1211,13 @@ def main(args):
                 logger.info(f"Resumed from checkpoint — starting at epoch {start_epoch}")
 
             # Early stopping reset
+            # TEMPORARILY DISABLED FOR DEBUGGING: to see if all 5 folds train
             early_stopping = EarlyStopping(
                 patience=config.training.early_stopping_patience,
                 min_delta=1e-4,
                 verbose=True
             )
+            # early_stopping = None  # UNCOMMENT to disable early stopping temporarily
 
             # Train for this fold.
             # On resume, start_epoch > 0 for the FIRST fold of FIRST target only.
@@ -1216,25 +1244,29 @@ def main(args):
                     f"Train Loss {train_loss:.6f} | "
                     f"Train R² {train_metrics['r2']:.6f}"
                 )
-                
-                # Log train metrics to W&B with per-fold step counter
-                # Each fold: step 1→max_epochs, creating separate curves
+
+                # Log train metrics per fold.
+                # Key: fold_N/train_* — each fold has its own named curve.
+                # Step: epoch_in_fold (1 → max_epochs) — same x-axis scale across all folds.
+                # WandB will render fold_1/train_loss, fold_2/train_loss, ... as
+                # separate charts that can be pinned side-by-side for comparison.
                 if wandb is not None and wandb.run is not None:
                     train_log_dict = {
-                        "train_loss": train_loss,
-                        "train_r2": train_metrics["r2"],
-                        "train_r2_oos": train_metrics["r2_oos"],
-                        "train_rmse": train_metrics["rmse"],
-                        "train_mae": train_metrics["mae"],
-                        "train_correlation": train_metrics["correlation"],
-                        "train_avg_gradient_norm": train_metrics["avg_gradient_norm"],
-                        "train_max_gradient_norm": train_metrics["max_gradient_norm"],
-                        "fold_num": fold_num,  # Track which fold this belongs to
+                        f"fold_{fold_num}/epoch":              epoch_in_fold,
+                        f"fold_{fold_num}/train_loss":         train_loss,
+                        f"fold_{fold_num}/train_r2":           train_metrics["r2"],
+                        f"fold_{fold_num}/train_r2_oos":       train_metrics["r2_oos"],
+                        f"fold_{fold_num}/train_rmse":         train_metrics["rmse"],
+                        f"fold_{fold_num}/train_mae":          train_metrics["mae"],
+                        f"fold_{fold_num}/train_correlation":  train_metrics["correlation"],
+                        f"fold_{fold_num}/train_avg_grad_norm": train_metrics["avg_gradient_norm"],
+                        f"fold_{fold_num}/train_max_grad_norm": train_metrics["max_gradient_norm"],
                     }
-                    wandb.log(train_log_dict, step=epoch_in_fold, commit=True)
+                    wandb.log(train_log_dict, commit=False)
 
-                # Validate
-                if (epoch + 1) % config.mlops.eval_frequency == 0:
+                # Validate every eval_frequency epochs
+                run_val = (epoch + 1) % config.mlops.eval_frequency == 0
+                if run_val:
                     val_metrics = trainer.validate(val_loader, target_idx=target_idx, train_targets_mean=train_targets_mean)
                     # Use normalized_huber for early stopping & best-model comparison:
                     # always on normalized scale regardless of whether target_scaler is set,
@@ -1247,21 +1279,25 @@ def main(args):
                         f"Val MSE {val_metrics['mse']:.6f} | "
                         f"Val R² {val_metrics['r2']:.6f}"
                     )
-                    
-                    # Log val metrics to W&B with per-fold step counter
+
+                    # Log val metrics under the same fold_N/ namespace.
+                    # epoch axis = fold_N/epoch (same as train), so train and val for
+                    # this fold share the x-axis and can be overlaid in WandB.
                     if wandb is not None and wandb.run is not None:
                         val_log_dict = {
-                            "val_loss_normalized": val_loss,
-                            "val_mse": val_metrics["mse"],
-                            "val_rmse": val_metrics["rmse"],
-                            "val_mae": val_metrics["mae"],
-                            "val_r2": val_metrics["r2"],
-                            "val_r2_oos": val_metrics["r2_oos"],
-                            "val_correlation": val_metrics["correlation"],
-                            "fold_num": fold_num,  # Track which fold this belongs to
+                            f"fold_{fold_num}/epoch":              epoch_in_fold,
+                            f"fold_{fold_num}/val_loss_normalized": val_loss,
+                            f"fold_{fold_num}/val_r2":             val_metrics["r2"],
+                            f"fold_{fold_num}/val_r2_oos":         val_metrics["r2_oos"],
+                            f"fold_{fold_num}/val_rmse":           val_metrics["rmse"],
+                            f"fold_{fold_num}/val_mae":            val_metrics["mae"],
+                            f"fold_{fold_num}/val_correlation":    val_metrics["correlation"],
                         }
-                        wandb.log(val_log_dict, step=epoch_in_fold, commit=True)
-                        logger.debug(f"✓ W&B validation logged: epoch_in_fold={epoch_in_fold}, fold_num={fold_num}")
+                        wandb.log(val_log_dict, commit=True)
+                        logger.debug(f"✓ W&B val logged: fold={fold_num}, epoch_in_fold={epoch_in_fold}")
+                    else:
+                        if wandb is not None and wandb.run is not None:
+                            wandb.log({}, commit=True)
 
                     # Early stopping check (based on normalized HuberLoss)
                     if early_stopping(val_loss):
@@ -1272,6 +1308,11 @@ def main(args):
                     if val_loss < trainer.best_val_loss:
                         trainer.best_val_loss = val_loss
                         trainer.best_epoch = epoch
+
+                else:
+                    # No validation this epoch — commit the train log
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log({}, commit=True)
 
             # Validate on full validation set for this fold.
             # Use a fresh validate call, but mark it so val_losses doesn't get a duplicate append.
@@ -1299,20 +1340,28 @@ def main(args):
                 for i in range(min(5, len(predictions))):
                     logger.info(f"  [{i+1}] Predicted: {predictions[i].item():.4f} | Actual: {targets[i].item():.4f} | Error: {abs(predictions[i].item() - targets[i].item()):.4f}")
 
-            # Log per-fold metrics to W&B (with step=fold_num for combined chart)
+            # Log per-fold summary metrics to W&B.
+            # We use a CUSTOM x-axis 'fold_num' (defined above via wandb.define_metric)
+            # so these log as a separate line chart (X=fold, Y=metric) that does NOT
+            # conflict with the per-epoch global step used by train/* and val/* curves.
             if wandb is not None and wandb.run is not None:
-                # Include BOTH train and val R² in fold summary for easy comparison
-                fold_log_dict = {
-                    "train_r2_final": final_train_metrics["r2"] if final_train_metrics else 0.0,
-                    "train_r2_oos_final": final_train_metrics["r2_oos"] if final_train_metrics else 0.0,
-                    "val_r2": final_val_metrics["r2"],
-                    "val_r2_oos": final_val_metrics["r2_oos"],
-                    "val_rmse": final_val_metrics["rmse"],
-                    "val_mae": final_val_metrics["mae"],
-                    "val_correlation": final_val_metrics["correlation"],
+                fold_summary_dict = {
+                    "fold_num":                        fold_num,
+                    "fold_summary/train_r2":           final_train_metrics["r2"]     if final_train_metrics else 0.0,
+                    "fold_summary/train_r2_oos":       final_train_metrics["r2_oos"] if final_train_metrics else 0.0,
+                    "fold_summary/val_r2":             final_val_metrics["r2"],
+                    "fold_summary/val_r2_oos":         final_val_metrics["r2_oos"],
+                    "fold_summary/val_rmse":           final_val_metrics["rmse"],
+                    "fold_summary/val_mae":            final_val_metrics["mae"],
+                    "fold_summary/val_correlation":    final_val_metrics["correlation"],
+                    "fold_summary/val_loss_normalized": final_val_metrics["normalized_huber"],
                 }
-                wandb.log(fold_log_dict, step=fold_num)
-                logger.info(f"✓ Logged Fold {fold_num} metrics to W&B (train R²={fold_log_dict['train_r2_final']:.6f}, val R²={fold_log_dict['val_r2']:.6f})")
+                wandb.log(fold_summary_dict)  # no step= argument: WandB uses fold_num as x-axis
+                logger.info(
+                    f"✓ W&B fold chart logged: fold={fold_num} "
+                    f"train_r2={final_train_metrics['r2'] if final_train_metrics else 0:.6f}, "
+                    f"val_r2={final_val_metrics['r2']:.6f}"
+                )
 
         # Store train_targets_mean from last fold for test evaluation
         last_fold_train_targets_mean = train_targets_mean
