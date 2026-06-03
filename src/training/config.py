@@ -75,7 +75,7 @@ class TrainingConfig:
     warmup_steps: int = 800
     use_warmup: bool = True
     num_training_steps: Optional[int] = None
-    early_stopping_patience: int = 7
+    early_stopping_patience: int = 15  # Increased from 7 to allow more training epochs and more validation logs
 
     def __post_init__(self):
         """Validate training config."""
