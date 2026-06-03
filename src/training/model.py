@@ -196,19 +196,23 @@ class TemporalLSTMLayer(nn.Module):
 
 class PredictionHead(nn.Module):
     """
-    Simplified MLP prediction head for continuous sentiment score.
+    MLP prediction head for continuous sentiment score.
     
-    Input: (batch, lstm_hidden_dim=64)
+    Input: (batch, lstm_hidden_dim)
     Output: (batch, 1) - scaled continuous score
+    
+    Intermediate dimension scales dynamically with input_dim (input_dim // 2)
+    to avoid information bottleneck when lstm_hidden_dim increases (e.g. 64 → 128).
     """
     
     def __init__(self, input_dim: int = 64, dropout: float = 0.4):
         super().__init__()
+        mid_dim = max(input_dim // 2, 16)  # Scale with input; floor at 16 for small configs
         self.head = nn.Sequential(
-            nn.Linear(input_dim, 16),
+            nn.Linear(input_dim, mid_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(16, 1),
+            nn.Linear(mid_dim, 1),
         )
         # Initialize weights
         for layer in self.head:

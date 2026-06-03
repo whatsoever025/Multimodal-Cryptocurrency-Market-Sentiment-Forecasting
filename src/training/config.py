@@ -35,15 +35,16 @@ class DataConfig:
 class ModelConfig:
     """Architecture configuration."""
     hidden_dim: int = 256  # Hidden dimension in encoders/attention - MUST match embedding dimensions (256D)
-    bottleneck_dim: int = 64  # Bottleneck layer: 256 -> 64 (compression before LSTM)
+    bottleneck_dim: int = 128  # Increased from 64: 24 timesteps × 3 modalities → more capacity needed
+                                # before LSTM. 64 was too small to encode 24h of multimodal context.
     lstm_layers: int = 1  # Simplified: reduced from 2 to 1
-    lstm_hidden_dim: int = 64  # Simplified: reduced from 256 to 64
-    lstm_dropout: float = 0.5  # AGGRESSIVE: Kill temporal memorization (prevents overfitting on sequences)
+    lstm_hidden_dim: int = 128  # Increased from 64: need more capacity for temporal compression
+                                 # of 24h context before the prediction head
+    lstm_dropout: float = 0.3  # Reduced from 0.5: too aggressive with low LR, caused plateau
     attention_heads: int = 4
-    mha_dropout: float = 0.1  # CRITICAL (2025-04-17): Must stay ≤0.1 for numerical stability in scaled dot-product backward
-                               # Attention is already regularized by its structure - no higher dropout needed
-    encoder_dropout: float = 0.3  # INCREASED: Strong regularization in tabular encoder MLP (safe from NaN)
-    head_dropout: float = 0.4  # INCREASED: Strong regularization in prediction head (safe from NaN, only MLPs)
+    mha_dropout: float = 0.1  # CRITICAL (2025-04-17): Must stay ≤0.1 for numerical stability
+    encoder_dropout: float = 0.2  # Reduced from 0.3: high dropout + low LR = stalled learning
+    head_dropout: float = 0.3  # Reduced from 0.4: same rationale
     grad_clip: float = 1.0
     frozen_backbones: bool = True  # Freeze BERT & ViT
 
@@ -69,13 +70,16 @@ class ModelConfig:
 class TrainingConfig:
     """Training loop configuration."""
     max_epochs: int = 60
-    learning_rate: float = 1e-5
-    weight_decay: float = 1e-2
+    learning_rate: float = 1e-4   # Tuned for noisy targets (y_heuristic std≈1.15, y_vol_adj_return std≈2.1).
+                                   # 3e-4 may overshoot on high-noise targets; 1e-4 is safer midpoint.
+                                   # Original 1e-5 was too low (plateau after epoch 2).
+    weight_decay: float = 1e-3    # Reduced from 1e-2: wd/lr ratio was 10x, counteracting gradient updates.
     accumulate_steps: int = 2
-    warmup_steps: int = 800
+    warmup_steps: int = 100       # ~4 epochs warmup (walk-forward fold: ~23 steps/epoch with ~5,500 samples).
+                                   # Original 800 steps = 35+ epochs of warmup — LR never reached peak.
     use_warmup: bool = True
     num_training_steps: Optional[int] = None
-    early_stopping_patience: int = 15  # Increased from 7 to allow more training epochs and more validation logs
+    early_stopping_patience: int = 15
 
     def __post_init__(self):
         """Validate training config."""
