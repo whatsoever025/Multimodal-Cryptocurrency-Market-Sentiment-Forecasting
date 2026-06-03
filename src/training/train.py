@@ -1204,8 +1204,7 @@ def main(args):
 
             for epoch in range(fold_start, config.training.max_epochs):
                 trainer.epoch = epoch
-                fold_step = epoch - fold_start + 1  # Per-fold step (1, 2, 3, ...)
-                global_epoch = (fold_num - 1) * config.training.max_epochs + fold_step  # Global epoch across all folds
+                epoch_in_fold = epoch - fold_start + 1  # Epoch per fold (1, 2, 3, ...)
 
                 # Train epoch
                 train_metrics = trainer.train_epoch(train_loader, target_idx=target_idx, train_targets_mean=train_targets_mean)
@@ -1213,7 +1212,7 @@ def main(args):
                 train_loss = train_metrics["loss"]
 
                 logger.info(
-                    f"Fold {fold_num}/5 Epoch {fold_step:3d}/{config.training.max_epochs} | "
+                    f"Fold {fold_num}/5 Epoch {epoch_in_fold:3d}/{config.training.max_epochs} | "
                     f"Train Loss {train_loss:.6f} | "
                     f"Train R² {train_metrics['r2']:.6f}"
                 )
@@ -1232,7 +1231,7 @@ def main(args):
                         "train_max_gradient_norm": train_metrics["max_gradient_norm"],
                         "fold_num": fold_num,  # Track which fold this belongs to
                     }
-                    wandb.log(train_log_dict, step=global_epoch, commit=True)
+                    wandb.log(train_log_dict, step=epoch_in_fold, commit=True)
 
                 # Validate
                 if (epoch + 1) % config.mlops.eval_frequency == 0:
@@ -1243,7 +1242,7 @@ def main(args):
                     val_loss = val_metrics["normalized_huber"]
 
                     logger.info(
-                        f"Fold {fold_num}/5 Epoch {fold_step:3d}/{config.training.max_epochs} | "
+                        f"Fold {fold_num}/5 Epoch {epoch_in_fold:3d}/{config.training.max_epochs} | "
                         f"Val HuberLoss (normalized) {val_loss:.6f} | "
                         f"Val MSE {val_metrics['mse']:.6f} | "
                         f"Val R² {val_metrics['r2']:.6f}"
@@ -1261,8 +1260,8 @@ def main(args):
                             "val_correlation": val_metrics["correlation"],
                             "fold_num": fold_num,  # Track which fold this belongs to
                         }
-                        wandb.log(val_log_dict, step=global_epoch, commit=True)
-                        logger.debug(f"✓ W&B validation logged: global_epoch={global_epoch}, fold_num={fold_num}")
+                        wandb.log(val_log_dict, step=epoch_in_fold, commit=True)
+                        logger.debug(f"✓ W&B validation logged: epoch_in_fold={epoch_in_fold}, fold_num={fold_num}")
 
                     # Early stopping check (based on normalized HuberLoss)
                     if early_stopping(val_loss):
