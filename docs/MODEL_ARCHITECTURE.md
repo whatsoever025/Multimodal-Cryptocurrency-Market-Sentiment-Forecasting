@@ -1,7 +1,7 @@
 # MultimodalFusionNet Architecture Documentation
 
-**Last Updated:** May 24, 2026  
-**Model Version:** 5.0 (Offline Feature Extraction & Regime Gating)  
+**Last Updated:** June 3, 2026  
+**Model Version:** 5.1 (Hyperparameter Re-tuning — Plateau Fix)  
 **Status:** Production-Ready
 
 ---
@@ -58,11 +58,11 @@
 
 ### 1. TabularEncoder
 ```
-Input: (batch, seq_len, 7) numeric features
+Input: (batch, seq_len, 7+16=23) numeric + asset embedding features
        ↓
-Linear (7 → 64) + ReLU + Dropout (0.3)
+Linear (23 → 64) + ReLU + Dropout (0.2)
        ↓
-Linear (64 → 256) + ReLU + Dropout (0.3)
+Linear (64 → 256) + ReLU + Dropout (0.2)
        ↓
 Output: (batch, seq_len, 256)
 ```
@@ -95,36 +95,39 @@ Reshape back to: (batch, seq_len, 256)
 ```
 Input: (batch, seq_len, 256)  [Fused [FUSION] representation]
        ↓
-Linear Projection: 256 → 64
+Linear Projection: 256 → 128
        ↓
-Output: (batch, seq_len, 64)
+Output: (batch, seq_len, 128)
 ```
-Compresses features to reduce parameters in the subsequent LSTM by 4x.
+Compresses features before LSTM. **128** (up from 64) provides sufficient capacity
+to encode 24-hour multimodal context without information bottleneck.
 
 ### 4. Temporal LSTM Layer
 ```
-Input: (batch, seq_len, 64)
+Input: (batch, seq_len, 128)
        ↓
 LSTM Cell (1 layer, batch-first)
-├─ Input Size: 64
-├─ Hidden Size: 64
-├─ Dropout: 0.5 (Aggressive to prevent sequence memorization)
+├─ Input Size: 128
+├─ Hidden Size: 128
+├─ Dropout: 0.3 (reduced from 0.5 — was too aggressive at low LR)
 └─ Batch First: True
        ↓
-Extract Final Hidden State h_n[-1] → (batch, 64)
+Extract Final Hidden State h_n[-1] → (batch, 128)
 ```
 
 ### 5. Prediction Heads
 Independent prediction heads are trained for each of the three targets.
 ```
-Input: (batch, 64)  [LSTM final hidden state]
+Input: (batch, 128)  [LSTM final hidden state]
        ↓
-Linear (64 → 16) + ReLU + Dropout (0.4)
+Linear (128 → 64) + ReLU + Dropout (0.3)
        ↓
-Linear (16 → 1)
+Linear (64 → 1)
        ↓
 Output: (batch, 1)  [continuous predicted sentiment score]
 ```
+> **Note:** Intermediate dimension is computed dynamically as `input_dim // 2`
+> (here: 128 // 2 = 64), so it scales automatically with `lstm_hidden_dim`.
 
 ---
 
@@ -140,14 +143,14 @@ batch_size: 128                         # Default batch size
 ### ModelConfig (`config.py`)
 ```python
 hidden_dim: 256                         # Internal embedding dimension
-bottleneck_dim: 64                      # Bottleneck dimension
+bottleneck_dim: 128                     # Bottleneck dimension (raised from 64: more capacity for 24h context)
 lstm_layers: 1                          # LSTM layers
-lstm_hidden_dim: 64                     # LSTM hidden dimension
-lstm_dropout: 0.5                       # Aggressive temporal dropout
+lstm_hidden_dim: 128                    # LSTM hidden dimension (raised from 64)
+lstm_dropout: 0.3                       # Reduced from 0.5 (was too aggressive at low LR)
 attention_heads: 4                      # Cross-modal attention heads
 mha_dropout: 0.1                        # MHA dropout (keeps backward dot-product stable)
-encoder_dropout: 0.3                    # TabularEncoder dropout
-head_dropout: 0.4                       # Prediction head dropout
+encoder_dropout: 0.2                    # TabularEncoder dropout (reduced from 0.3)
+head_dropout: 0.3                       # Prediction head dropout (reduced from 0.4)
 grad_clip: 1.0                          # Gradient norm clipping (L2)
 frozen_backbones: True                  # Freeze FinBERT & ViT
 ```
@@ -155,13 +158,23 @@ frozen_backbones: True                  # Freeze FinBERT & ViT
 ### TrainingConfig (`config.py`)
 ```python
 max_epochs: 60                          # Training epochs
-learning_rate: 1e-5                     # Learning rate (conservative for stability)
-weight_decay: 1e-2                      # Weight decay regularization
-accumulate_steps: 2                     # Gradient accumulation steps
-warmup_steps: 800                       # Linear warmup steps
+learning_rate: 1e-4                     # Raised from 1e-5: original was too low, caused plateau after epoch 2
+                                        # Safe range for frozen-backbone head-only training: 1e-4 to 5e-4
+weight_decay: 1e-3                      # Reduced from 1e-2: wd/lr ratio was 10x, counteracting gradient updates
+accumulate_steps: 2                     # Gradient accumulation steps (effective batch = 256)
+warmup_steps: 100                       # Reduced from 800: ~4 epochs (walk-forward fold ≈ 21 steps/epoch)
+                                        # Original 800 steps = 38 epochs of warmup (LR never reached peak)
 use_warmup: True                        # Enable warmup schedule
-early_stopping_patience: 7              # Patience epochs (val loss min_delta=1e-4)
+early_stopping_patience: 15             # Patience epochs (val loss min_delta=1e-4)
 ```
+
+> **v5.1 Rationale — Plateau Fix:**  
+> Walk-forward folds contain ~5,500 training samples (60% of one asset's 37,764 rows).  
+> With `batch_size=128`, `accumulate_steps=2` → **~21 optimizer steps/epoch**.  
+> The original `warmup_steps=800` therefore spanned **≈ 38 epochs of warmup**, meaning  
+> the LR never reached its peak before cosine decay returned it to near-zero.  
+> Combined with `weight_decay=1e-2` (10× the LR) actively counteracting gradient updates,  
+> the model had essentially zero effective learning rate for 60% of training.
 
 ---
 
