@@ -1210,14 +1210,16 @@ def main(args):
                 start_epoch = trainer.epoch + 1
                 logger.info(f"Resumed from checkpoint — starting at epoch {start_epoch}")
 
-            # Early stopping reset
-            # TEMPORARILY DISABLED FOR DEBUGGING: to see if all 5 folds train
+            # Early stopping reset.
+            # min_delta=1e-5 (reduced from 1e-4): financial time-series improvements are
+            # often < 1e-4 per epoch in the slow-learning phase (epoch 2-9 plateau observed).
+            # 1e-4 was cutting training at epoch ~16 when loss was still decreasing.
+            # 1e-5 responds to genuine stagnation without triggering on normal noise.
             early_stopping = EarlyStopping(
                 patience=config.training.early_stopping_patience,
-                min_delta=1e-4,
+                min_delta=1e-5,
                 verbose=True
             )
-            # early_stopping = None  # UNCOMMENT to disable early stopping temporarily
 
             # Train for this fold.
             # On resume, start_epoch > 0 for the FIRST fold of FIRST target only.
