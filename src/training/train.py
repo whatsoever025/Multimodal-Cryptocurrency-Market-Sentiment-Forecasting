@@ -512,6 +512,18 @@ class Trainer:
             # Move batch to device (float32 by default)
             batch = {k: v.to(self.device) for k, v in batch.items()}
             
+            # ========== EMBEDDING NOISE REGULARIZATION ==========
+            # Add small Gaussian noise to pre-extracted embeddings during training only.
+            # Prevents the model from memorizing specific embedding fingerprints from
+            # training folds (a key overfitting mechanism when using frozen features).
+            # std=0.01 is small relative to embedding scale (typically std≈0.1-0.5),
+            # enough to act as regularization without distorting the semantic signal.
+            if self.model.training:
+                noise_std = 0.01
+                batch = dict(batch)  # Shallow copy to avoid modifying the original batch dict
+                batch["text_embedding"] = batch["text_embedding"] + torch.randn_like(batch["text_embedding"]) * noise_std
+                batch["image_embedding"] = batch["image_embedding"] + torch.randn_like(batch["image_embedding"]) * noise_std
+
             # ========== FORWARD PASS (FLOAT32) ==========
             # Standard PyTorch forward pass - all tensors remain float32
             predictions = self.model(batch)                    # (batch,)
