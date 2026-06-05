@@ -1210,9 +1210,10 @@ def main(args):
                     f"fold_{fold_num}/train_r2_oos", f"fold_{fold_num}/train_rmse",
                     f"fold_{fold_num}/train_mae", f"fold_{fold_num}/train_correlation",
                     f"fold_{fold_num}/train_avg_grad_norm", f"fold_{fold_num}/train_max_grad_norm",
-                    f"fold_{fold_num}/val_loss_normalized", f"fold_{fold_num}/val_r2",
-                    f"fold_{fold_num}/val_r2_oos", f"fold_{fold_num}/val_rmse",
-                    f"fold_{fold_num}/val_mae", f"fold_{fold_num}/val_correlation",
+                    f"fold_{fold_num}/val_loss_normalized", f"fold_{fold_num}/val_loss_ema",
+                    f"fold_{fold_num}/val_r2", f"fold_{fold_num}/val_r2_oos",
+                    f"fold_{fold_num}/val_rmse", f"fold_{fold_num}/val_mae",
+                    f"fold_{fold_num}/val_correlation",
                 ]:
                     wandb.define_metric(metric_name, step_metric=epoch_axis)
 
@@ -1237,6 +1238,14 @@ def main(args):
             # On resume, start_epoch > 0 for the FIRST fold of FIRST target only.
             fold_start = start_epoch if (target_idx == 0 and fold_num == 1) else 0
             start_epoch = 0  # Reset so subsequent folds/targets always start at 0
+
+            # EMA of val loss for early stopping.
+            # Raw val loss on small val windows (~500 samples) is very noisy —
+            # a single noisy batch can make val loss spike or dip by 0.003+,
+            # which triggers early stopping prematurely.
+            # EMA with α=0.3 smooths this noise while still responding to real trends.
+            # Formula: ema = α * current + (1-α) * previous
+            ema_val_loss: Optional[float] = None
             
             final_train_metrics = None  # Track final train metrics for fold summary
             logger.info(f"\n{'='*80}")
@@ -1313,12 +1322,22 @@ def main(args):
                         if wandb is not None and wandb.run is not None:
                             wandb.log({}, commit=True)
 
-                    # Early stopping check (based on normalized HuberLoss)
-                    if early_stopping(val_loss):
-                        logger.info(f"✓ Early stopping triggered at epoch {epoch+1}")
+                    # Early stopping: use EMA-smoothed val loss instead of raw val loss.
+                    # Raw val loss on small val windows is too noisy for direct stopping decisions.
+                    ema_alpha = 0.3
+                    if ema_val_loss is None:
+                        ema_val_loss = val_loss  # Bootstrap with first observation
+                    else:
+                        ema_val_loss = ema_alpha * val_loss + (1 - ema_alpha) * ema_val_loss
+
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log({f"fold_{fold_num}/val_loss_ema": ema_val_loss}, commit=False)
+
+                    if early_stopping(ema_val_loss):
+                        logger.info(f"✓ Early stopping triggered at epoch {epoch+1} (EMA val loss: {ema_val_loss:.6f})")
                         break
 
-                    # Update best model for this fold (based on normalized HuberLoss)
+                    # Update best model for this fold (based on raw val loss, not EMA)
                     if val_loss < trainer.best_val_loss:
                         trainer.best_val_loss = val_loss
                         trainer.best_epoch = epoch
