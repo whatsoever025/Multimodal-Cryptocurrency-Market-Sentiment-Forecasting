@@ -69,11 +69,11 @@ class ModelConfig:
 class TrainingConfig:
     """Training loop configuration."""
     max_epochs: int = 60
-    learning_rate: float = 7e-5   # Reduced from 1e-4: slower updates = less memorization of training noise.
-                                   # Overfitting confirmed (val loss ↑ while train loss ↓ from epoch 2).
+    learning_rate: float = 1e-4   # Comparison run: testing 1e-4 with EMA val smoothing.
+                                   # Previous run at 1e-4 showed overfitting without EMA.
+                                   # This run uses full regularization stack to make fair comparison.
     weight_decay: float = 3e-3    # Increased from 1e-3: stronger L2 penalty to prevent weight growth.
-                                   # With lr=7e-5, wd/lr ratio ≈ 43 (moderate-to-aggressive, appropriate
-                                   # for financial time-series with high noise and small fold datasets).
+                                   # With lr=1e-4, wd/lr ratio = 30 (moderate, still protective).
     accumulate_steps: int = 2
     warmup_steps: int = 100       # ~4 epochs warmup (walk-forward fold: ~23 steps/epoch with ~5,500 samples).
                                    # Original 800 steps = 35+ epochs of warmup — LR never reached peak.
