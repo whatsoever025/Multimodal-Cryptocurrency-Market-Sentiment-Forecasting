@@ -69,7 +69,7 @@ class ModelConfig:
 class TrainingConfig:
     """Training loop configuration."""
     max_epochs: int = 60
-    learning_rate: float = 3e-5   # Comparison run: testing 3e-5 (between 1e-5 too-low and 7e-5 best).
+    learning_rate: float = 1e-5   # Comparison run: testing 3e-5 (between 1e-5 too-low and 7e-5 best).
                                    # Completes the LR sensitivity curve for thesis comparison.
     weight_decay: float = 3e-3    # Increased from 1e-3: stronger L2 penalty to prevent weight growth.
                                    # With lr=1e-4, wd/lr ratio = 30 (moderate, still protective).
