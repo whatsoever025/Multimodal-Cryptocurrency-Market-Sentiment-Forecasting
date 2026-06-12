@@ -81,6 +81,15 @@ class TrainingConfig:
     early_stopping_patience: int = 10  # Reduced from 15: overfitting confirmed (val loss increases
                                         # from epoch 2 while train loss decreases). Stop earlier
                                         # to save the best val checkpoint before overfitting worsens.
+    early_stopping_min_delta: float = 1e-5  # Minimum val loss improvement to count as 'improved'.
+                                             # 1e-5 (not 1e-4) to avoid premature stopping in slow-learning phase.
+    ema_alpha: float = 0.3                  # EMA smoothing factor for val loss used in early stopping.
+                                             # α=0.3: responds to real trends while filtering per-epoch noise.
+    embedding_noise_std: float = 0.01       # Std of Gaussian noise injected into text/image embeddings
+                                             # during training. Acts as regularization against overfitting.
+                                             # Set to 0.0 to disable.
+    huber_delta: float = 1.0                # Delta parameter for HuberLoss (used in both train & validate).
+                                             # Must be consistent across both phases.
 
     def __post_init__(self):
         """Validate training config."""
@@ -96,6 +105,14 @@ class TrainingConfig:
             raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
         if self.early_stopping_patience <= 0:
             raise ValueError(f"early_stopping_patience must be > 0, got {self.early_stopping_patience}")
+        if self.early_stopping_min_delta < 0:
+            raise ValueError(f"early_stopping_min_delta must be >= 0, got {self.early_stopping_min_delta}")
+        if not (0 < self.ema_alpha < 1):
+            raise ValueError(f"ema_alpha must be in (0, 1), got {self.ema_alpha}")
+        if self.embedding_noise_std < 0:
+            raise ValueError(f"embedding_noise_std must be >= 0, got {self.embedding_noise_std}")
+        if self.huber_delta <= 0:
+            raise ValueError(f"huber_delta must be > 0, got {self.huber_delta}")
 
 
 @dataclass
@@ -183,51 +200,79 @@ def create_config(
     seq_len: int = 24,
     batch_size: int = None,  # None = use DataConfig default (128)
     hidden_dim: int = 256,
-    learning_rate: float = 1e-4,
+    learning_rate: float = None,
+    weight_decay: float = None,
+    early_stopping_patience: int = None,
+    early_stopping_min_delta: float = None,
+    ema_alpha: float = None,
+    embedding_noise_std: float = None,
+    huber_delta: float = None,
     wandb_run_name: Optional[str] = None,
     **kwargs
 ) -> ExperimentConfig:
     """
     Factory function to create ExperimentConfig with custom parameters.
-    
+
+    All training hyperparameters default to None — if None, the field's default
+    value defined in TrainingConfig is kept. This avoids any double-default problem.
+
     Args:
-        asset: "BTC" or "ETH"
+        asset: "BTC", "ETH", or "MULTI"
         seq_len: Sliding window length in hours
         batch_size: Batch size per GPU (None = use DataConfig default)
         hidden_dim: Model hidden dimension
-        learning_rate: Optimizer learning rate
+        learning_rate: AdamW learning rate
+        weight_decay: AdamW weight decay
+        early_stopping_patience: Epochs without improvement before stopping
+        early_stopping_min_delta: Minimum val-loss drop to count as improvement
+        ema_alpha: EMA smoothing factor for val loss (0 < alpha < 1)
+        embedding_noise_std: Std of noise added to embeddings during training (0 = disabled)
+        huber_delta: Delta for HuberLoss (must be same in train & validate)
         wandb_run_name: Unique run identifier for W&B tracking
-        **kwargs: Additional config overrides
-    
+        **kwargs: Additional config overrides (applied to top-level ExperimentConfig attrs)
+
     Returns:
         ExperimentConfig instance
     """
     config = ExperimentConfig()
-    
+
     # Update data config
     config.data.asset = asset
     config.data.seq_len = seq_len
     if batch_size is not None:
         config.data.batch_size = batch_size
-    
+
     # Update model config
     config.model.hidden_dim = hidden_dim
-    
-    # Update training config
-    config.training.learning_rate = learning_rate
-    
+
+    # Update training config — only override when explicitly provided
+    if learning_rate is not None:
+        config.training.learning_rate = learning_rate
+    if weight_decay is not None:
+        config.training.weight_decay = weight_decay
+    if early_stopping_patience is not None:
+        config.training.early_stopping_patience = early_stopping_patience
+    if early_stopping_min_delta is not None:
+        config.training.early_stopping_min_delta = early_stopping_min_delta
+    if ema_alpha is not None:
+        config.training.ema_alpha = ema_alpha
+    if embedding_noise_std is not None:
+        config.training.embedding_noise_std = embedding_noise_std
+    if huber_delta is not None:
+        config.training.huber_delta = huber_delta
+
     # Update MLOps config
     if wandb_run_name:
         config.mlops.wandb_run_name = wandb_run_name
-    
-    # Apply any additional overrides
+
+    # Apply any additional top-level overrides
     for key, value in kwargs.items():
         if hasattr(config, key):
             setattr(config, key, value)
-    
-    # Trigger validation
+
+    # Re-trigger validation after all overrides applied
     config.__post_init__()
-    
+
     return config
 
 

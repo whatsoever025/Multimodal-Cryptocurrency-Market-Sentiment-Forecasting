@@ -518,8 +518,8 @@ class Trainer:
             # training folds (a key overfitting mechanism when using frozen features).
             # std=0.01 is small relative to embedding scale (typically std≈0.1-0.5),
             # enough to act as regularization without distorting the semantic signal.
-            if self.model.training:
-                noise_std = 0.01
+            if self.model.training and self.config.training.embedding_noise_std > 0:
+                noise_std = self.config.training.embedding_noise_std
                 batch = dict(batch)  # Shallow copy to avoid modifying the original batch dict
                 batch["text_embedding"] = batch["text_embedding"] + torch.randn_like(batch["text_embedding"]) * noise_std
                 batch["image_embedding"] = batch["image_embedding"] + torch.randn_like(batch["image_embedding"]) * noise_std
@@ -540,7 +540,7 @@ class Trainer:
             
             # Compute HuberLoss (robust to outliers)
             # More stable than MSE for noisy market data with outliers
-            loss = nn.HuberLoss(delta=1.0)(predictions_clamped, targets)
+            loss = nn.HuberLoss(delta=self.config.training.huber_delta)(predictions_clamped, targets)
             
             # ========== NaN CHECK BEFORE BACKWARD ==========
             # Detect numerical issues early
@@ -748,7 +748,7 @@ class Trainer:
                 # Use HuberLoss for consistency with training (robust to outliers).
                 # NOTE: This is HuberLoss, not MSE — kept on normalized scale intentionally
                 # so val_losses is comparable across folds regardless of target_scaler.
-                huber_loss = nn.HuberLoss(delta=1.0)(predictions, targets)
+                huber_loss = nn.HuberLoss(delta=self.config.training.huber_delta)(predictions, targets)
                 mae = nn.L1Loss()(predictions, targets)
                 
                 total_huber += huber_loss.item()
@@ -906,6 +906,13 @@ def main(args):
     num_folds = getattr(args, 'num_folds', 5)
     ablation_mode = getattr(args, 'ablation', 'full')
     targets_filter = getattr(args, 'targets', None)  # e.g. ["y_baseline"] or None for all
+    learning_rate            = getattr(args, 'learning_rate', None)
+    weight_decay             = getattr(args, 'weight_decay', None)
+    early_stopping_patience  = getattr(args, 'early_stopping_patience', None)
+    early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', None)
+    ema_alpha                = getattr(args, 'ema_alpha', None)
+    embedding_noise_std      = getattr(args, 'embedding_noise_std', None)
+    huber_delta              = getattr(args, 'huber_delta', None)
     # Setup
     setup_logging()
     logger.info("=" * 80)
@@ -934,12 +941,41 @@ def main(args):
         logger.info(f"Loading config from {config_path}...")
         # For now, use default config (could load from YAML in future)
         config = ExperimentConfig()
+        config.data.asset = asset
+        if wandb_run_name := run_name:
+            config.mlops.wandb_run_name = wandb_run_name
     else:
         config = create_config(
             asset=asset,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_delta=early_stopping_min_delta,
+            ema_alpha=ema_alpha,
+            embedding_noise_std=embedding_noise_std,
+            huber_delta=huber_delta,
             wandb_run_name=run_name,
         )
-        config.debug = debug
+    config.debug = debug
+
+    # ── CLI overrides: apply ALL explicitly-passed args after config creation ──
+    # This ensures overrides work for BOTH the --config branch and the default branch.
+    _overrides = {
+        "learning_rate":            learning_rate,
+        "weight_decay":             weight_decay,
+        "early_stopping_patience":  early_stopping_patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
+        "ema_alpha":                ema_alpha,
+        "embedding_noise_std":      embedding_noise_std,
+        "huber_delta":              huber_delta,
+    }
+    applied = []
+    for field, value in _overrides.items():
+        if value is not None:
+            setattr(config.training, field, value)
+            applied.append(f"{field}={value}")
+    if applied:
+        logger.info(f"✓ CLI overrides applied: {', '.join(applied)}")
     
     logger.info(f"Config: asset={config.data.asset}, seq_len={config.data.seq_len}, batch_size={config.data.batch_size}")
     logger.info(f"Model: hidden_dim={config.model.hidden_dim}, frozen_backbones={config.model.frozen_backbones}")
@@ -1230,7 +1266,7 @@ def main(args):
             # 1e-5 responds to genuine stagnation without triggering on normal noise.
             early_stopping = EarlyStopping(
                 patience=config.training.early_stopping_patience,
-                min_delta=1e-5,
+                min_delta=config.training.early_stopping_min_delta,
                 verbose=True
             )
 
@@ -1324,7 +1360,7 @@ def main(args):
 
                     # Early stopping: use EMA-smoothed val loss instead of raw val loss.
                     # Raw val loss on small val windows is too noisy for direct stopping decisions.
-                    ema_alpha = 0.3
+                    ema_alpha = config.training.ema_alpha
                     if ema_val_loss is None:
                         ema_val_loss = val_loss  # Bootstrap with first observation
                     else:
@@ -1527,27 +1563,48 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train multimodal crypto sentiment model")
-    parser.add_argument("--asset", choices=["MULTI"], default="MULTI", help="Cryptocurrency asset (multi-asset: BTC+ETH combined)")
-    parser.add_argument("--features-dir", type=str, default="./data/features", help="Local path to pre-extracted Kaggle features (contains text_embeddings_*.pt, image_embeddings_*.pt, tabular_features_scaled_*.pt, target_scores_scaled_*.pt)")
-    parser.add_argument("--run-name", type=str, default=None, help="W&B run name")
-    parser.add_argument("--config", type=str, default=None, help="Config file path (YAML)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
-    parser.add_argument("--debug", action="store_true", help="Debug mode (small dataset)")
-    parser.add_argument("--num-folds", type=int, default=5, help="Number of walk-forward folds (default: 5)")
+    parser.add_argument("--asset", choices=["MULTI"], default="MULTI",
+                        help="Cryptocurrency asset (multi-asset: BTC+ETH combined)")
+    parser.add_argument("--features-dir", type=str, default="./data/features",
+                        help="Local path to pre-extracted features directory")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="W&B run name")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Config file path (YAML)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint")
+    parser.add_argument("--debug", action="store_true",
+                        help="Debug mode (small dataset, CPU)")
+    parser.add_argument("--num-folds", type=int, default=5,
+                        help="Number of walk-forward folds (default: 5)")
     parser.add_argument("--ablation", type=str, default="full",
                         choices=["full", "tabular_only", "no_text", "no_image"],
-                        help="Ablation mode: full (all modalities), tabular_only (zero text+image), "
-                             "no_text (zero text), no_image (zero image)")
+                        help="Ablation mode: full (all modalities), tabular_only, no_text, no_image")
     parser.add_argument("--targets", nargs="+", default=None,
                         choices=["y_baseline", "y_heuristic", "y_vol_adj_return"],
-                        help="Which targets to train (default: all 3). "
-                             "Example: --targets y_baseline")
-    
+                        help="Which targets to train (default: all 3). Example: --targets y_baseline")
+    # ── Training hyperparameter overrides (all optional; default = config.py values) ──
+    parser.add_argument("--learning-rate", type=float, default=None, dest="learning_rate",
+                        help="AdamW learning rate (default: TrainingConfig.learning_rate = 1e-5)")
+    parser.add_argument("--weight-decay", type=float, default=None, dest="weight_decay",
+                        help="AdamW weight decay (default: TrainingConfig.weight_decay = 3e-3)")
+    parser.add_argument("--early-stopping-patience", type=int, default=None, dest="early_stopping_patience",
+                        help="Early stopping patience in epochs (default: TrainingConfig.early_stopping_patience = 10)")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=None, dest="early_stopping_min_delta",
+                        help="Min val-loss improvement to reset patience (default: TrainingConfig.early_stopping_min_delta = 1e-5)")
+    parser.add_argument("--ema-alpha", type=float, default=None, dest="ema_alpha",
+                        help="EMA alpha for val loss smoothing in early stopping (default: TrainingConfig.ema_alpha = 0.3)")
+    parser.add_argument("--embedding-noise-std", type=float, default=None, dest="embedding_noise_std",
+                        help="Gaussian noise std for embedding regularization; 0 = disabled (default: 0.01)")
+    parser.add_argument("--huber-delta", type=float, default=None, dest="huber_delta",
+                        help="HuberLoss delta, shared between train & validate (default: 1.0)")
+
     args = parser.parse_args()
-    
+
     # Auto-generate run name if not provided
     if args.run_name is None:
         args.run_name = f"{args.asset.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
+
     main(args)
