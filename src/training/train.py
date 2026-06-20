@@ -734,6 +734,7 @@ class Trainer:
         # Collect all predictions and targets for post-hoc analysis
         all_predictions = []
         all_targets = []
+        all_is_post_etf = []
         
         with torch.no_grad():
             for batch in val_loader:
@@ -758,10 +759,17 @@ class Trainer:
                 # Collect for global metrics
                 all_predictions.append(predictions.cpu())
                 all_targets.append(targets.cpu())
+                
+                # Extract is_post_ETF flag from tabular data (last timestep, col 6)
+                # Since StandardScaler is used, the binary 0/1 becomes negative/positive
+                is_post_etf_scaled = batch["tabular"][:, -1, 6].cpu()
+                is_post_etf_binary = (is_post_etf_scaled > 0.0).float()
+                all_is_post_etf.append(is_post_etf_binary)
         
         # Concatenate all predictions and targets
         all_predictions = torch.cat(all_predictions, dim=0)  # (total_samples,) - already 1D
         all_targets = torch.cat(all_targets, dim=0)  # (total_samples,) - already 1D
+        all_is_post_etf = torch.cat(all_is_post_etf, dim=0)
         
         # Per-batch averages on normalized scale — used for consistent early stopping / val_losses
         # These are HuberLoss-based, not MSE, and always on normalized scale.
@@ -811,6 +819,7 @@ class Trainer:
         metrics["is_denormalized"] = is_denormalized
         metrics["predictions"] = all_predictions
         metrics["targets"] = all_targets
+        metrics["is_post_etf"] = all_is_post_etf
         
         return metrics
     
@@ -1164,6 +1173,13 @@ def main(args):
         logger.info(f"TARGET {target_idx+1}/{len(TARGET_NAMES)}: {target_name}")
         logger.info("#" * 80)
 
+        # Lists to accumulate Out-of-Sample (OOS) predictions across all folds + test set
+        # This is required because Pre-ETF data is in the validation folds, not the test set.
+        oos_preds = []
+        oos_tgts = []
+        oos_is_post_etf = []
+        oos_benchmarks = []
+
         # Re-create walk-forward generator (it is a generator — exhausted after one pass)
         walk_forward_generator = create_walk_forward_dataloaders(
             config,
@@ -1398,6 +1414,27 @@ def main(args):
                 "val_mae": final_val_metrics["mae"],
                 "val_correlation": final_val_metrics["correlation"],
             }
+            
+            # Accumulate OOS data from this validation fold
+            if "predictions" in final_val_metrics:
+                oos_preds.append(final_val_metrics["predictions"])
+                oos_tgts.append(final_val_metrics["targets"])
+                oos_is_post_etf.append(final_val_metrics.get("is_post_etf"))
+                
+                # Get the denormalized train_targets_mean for this fold
+                _fold_benchmark = train_targets_mean
+                if trainer.target_scaler is not None and train_targets_mean is not None:
+                    col = getattr(trainer, "_current_target_idx", 0)
+                    center = trainer.target_scaler.center_[col]
+                    scale = trainer.target_scaler.scale_[col]
+                    _fold_benchmark = train_targets_mean * scale + center
+                
+                if _fold_benchmark is not None:
+                    # Create a tensor of the benchmark mean, same shape as predictions
+                    bm_tensor = torch.full_like(final_val_metrics["predictions"], _fold_benchmark)
+                    oos_benchmarks.append(bm_tensor)
+                else:
+                    oos_benchmarks.append(torch.zeros_like(final_val_metrics["predictions"]))
 
             logger.info(f"Fold {fold_num} Results: R²={final_val_metrics['r2']:.6f}, MSE={final_val_metrics['mse']:.6f}, RMSE={final_val_metrics['rmse']:.6f}, MAE={final_val_metrics['mae']:.6f}")
 
@@ -1475,6 +1512,25 @@ def main(args):
                 f"  Prediction Error Std: {test_metrics['prediction_error_std']:.6f}"
             )
 
+            # Accumulate OOS data from the test set
+            if "predictions" in test_metrics:
+                oos_preds.append(test_metrics["predictions"])
+                oos_tgts.append(test_metrics["targets"])
+                oos_is_post_etf.append(test_metrics.get("is_post_etf"))
+                
+                _test_benchmark = last_fold_train_targets_mean
+                if trainer.target_scaler is not None and last_fold_train_targets_mean is not None:
+                    col = getattr(trainer, "_current_target_idx", 0)
+                    center = trainer.target_scaler.center_[col]
+                    scale = trainer.target_scaler.scale_[col]
+                    _test_benchmark = last_fold_train_targets_mean * scale + center
+                
+                if _test_benchmark is not None:
+                    bm_tensor = torch.full_like(test_metrics["predictions"], _test_benchmark)
+                    oos_benchmarks.append(bm_tensor)
+                else:
+                    oos_benchmarks.append(torch.zeros_like(test_metrics["predictions"]))
+
             # Log comprehensive test metrics to W&B
             if wandb is not None and wandb.run is not None:
                 # Log core metrics first
@@ -1542,15 +1598,61 @@ def main(args):
             "test_metrics": test_metrics,
         }
 
+        # --- REGIME-LEVEL EVALUATION (AGGREGATED OOS) ---
+        if len(oos_preds) > 0 and oos_is_post_etf[0] is not None:
+            cat_preds = torch.cat(oos_preds)
+            cat_tgts = torch.cat(oos_tgts)
+            cat_is_post_etf = torch.cat(oos_is_post_etf)
+            cat_benchmarks = torch.cat(oos_benchmarks)
+            
+            pre_etf_mask = cat_is_post_etf == 0
+            post_etf_mask = cat_is_post_etf == 1
+            
+            logger.info("\n" + "-" * 40)
+            logger.info(f"REGIME-LEVEL STABILITY ({target_name})")
+            logger.info("-" * 40)
+            
+            # Helper to compute OOS metrics with array of benchmarks
+            def _eval_regime(preds_subset, tgts_subset, bench_subset, name):
+                mae = torch.mean(torch.abs(preds_subset - tgts_subset)).item()
+                ss_res = torch.sum((preds_subset - tgts_subset) ** 2).item()
+                
+                # GKX 2020 (Zero Predictor)
+                ss_tot_gkx = torch.sum(tgts_subset ** 2).item()
+                r2_oos_gkx = 1.0 - (ss_res / ss_tot_gkx) if ss_tot_gkx > 0 else 0.0
+                
+                # Historical Mean
+                ss_tot_hist = torch.sum((tgts_subset - bench_subset) ** 2).item()
+                r2_oos_hist = 1.0 - (ss_res / ss_tot_hist) if ss_tot_hist > 0 else 0.0
+                
+                # Select based on target (mirrors _compute_metrics)
+                if target_name == "y_baseline":
+                    r2_oos_primary = r2_oos_hist
+                else:
+                    r2_oos_primary = r2_oos_gkx
+                    
+                logger.info(f"  [{name}] MAE: {mae:.6f} | R²_OOS: {r2_oos_primary:.6f} | n={len(tgts_subset)}")
+            
+            if pre_etf_mask.any():
+                _eval_regime(cat_preds[pre_etf_mask], cat_tgts[pre_etf_mask], cat_benchmarks[pre_etf_mask], "Pre-ETF")
+            if post_etf_mask.any():
+                _eval_regime(cat_preds[post_etf_mask], cat_tgts[post_etf_mask], cat_benchmarks[post_etf_mask], "Post-ETF")
+            logger.info("-" * 40 + "\n")
+
         # Finish W&B run for this target
         if wandb is not None and wandb.run is not None:
             wandb.finish()
 
     # END of per-target loop
+    # END of per-target loop
     # ==================== GLOBAL SUMMARY ====================
     logger.info("\n" + "=" * 80)
     logger.info("ALL TARGETS — TRAINING COMPLETE")
     logger.info("=" * 80)
+    
+    # Save MFN predictions to disk for DM testing
+    mfn_preds_dict = {}
+    
     for tname, tresult in all_target_results.items():
         fold_r2 = [v["val_r2"] for v in tresult["fold_results"].values()]
         tm = tresult["test_metrics"]
@@ -1558,6 +1660,17 @@ def main(args):
         logger.info(
             f"  {tname:15s}: CV R² {np.mean(fold_r2):.4f} ± {np.std(fold_r2):.4f} |{test_str}"
         )
+        if tm and "predictions" in tm:
+            mfn_preds_dict[f"{tname}_MFN"] = tm["predictions"].numpy() if hasattr(tm["predictions"], "numpy") else tm["predictions"]
+            
+    # Save to npz
+    out_dir = config.mlops.checkpoint_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mfn_preds_file = out_dir / f"mfn_test_predictions_{args.ablation}.npz"
+    if mfn_preds_dict:
+        np.savez(mfn_preds_file, **mfn_preds_dict)
+        logger.info(f"✓ MFN Test predictions saved → {mfn_preds_file} (Use this for DM tests vs baselines)")
+
     logger.info("=" * 80)
 
 
