@@ -526,25 +526,37 @@ class Trainer:
 
             # ========== FORWARD PASS (FLOAT32) ==========
             # Standard PyTorch forward pass - all tensors remain float32
-            predictions = self.model(batch)                    # (batch,)
-            targets = batch["target"][:, target_idx]          # (batch,) — slice one target column
-            
+            predictions = self.model(batch)  # (batch,) single-target | (batch, num_targets) multi-target
+            num_targets = getattr(self.model, 'num_targets', 1)
+
             # ========== NUMERICAL STABILITY: CLAMP PREDICTIONS ==========
-            # Prevent extreme values that can cause NaN in loss backward
-            # Sentiment range is typically [-100, 100], clamp to [-150, 150] for safety
             predictions_clamped = torch.clamp(predictions, min=-150, max=150)
-            
-            # Collect for epoch-level metrics (using clamped predictions)
-            all_predictions.append(predictions_clamped.detach().cpu())
-            all_targets.append(targets.detach().cpu())
-            
-            # Compute HuberLoss (robust to outliers)
-            # More stable than MSE for noisy market data with outliers
-            loss = nn.HuberLoss(delta=self.config.training.huber_delta)(predictions_clamped, targets)
+
+            if num_targets > 1:
+                # Multi-target: compute mean Huber loss across all heads.
+                # Collect metrics for the primary target (target_idx) for progress logging.
+                targets_all = batch["target"][:, :num_targets]  # (batch, num_targets)
+                head_losses = [
+                    nn.HuberLoss(delta=self.config.training.huber_delta)(
+                        predictions_clamped[:, i], targets_all[:, i]
+                    )
+                    for i in range(num_targets)
+                ]
+                loss = sum(head_losses) / num_targets
+                # Track primary-target predictions for epoch-level metrics
+                all_predictions.append(predictions_clamped[:, target_idx].detach().cpu())
+                all_targets.append(targets_all[:, target_idx].detach().cpu())
+            else:
+                targets = batch["target"][:, target_idx]  # (batch,) — slice one target column
+                all_predictions.append(predictions_clamped.detach().cpu())
+                all_targets.append(targets.detach().cpu())
+                loss = nn.HuberLoss(delta=self.config.training.huber_delta)(predictions_clamped, targets)
             
             # ========== NaN CHECK BEFORE BACKWARD ==========
-            # Detect numerical issues early
-            if check_for_nan(loss, batch_idx, predictions_clamped, targets):
+            # For multi-target, check against the flat clamped tensor (same NaN surface).
+            _check_preds = predictions_clamped.reshape(-1)
+            _check_tgts  = (targets_all if num_targets > 1 else targets).reshape(-1)
+            if check_for_nan(loss, batch_idx, _check_preds, _check_tgts):
                 logger.warning(f"⚠ Skipping batch {batch_idx} due to NaN/Inf in predictions or loss")
                 self.optimizer.zero_grad()  # Clear any accumulated gradients
                 continue
@@ -736,30 +748,44 @@ class Trainer:
         all_targets = []
         all_is_post_etf = []
         
+        num_targets = getattr(self.model, 'num_targets', 1)
+
         with torch.no_grad():
             for batch in val_loader:
                 # Move to device (float32)
                 batch = {k: v.to(self.device) for k, v in batch.items()}
-                
+
                 # Forward pass (pure float32, no AMP)
-                predictions = self.model(batch)                   # (batch,)
-                targets = batch["target"][:, target_idx]          # (batch,) — single column
-                
-                # Compute metrics on normalized scale for loss tracking.
-                # Use HuberLoss for consistency with training (robust to outliers).
-                # NOTE: This is HuberLoss, not MSE — kept on normalized scale intentionally
-                # so val_losses is comparable across folds regardless of target_scaler.
-                huber_loss = nn.HuberLoss(delta=self.config.training.huber_delta)(predictions, targets)
-                mae = nn.L1Loss()(predictions, targets)
-                
+                predictions = self.model(batch)  # (batch,) or (batch, num_targets)
+
+                if num_targets > 1:
+                    targets_all = batch["target"][:, :num_targets]  # (batch, num_targets)
+                    # Mean Huber loss across heads (mirrors training)
+                    head_losses = [
+                        nn.HuberLoss(delta=self.config.training.huber_delta)(
+                            predictions[:, i], targets_all[:, i]
+                        )
+                        for i in range(num_targets)
+                    ]
+                    huber_loss = sum(head_losses) / num_targets
+                    mae = sum(
+                        nn.L1Loss()(predictions[:, i], targets_all[:, i])
+                        for i in range(num_targets)
+                    ) / num_targets
+                    # Collect primary-target predictions for main metric path
+                    all_predictions.append(predictions[:, target_idx].cpu())
+                    all_targets.append(targets_all[:, target_idx].cpu())
+                else:
+                    targets = batch["target"][:, target_idx]  # (batch,) — single column
+                    huber_loss = nn.HuberLoss(delta=self.config.training.huber_delta)(predictions, targets)
+                    mae = nn.L1Loss()(predictions, targets)
+                    all_predictions.append(predictions.cpu())
+                    all_targets.append(targets.cpu())
+
                 total_huber += huber_loss.item()
                 total_mae += mae.item()
                 num_steps += 1
-                
-                # Collect for global metrics
-                all_predictions.append(predictions.cpu())
-                all_targets.append(targets.cpu())
-                
+
                 # Extract is_post_ETF flag from tabular data (last timestep, col 6)
                 # Since StandardScaler is used, the binary 0/1 becomes negative/positive
                 is_post_etf_scaled = batch["tabular"][:, -1, 6].cpu()
@@ -915,6 +941,7 @@ def main(args):
     num_folds = getattr(args, 'num_folds', 5)
     ablation_mode = getattr(args, 'ablation', 'full')
     targets_filter = getattr(args, 'targets', None)  # e.g. ["y_baseline"] or None for all
+    num_targets = getattr(args, 'num_targets', 1)    # 1 = single-target (default), 3 = multi-target joint loss
     learning_rate            = getattr(args, 'learning_rate', None)
     weight_decay             = getattr(args, 'weight_decay', None)
     early_stopping_patience  = getattr(args, 'early_stopping_patience', None)
@@ -992,6 +1019,8 @@ def main(args):
     logger.info(f"MLOps: wandb_run={config.mlops.wandb_run_name}")
     if ablation_mode != "full":
         logger.info(f"⚠ ABLATION MODE: {ablation_mode} — some modalities zeroed out")
+    if num_targets > 1:
+        logger.info(f"⚠ MULTI-TARGET MODE: one model with {num_targets} heads, joint mean Huber loss")
     
     # Create dataloaders (walk-forward validation)
     logger.info("\n" + "-" * 80)
@@ -1151,6 +1180,115 @@ def main(args):
     print("[PROGRESS] ✓ Setup complete, training begins now...")
     sys.stdout.flush()
     
+    # ==================== MULTI-TARGET TRAINING (num_targets > 1) ====================
+    # One shared model with N independent prediction heads, trained with mean Huber loss
+    # across all heads simultaneously. Used to produce the multi-target baseline for RQ3.
+    if num_targets > 1:
+        # Ensure num_targets does not exceed available targets
+        num_targets = min(num_targets, len(TARGET_NAMES))
+
+        logger.info("=" * 80)
+        logger.info(f"MULTI-TARGET MODE: one model, {num_targets} heads, joint loss")
+        logger.info("=" * 80)
+
+        model = MultimodalFusionNet(config, ablation_mode=ablation_mode, num_targets=num_targets)
+        logger.info(f"  Multi-target model initialised ({num_targets} heads)")
+
+        if config.mlops.use_wandb and wandb is not None:
+            if wandb.run is not None:
+                wandb.finish()
+            mt_run_name = f"{config.mlops.wandb_run_name}_multi_target_{num_targets}h"
+            wandb.init(
+                project=config.mlops.wandb_project,
+                name=mt_run_name,
+                config={**config.to_dict(), "num_targets": num_targets, "mode": "multi_target"},
+                settings=wandb.Settings(_service_wait=0, _disable_stats=False),
+                reinit=True,
+            )
+
+        walk_forward_generator = create_walk_forward_dataloaders(
+            config, features_dir=features_dir, num_folds=num_folds, num_workers=0, pin_memory=True
+        )
+
+        fold_results_mt = {}
+        last_train_targets_mean = {i: 0.0 for i in range(num_targets)}
+
+        for fold_num, train_loader, val_loader, scalers_dict in walk_forward_generator:
+            logger.info(f"\n{'='*80}\nFOLD {fold_num} [multi-target]\n{'='*80}")
+
+            # Compute per-target training means for R² OOS benchmarks
+            train_means = {i: compute_train_targets_mean(train_loader, target_idx=i) for i in range(num_targets)}
+            last_train_targets_mean = train_means
+
+            model.apply(_reset_weights)
+            trainer = Trainer(config, model, device=device, target_scaler=scalers_dict.get("target_scaler"))
+            trainer._current_target_idx = 0  # primary target for scaler/denorm
+            trainer.setup_optimizer()
+
+            early_stopping = EarlyStopping(
+                patience=config.training.early_stopping_patience,
+                min_delta=config.training.early_stopping_min_delta,
+                verbose=True,
+            )
+            ema_val_loss: Optional[float] = None
+
+            for epoch in range(config.training.max_epochs):
+                trainer.epoch = epoch
+                # train_epoch uses target_idx=0 for metric logging; loss is joint across all heads
+                train_metrics = trainer.train_epoch(train_loader, target_idx=0, train_targets_mean=train_means[0])
+
+                if (epoch + 1) % config.mlops.eval_frequency == 0:
+                    val_metrics = trainer.validate(val_loader, target_idx=0, train_targets_mean=train_means[0])
+                    val_loss = val_metrics["normalized_huber"]
+                    ema_alpha = config.training.ema_alpha
+                    ema_val_loss = val_loss if ema_val_loss is None else ema_alpha * val_loss + (1 - ema_alpha) * ema_val_loss
+                    if early_stopping(ema_val_loss):
+                        logger.info(f"✓ Early stopping at epoch {epoch+1}")
+                        break
+
+            # Final validation: collect per-target metrics by running validate once per head
+            per_target_val = {}
+            for tidx in range(num_targets):
+                tname = TARGET_NAMES[tidx]
+                vm = trainer.validate(val_loader, target_idx=tidx, train_targets_mean=train_means[tidx])
+                per_target_val[tname] = {"val_r2_oos": vm["r2_oos"], "val_mae": vm["mae"], "val_r2": vm["r2"]}
+                logger.info(f"  Fold {fold_num} [{tname}]: R²_OOS={vm['r2_oos']:.4f} | MAE={vm['mae']:.6f}")
+
+            fold_results_mt[fold_num] = per_target_val
+
+        # ---- Test evaluation (multi-target) ----
+        if test_loader is not None:
+            if target_scaler is not None:
+                trainer.target_scaler = target_scaler
+            trainer._current_target_idx = 0
+            mt_test_results = {}
+            for tidx in range(num_targets):
+                tname = TARGET_NAMES[tidx]
+                trainer._current_target_idx = tidx
+                tm = trainer.validate(test_loader, target_idx=tidx, train_targets_mean=last_train_targets_mean[tidx])
+                mt_test_results[tname] = {"r2_oos": tm["r2_oos"], "mae": tm["mae"], "r2": tm["r2"]}
+                logger.info(f"  [TEST] {tname}: R²_OOS={tm['r2_oos']:.4f} | MAE={tm['mae']:.6f}")
+
+        logger.info("\n[MULTI-TARGET] Summary:")
+        for tidx in range(num_targets):
+            tname = TARGET_NAMES[tidx]
+            fold_r2s = [fold_results_mt[f][tname]["val_r2_oos"] for f in fold_results_mt]
+            logger.info(f"  {tname}: CV R²_OOS {np.mean(fold_r2s):.4f} ± {np.std(fold_r2s):.4f}")
+
+        # Save predictions
+        out_dir = config.mlops.checkpoint_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(out_dir / f"mfn_test_predictions_multi_target_{num_targets}h.npz",
+                 **{f"{tname}_MFN_multi": mt_test_results[tname] for tname in mt_test_results})
+
+        if wandb is not None and wandb.run is not None:
+            wandb.finish()
+
+        logger.info("=" * 80)
+        logger.info("MULTI-TARGET TRAINING COMPLETE")
+        logger.info("=" * 80)
+        return  # Skip single-target loop below
+
     # ==================== PER-TARGET TRAINING LOOP ====================
     # v5: 3 independent models, one per target (y_baseline, y_heuristic, y_vol_adj_return).
     # Each model is re-initialised from scratch so there is zero cross-target leakage.
@@ -1189,8 +1327,8 @@ def main(args):
             pin_memory=True
         )
 
-        # Fresh model for this target
-        model = MultimodalFusionNet(config, ablation_mode=ablation_mode)
+        # Fresh model for this target (single-target mode: num_targets=1)
+        model = MultimodalFusionNet(config, ablation_mode=ablation_mode, num_targets=1)
         logger.info(f"  Fresh model initialised for {target_name}")
 
         # W&B run per target
@@ -1698,6 +1836,14 @@ if __name__ == "__main__":
     parser.add_argument("--targets", nargs="+", default=None,
                         choices=["y_baseline", "y_heuristic", "y_vol_adj_return"],
                         help="Which targets to train (default: all 3). Example: --targets y_baseline")
+    parser.add_argument("--num-targets", type=int, default=1, dest="num_targets",
+                        choices=[1, 2, 3],
+                        help=(
+                            "Number of prediction heads trained jointly. "
+                            "1 (default): single-target mode — 3 independent models, one per target. "
+                            "3: multi-target mode — one model with 3 heads, mean Huber loss across all heads. "
+                            "Use --num-targets 3 to produce the multi-target baseline for RQ3 comparison."
+                        ))
     # ── Training hyperparameter overrides (all optional; default = config.py values) ──
     parser.add_argument("--learning-rate", type=float, default=None, dest="learning_rate",
                         help="AdamW learning rate (default: TrainingConfig.learning_rate = 1e-5)")

@@ -23,7 +23,9 @@ TARGET ENGINEERING (t vs t+1 — NO DATA LEAKAGE):
     target_delta_conflict -> delta_conflict shifted to t
 
   Final targets:
-    y_baseline       = funding_rate(t+8h)  — next settlement value (8-hour horizon)
+    y_baseline       = funding_rate(t+1h) per row — the +7 index offset in
+                       WalkForwardDataset.__getitem__ makes this effectively
+                       predict funding_rate 8 hours after the last input step.
     y_heuristic      = weighted sum of Z-scored target variables (1-hour horizon)
     y_vol_adj_return = Volatility-Adjusted Log Return (1-hour horizon)
 
@@ -360,7 +362,7 @@ class DataAligner:
         target_delta_tone     = delta_tone.shift(-1)
         target_delta_conflict = delta_conflict.shift(-1)
         
-        target_raw_funding    = self.df["funding_rate"].shift(-8)  # Next 8h settlement value
+        target_raw_funding    = self.df["funding_rate"].shift(-1)  # Used with +7 offset in dataset.py → effective 8h-ahead horizon
 
         # Stack the four raw target variables into a DataFrame for scaling
         target_df = pd.DataFrame(
@@ -375,10 +377,8 @@ class DataAligner:
 
         # ------------------------------------------------------------------
         # Step 3: Drop rows with NaN targets
-        #   - First row:   NaN from .diff() on delta_funding / delta_tone / delta_conflict
-        #   - Last 8 rows: NaN from target_raw_funding.shift(-8) — no t+8h observation available
-        #                  (valid_mask is AND of all targets, so this drives the cutoff)
-        #   - Last 1 row:  NaN from shift(-1) targets (already covered by the 8-row cutoff)
+        #   - First row:  NaN from .diff() on delta_funding / delta_tone / delta_conflict
+        #   - Last row:   NaN from .shift(-1) — no t+1 observation available
         # ------------------------------------------------------------------
         rows_before = len(self.df)
         valid_mask = target_df.notna().all(axis=1) & target_raw_funding.notna()
@@ -389,13 +389,13 @@ class DataAligner:
         logger.info(f"  Dropped {rows_dropped} rows with NaN targets (first/last rows)")
 
         # ------------------------------------------------------------------
-        # TARGET 1: y_baseline — funding_rate level at t+8h (next settlement)
-        # Uses shift(-8) to predict the next 8-hour settlement value.
-        # This is the correct horizon: funding rate only changes every 8h,
-        # so shift(-1) was trivially predictable (same value most of the time).
-        # shift(-8) represents the actual next rate-setting event.
+        # TARGET 1: y_baseline — funding_rate at t+1 (raw; 8h-ahead horizon is applied
+        # downstream via the +7 index offset in WalkForwardDataset.__getitem__).
+        # Using shift(-1) here, combined with the +7 offset in __getitem__,
+        # makes the model predict funding_rate 8 hours after the last input step.
+        # DO NOT change to shift(-8) — that causes a double-shift (15h+ ahead).
         self.df["y_baseline"] = target_raw_funding.values
-        logger.info("  ✓ y_baseline = funding_rate(t+8h) (next 8h settlement value)")
+        logger.info("  ✓ y_baseline = funding_rate(t+1h) [effective 8h-ahead via dataset +7 offset]")
 
         # ------------------------------------------------------------------
         # TARGET 2: y_heuristic — weighted Z-score composite

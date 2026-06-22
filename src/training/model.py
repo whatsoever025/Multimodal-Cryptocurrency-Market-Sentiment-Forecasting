@@ -255,20 +255,21 @@ class MultimodalFusionNet(nn.Module):
     - VRAM: 16GB sufficient with batch_size=8, seq_len=24
     """
     
-    def __init__(self, config, ablation_mode: str = "full"):
+    def __init__(self, config, ablation_mode: str = "full", num_targets: int = 1):
         super().__init__()
         self.config = config
         self.hidden_dim = config.model.hidden_dim
         self.seq_len = config.data.seq_len
-        
+        self.num_targets = num_targets
+
         # Ablation mode: controls which modalities are active
         # "full"         = all modalities (default)
         # "tabular_only" = zero-out text + image
         # "no_text"      = zero-out text only
         # "no_image"     = zero-out image only
         self.ablation_mode = ablation_mode
-        
-        logger.info(f"Initializing MultimodalFusionNet (hidden_dim={self.hidden_dim}, ablation={self.ablation_mode})...")
+
+        logger.info(f"Initializing MultimodalFusionNet (hidden_dim={self.hidden_dim}, ablation={self.ablation_mode}, num_targets={self.num_targets})...")
         
         # 0. Learnable [FUSION] token (detector token for cross-modal fusion)
         # Shape: (1, 1, hidden_dim) -> expands to (batch, seq_len, hidden_dim) in forward
@@ -308,12 +309,24 @@ class MultimodalFusionNet(nn.Module):
             dropout=config.model.lstm_dropout,
         )
         
-        # 5. Prediction head (simplified: 64 → 16 → 1)
-        self.prediction_head = PredictionHead(
-            input_dim=config.model.bottleneck_dim,
-            dropout=config.model.head_dropout,
-        )
-        
+        # 5. Prediction head(s)
+        # num_targets=1 (default): single head, output (batch,) — single-target mode.
+        # num_targets>1: independent head per target, output (batch, num_targets) — multi-target mode.
+        # Separate heads prevent gradient interference between targets; each head specialises
+        # on its own loss surface while sharing the full backbone.
+        if self.num_targets > 1:
+            self.prediction_heads = nn.ModuleList([
+                PredictionHead(input_dim=config.model.bottleneck_dim, dropout=config.model.head_dropout)
+                for _ in range(self.num_targets)
+            ])
+            logger.info(f"✓ {self.num_targets} independent prediction heads initialized (multi-target mode)")
+        else:
+            self.prediction_head = PredictionHead(
+                input_dim=config.model.bottleneck_dim,
+                dropout=config.model.head_dropout,
+            )
+            logger.info("✓ Single prediction head initialized (single-target mode)")
+
         logger.info("✓ MultimodalFusionNet initialized")
         
         # Print parameter counts
@@ -399,13 +412,17 @@ class MultimodalFusionNet(nn.Module):
         # Input: compressed [FUSION] token representations across time
         temporal_output = self.temporal_lstm(bottleneck_features)
         
-        # ==================== PREDICTION HEAD ====================
-        # Simplified MLP head: (batch, 64) -> (batch, 1) -> reshape to (batch,)
-        # Use view(-1) instead of squeeze(dim=1) to safely handle batch_size=1:
-        # squeeze(dim=1) on shape (1,1) collapses to scalar (), breaking metric computation.
-        predictions = self.prediction_head(temporal_output)  # (batch, 1)
-        predictions = predictions.view(-1)  # (batch,) - safe for all batch sizes
-        
+        # ==================== PREDICTION HEAD(S) ====================
+        # Single-target: (batch, 64) -> (batch, 1) -> (batch,)
+        # Multi-target:  stack outputs of N independent heads -> (batch, num_targets)
+        if self.num_targets > 1:
+            predictions = torch.stack(
+                [head(temporal_output).view(-1) for head in self.prediction_heads],
+                dim=1,
+            )  # (batch, num_targets)
+        else:
+            predictions = self.prediction_head(temporal_output).view(-1)  # (batch,)
+
         return predictions
     
     def get_trainable_params(self):
