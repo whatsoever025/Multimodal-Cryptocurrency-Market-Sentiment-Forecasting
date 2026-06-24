@@ -201,6 +201,7 @@ def create_walk_forward_dataloaders(
     num_folds: int = 5,
     num_workers: int = 0,
     pin_memory: bool = True,
+    tabular_filename: str = "tabular_features.pt",
 ):
     """
     Create walk-forward validation folds.
@@ -218,6 +219,9 @@ def create_walk_forward_dataloaders(
         num_folds: Number of temporal validation folds
         num_workers: Data loading workers (always 0 on Kaggle)
         pin_memory: Pin memory for GPU transfer
+        tabular_filename: Filename of the tabular features tensor inside each asset subdir.
+            Use "tabular_features.pt" (default, 7 features) for the original experiment
+            or "tabular_features_extended.pt" (11 features) for the ablation with TI.
     
     Yields:
         Tuple of (fold_num, train_loader, val_loader, scalers_dict)
@@ -241,13 +245,13 @@ def create_walk_forward_dataloaders(
         # Load BTC
         btc_text = torch.load(btc_subdir / "text_embeddings.pt", map_location="cpu")
         btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
-        btc_tab = torch.load(btc_subdir / "tabular_features.pt", map_location="cpu")
+        btc_tab = torch.load(btc_subdir / tabular_filename, map_location="cpu")
         btc_tgt = torch.load(btc_subdir / "target_scores.pt", map_location="cpu")
         
         # Load ETH
         eth_text = torch.load(eth_subdir / "text_embeddings.pt", map_location="cpu")
         eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
-        eth_tab = torch.load(eth_subdir / "tabular_features.pt", map_location="cpu")
+        eth_tab = torch.load(eth_subdir / tabular_filename, map_location="cpu")
         eth_tgt = torch.load(eth_subdir / "target_scores.pt", map_location="cpu")
         
         btc_len = btc_text.shape[0]
@@ -282,7 +286,7 @@ def create_walk_forward_dataloaders(
         
         text_embeddings = torch.load(features_dir / "text_embeddings.pt", map_location="cpu")
         image_embeddings = torch.load(features_dir / "image_embeddings.pt", map_location="cpu")
-        tabular_data = torch.load(features_dir / "tabular_features.pt", map_location="cpu")
+        tabular_data = torch.load(features_dir / tabular_filename, map_location="cpu")
         target_scores = torch.load(features_dir / "target_scores.pt", map_location="cpu")
         
         total_samples = text_embeddings.shape[0]

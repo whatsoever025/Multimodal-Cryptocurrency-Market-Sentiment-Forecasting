@@ -939,6 +939,7 @@ def main(args):
     resume_training = getattr(args, 'resume', False)
     debug = getattr(args, 'debug', False)
     num_folds = getattr(args, 'num_folds', 5)
+    tabular_filename = getattr(args, 'tabular_file', 'tabular_features.pt')
     ablation_mode = getattr(args, 'ablation', 'full')
     targets_filter = getattr(args, 'targets', None)  # e.g. ["y_baseline"] or None for all
     num_targets = getattr(args, 'num_targets', 1)    # 1 = single-target (default), 3 = multi-target joint loss
@@ -1207,7 +1208,8 @@ def main(args):
             )
 
         walk_forward_generator = create_walk_forward_dataloaders(
-            config, features_dir=features_dir, num_folds=num_folds, num_workers=0, pin_memory=True
+            config, features_dir=features_dir, num_folds=num_folds, num_workers=0, pin_memory=True,
+            tabular_filename=tabular_filename,
         )
 
         fold_results_mt = {}
@@ -1324,7 +1326,8 @@ def main(args):
             features_dir=features_dir,
             num_folds=num_folds,
             num_workers=0,
-            pin_memory=True
+            pin_memory=True,
+            tabular_filename=tabular_filename,
         )
 
         # Fresh model for this target (single-target mode: num_targets=1)
@@ -1859,6 +1862,13 @@ if __name__ == "__main__":
                         help="Gaussian noise std for embedding regularization; 0 = disabled (default: 0.01)")
     parser.add_argument("--huber-delta", type=float, default=None, dest="huber_delta",
                         help="HuberLoss delta, shared between train & validate (default: 1.0)")
+    parser.add_argument("--tabular-file", type=str, default="tabular_features.pt", dest="tabular_file",
+                        help=(
+                            "Filename of the tabular features tensor inside each asset subdir. "
+                            "Use 'tabular_features.pt' (default, 7 base features) for the original experiment "
+                            "or 'tabular_features_extended.pt' (11 features = 7 base + MA7/MA25/RSI/MACD) "
+                            "for the technical-indicator ablation."
+                        ))
 
     args = parser.parse_args()
 

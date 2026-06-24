@@ -399,7 +399,7 @@ def main(args):
             print(f"[PROGRESS] ({asset}) Image extraction complete ({format_duration(elapsed)})")
 
         # Tabular features (raw, no scaling)
-        tabular_output_path = asset_output_dir / "tabular_features.pt"
+        tabular_output_path = asset_output_dir / "tabular_features_extended.pt"
         if tabular_output_path.exists() and not args.force:
             logger.info(f"✓ Tabular features already exist for {asset}: {tabular_output_path}")
             print(f"[PROGRESS] ({asset}) Skipping tabular extraction (file exists)")
@@ -431,7 +431,7 @@ def main(args):
         # Verify files for this asset
         text_path = asset_output_dir / "text_embeddings.pt"
         image_path = asset_output_dir / "image_embeddings.pt"
-        tabular_path = asset_output_dir / "tabular_features.pt"
+        tabular_path = asset_output_dir / "tabular_features_extended.pt"
         target_path = asset_output_dir / "target_scores.pt"
 
         if (text_path.exists() and image_path.exists() and 
