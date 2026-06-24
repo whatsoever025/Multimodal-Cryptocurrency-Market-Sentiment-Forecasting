@@ -13,12 +13,18 @@ import sys
 import torch
 import torch.nn as nn
 import numpy as np
+import pandas as pd
 import logging
 import argparse
 from pathlib import Path
 from PIL import Image
 from typing import Dict, Tuple
 import time
+
+try:
+    import ta
+except ImportError:
+    raise ImportError("'ta' package required: pip install ta")
 
 try:
     from transformers import AutoModel, AutoTokenizer
@@ -491,8 +497,37 @@ def extract_target_scores_sequence(
     sys.stdout.flush()
 
 
-# v5 tabular feature column order (7 columns)
-TABULAR_FEATURE_NAMES = [
+def _compute_technical_indicators(return_1h_arr: np.ndarray) -> dict:
+    """
+    Compute MA7_ratio, MA25_ratio, RSI(14), MACD_hist from return_1h.
+
+    Price is reconstructed via cumulative product of (1 + return/100).
+    MA features use percent-deviation ratios to stay scale-invariant across BTC/ETH.
+    No leakage: all computations look backward only.
+    """
+    returns = pd.Series(return_1h_arr.astype(np.float64))
+    price = (1.0 + returns.fillna(0.0) / 100.0).cumprod()
+
+    ma7 = price.rolling(7, min_periods=1).mean()
+    ma25 = price.rolling(25, min_periods=1).mean()
+    ma7_ratio = ((price / ma7.clip(lower=1e-8)) - 1.0) * 100.0
+    ma25_ratio = ((price / ma25.clip(lower=1e-8)) - 1.0) * 100.0
+
+    rsi = ta.momentum.rsi(price, window=14).fillna(50.0)
+
+    macd_obj = ta.trend.MACD(price, window_slow=26, window_fast=12, window_sign=9)
+    macd_hist = macd_obj.macd_diff().fillna(0.0)
+
+    return {
+        "ma7_ratio":  ma7_ratio.fillna(0.0).astype(np.float32).values,
+        "ma25_ratio": ma25_ratio.fillna(0.0).astype(np.float32).values,
+        "rsi_14":     rsi.astype(np.float32).values,
+        "macd_hist":  macd_hist.astype(np.float32).values,
+    }
+
+
+# v6 tabular feature column order (11 columns = 7 original + 4 technical indicators)
+_BASE_FEATURE_NAMES = [
     "return_1h",              # 1-hour price return
     "volume",                 # trading volume
     "funding_rate",           # futures funding rate
@@ -501,6 +536,13 @@ TABULAR_FEATURE_NAMES = [
     "gdelt_conflict_volume",  # GDELT conflict news volume
     "is_post_ETF",            # binary flag: 1 if >= 2024-01-01 (ETF approval)
 ]
+_COMPUTED_FEATURE_NAMES = [
+    "ma7_ratio",              # % deviation of price from 7-period MA (scale-invariant)
+    "ma25_ratio",             # % deviation of price from 25-period MA (scale-invariant)
+    "rsi_14",                 # RSI(14) momentum oscillator [0, 100]
+    "macd_hist",              # MACD histogram (MACD line − signal line)
+]
+TABULAR_FEATURE_NAMES = _BASE_FEATURE_NAMES + _COMPUTED_FEATURE_NAMES
 
 
 
@@ -510,33 +552,43 @@ def extract_tabular_features_sequence(
     output_path: Path,
 ) -> None:
     """
-    Extract RAW 7 tabular features (v5 schema, no scaling).
+    Extract 11 tabular features (v6 schema, no scaling).
+    7 base features loaded from HF dataset + 4 technical indicators computed on-the-fly.
     Scaling is applied in-memory during training.
 
-    v5 Feature columns (saved in this order):
+    v6 Feature columns (saved in this order):
       [return_1h, volume, funding_rate,
        gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
-       is_post_ETF]
+       is_post_ETF,
+       ma7_ratio, ma25_ratio, rsi_14, macd_hist]
 
-    NOTE: `fear_greed_value` was REMOVED in v5.
-          `is_post_ETF` (binary 0/1) was ADDED in v5.
+    Technical indicators are derived from return_1h via price reconstruction:
+      price_index = cumprod(1 + return_1h/100)
+    No look-ahead bias: all rolling computations are backward-looking.
 
-    Saves as (N, 7) float32 tensor.
+    Saves as (N, 11) float32 tensor.
 
     Args:
         dataset: HuggingFace Dataset (v5, single flat split)
         output_path: Path to save raw tabular tensor
     """
-    logger.info(f"Extracting v5 tabular features ({len(dataset)} samples)...")
-    print("[PROGRESS] Extracting tabular features (v5 schema, RAW, no scaling)...")
+    logger.info(f"Extracting v6 tabular features ({len(dataset)} samples)...")
+    print("[PROGRESS] Extracting tabular features (v6: 7 base + 4 technical indicators)...")
     sys.stdout.flush()
 
+    # Load 7 base features from HF dataset
     tabular_features = []
-    for feature_name in TABULAR_FEATURE_NAMES:
+    for feature_name in _BASE_FEATURE_NAMES:
         arr = np.array(dataset[feature_name], dtype=np.float32)
         tabular_features.append(arr)
 
-    # Stack → (N, 7)
+    # Compute 4 technical indicators from return_1h (no HF column needed)
+    return_1h_arr = np.array(dataset["return_1h"], dtype=np.float32)
+    tech = _compute_technical_indicators(return_1h_arr)
+    for feature_name in _COMPUTED_FEATURE_NAMES:
+        tabular_features.append(tech[feature_name])
+
+    # Stack → (N, 11)
     tabular_array = np.stack(tabular_features, axis=1).astype(np.float32)
     logger.info(f"Tabular array shape: {tabular_array.shape}")
     logger.info("Feature ranges (RAW):")
@@ -545,7 +597,7 @@ def extract_tabular_features_sequence(
 
     tabular_tensor = torch.tensor(tabular_array, dtype=torch.float32).contiguous()
     torch.save(tabular_tensor, output_path)
-    logger.info(f"✓ Saved v5 tabular features to {output_path}")
+    logger.info(f"✓ Saved v6 tabular features to {output_path}")
     print(f"[PROGRESS] ✓ Tabular features extracted and saved {tabular_tensor.shape}")
     sys.stdout.flush()
 
