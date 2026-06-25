@@ -1051,12 +1051,12 @@ def main(args):
             # ---- load per-asset tensors and concatenate ----
             _btc_text  = torch.load(btc_subdir / "text_embeddings.pt",  map_location="cpu")
             _btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
-            _btc_tab   = torch.load(btc_subdir / "tabular_features.pt", map_location="cpu")
+            _btc_tab   = torch.load(btc_subdir / tabular_filename,       map_location="cpu")
             _btc_tgt   = torch.load(btc_subdir / "target_scores.pt",    map_location="cpu")
 
             _eth_text  = torch.load(eth_subdir / "text_embeddings.pt",  map_location="cpu")
             _eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
-            _eth_tab   = torch.load(eth_subdir / "tabular_features.pt", map_location="cpu")
+            _eth_tab   = torch.load(eth_subdir / tabular_filename,       map_location="cpu")
             _eth_tgt   = torch.load(eth_subdir / "target_scores.pt",    map_location="cpu")
 
             _btc_len = _btc_text.shape[0]
@@ -1070,7 +1070,7 @@ def main(args):
             # Fallback: single consolidated files + split_metadata.json
             _test_text  = torch.load(_features_dir / "text_embeddings.pt",  map_location="cpu")
             _test_image = torch.load(_features_dir / "image_embeddings.pt", map_location="cpu")
-            _test_tab   = torch.load(_features_dir / "tabular_features.pt", map_location="cpu")
+            _test_tab   = torch.load(_features_dir / tabular_filename,        map_location="cpu")
             _test_tgt   = torch.load(_features_dir / "target_scores.pt",    map_location="cpu")
             _total = _test_text.shape[0]
             _btc_len = _total // 2

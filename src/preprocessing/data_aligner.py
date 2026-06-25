@@ -399,17 +399,21 @@ class DataAligner:
 
         # ------------------------------------------------------------------
         # TARGET 2: y_heuristic — weighted Z-score composite
+        # Expanding-window Z-score: at each time t, mean and std are computed
+        # from [0..t] only, so no future data ever enters the normalization.
+        # min_periods=24 avoids unstable estimates at the very start of the series.
         # ------------------------------------------------------------------
-        scaler_h = StandardScaler()
-        z_scaled = scaler_h.fit_transform(target_df.values)  # shape (N, 4)
+        exp_mean = target_df.expanding(min_periods=24).mean()
+        exp_std  = target_df.expanding(min_periods=24).std()
+        z_scaled = ((target_df - exp_mean) / exp_std.clip(lower=1e-8)).fillna(0.0).values
 
         # Columns order: delta_funding, return, delta_tone, delta_conflict
         # Weights:       +0.4,          +0.3,   +0.2,       -0.1
         weights = np.array([0.4, 0.3, 0.2, -0.1])
         self.df["y_heuristic"] = z_scaled @ weights
         logger.info(
-            "  ✓ y_heuristic = 0.4*Z(delta_funding) + 0.3*Z(return) "
-            "+ 0.2*Z(delta_tone) - 0.1*Z(delta_conflict)"
+            "  ✓ y_heuristic = 0.4*Z_exp(delta_funding) + 0.3*Z_exp(return) "
+            "+ 0.2*Z_exp(delta_tone) - 0.1*Z_exp(delta_conflict)  [expanding-window Z-score]"
         )
 
         # ------------------------------------------------------------------
