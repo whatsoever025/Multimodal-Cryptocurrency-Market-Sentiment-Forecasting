@@ -941,6 +941,9 @@ def main(args):
     num_folds = getattr(args, 'num_folds', 5)
     tabular_filename = getattr(args, 'tabular_file', 'tabular_features.pt')
     ablation_mode = getattr(args, 'ablation', 'full')
+    # Derive tabular_input_size from filename: extended (11 feat) → 27, base (7 feat) → 23
+    _n_tab_features = 11 if tabular_filename == "tabular_features_extended.pt" else 7
+    config.model.tabular_input_size = _n_tab_features + 16  # +16 for asset embedding
     targets_filter = getattr(args, 'targets', None)  # e.g. ["y_baseline"] or None for all
     num_targets = getattr(args, 'num_targets', 1)    # 1 = single-target (default), 3 = multi-target joint loss
     learning_rate            = getattr(args, 'learning_rate', None)

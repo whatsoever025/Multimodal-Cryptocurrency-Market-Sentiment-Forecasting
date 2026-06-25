@@ -46,6 +46,7 @@ class ModelConfig:
     head_dropout: float = 0.4     # Increased back: same reason.
     grad_clip: float = 1.0
     frozen_backbones: bool = True
+    tabular_input_size: int = 23  # 7 base features + 16 asset embedding (extended: 11+16=27)
 
     def __post_init__(self):
         """Validate model config."""

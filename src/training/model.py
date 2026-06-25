@@ -284,11 +284,11 @@ class MultimodalFusionNet(nn.Module):
         logger.info("✓ Asset embedding initialized (2 → 16 dimensions)")
         
         # 1. Tabular encoder (only trainable component with backbones)
-        # Input size: 11 tabular features + 16 asset embedding dimensions = 27
-        # (7 original + 4 technical indicators: ma7_ratio, ma25_ratio, rsi_14, macd_hist)
+        # input_size = tabular_features + 16 asset embedding
+        # Base: 7+16=23 | Extended (ma7/ma25/rsi/macd): 11+16=27
         self.tabular_encoder = TabularEncoder(
             hidden_dim=self.hidden_dim,
-            input_size=11 + 16,
+            input_size=config.model.tabular_input_size,
             dropout=config.model.encoder_dropout,
         )
         
