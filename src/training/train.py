@@ -786,9 +786,12 @@ class Trainer:
                 total_mae += mae.item()
                 num_steps += 1
 
-                # Extract is_post_ETF flag from tabular data (last timestep, col 6)
-                # Since StandardScaler is used, the binary 0/1 becomes negative/positive
-                is_post_etf_scaled = batch["tabular"][:, -1, 6].cpu()
+                # Extract is_post_ETF flag from tabular data (last timestep, last base col)
+                # is_post_ETF is always the last of the 7 base features (idx 6), but drops
+                # to idx 5 in the no_funding variant (6 features).
+                _n_tab_cols = batch["tabular"].shape[2]
+                _is_post_etf_idx = 5 if _n_tab_cols == 6 else 6
+                is_post_etf_scaled = batch["tabular"][:, -1, _is_post_etf_idx].cpu()
                 is_post_etf_binary = (is_post_etf_scaled > 0.0).float()
                 all_is_post_etf.append(is_post_etf_binary)
         
