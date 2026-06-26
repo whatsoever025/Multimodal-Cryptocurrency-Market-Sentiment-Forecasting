@@ -1829,6 +1829,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train multimodal crypto sentiment model")
     parser.add_argument("--asset", choices=["MULTI"], default="MULTI",
                         help="Cryptocurrency asset (multi-asset: BTC+ETH combined)")
+    parser.add_argument("--features-dir", type=str, default="./data/features", dest="features_dir",
+                        help="Directory containing BTC/ and ETH/ feature subdirs (default: ./data/features). "
+                             "On Kaggle: /kaggle/input/<dataset-name>")
     parser.add_argument("--features-dir", type=str, default="./data/features",
                         help="Local path to pre-extracted features directory")
     parser.add_argument("--run-name", type=str, default=None,
