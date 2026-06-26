@@ -202,6 +202,7 @@ def create_walk_forward_dataloaders(
     num_workers: int = 0,
     pin_memory: bool = True,
     tabular_filename: str = "tabular_features.pt",
+    tabular_dir: str = None,
 ):
     """
     Create walk-forward validation folds.
@@ -228,6 +229,7 @@ def create_walk_forward_dataloaders(
     """
     num_workers = 0  # Force num_workers=0 for Kaggle safety
     features_dir = Path(features_dir) if features_dir else Path("./data/features")
+    tabular_dir  = Path(tabular_dir)  if tabular_dir  else features_dir
     
     logger.info("=" * 80)
     logger.info("WALK-FORWARD VALIDATION: Loading dynamic asset features")
@@ -245,13 +247,13 @@ def create_walk_forward_dataloaders(
         # Load BTC
         btc_text = torch.load(btc_subdir / "text_embeddings.pt", map_location="cpu")
         btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
-        btc_tab = torch.load(btc_subdir / tabular_filename, map_location="cpu")
+        btc_tab = torch.load(tabular_dir / "BTC" / tabular_filename, map_location="cpu")
         btc_tgt = torch.load(btc_subdir / "target_scores.pt", map_location="cpu")
-        
+
         # Load ETH
         eth_text = torch.load(eth_subdir / "text_embeddings.pt", map_location="cpu")
         eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
-        eth_tab = torch.load(eth_subdir / tabular_filename, map_location="cpu")
+        eth_tab = torch.load(tabular_dir / "ETH" / tabular_filename, map_location="cpu")
         eth_tgt = torch.load(eth_subdir / "target_scores.pt", map_location="cpu")
         
         btc_len = btc_text.shape[0]

@@ -933,6 +933,7 @@ def main(args):
     # Set safe defaults for all args attributes (in case called from notebook without argparse)
     asset = getattr(args, 'asset', 'MULTI')
     features_dir = getattr(args, 'features_dir', './data/features')
+    tabular_dir  = getattr(args, 'tabular_dir', None) or features_dir
     run_name = getattr(args, 'run_name', None)
     config_path = getattr(args, 'config', None)
     seed = getattr(args, 'seed', 42)
@@ -994,7 +995,12 @@ def main(args):
             wandb_run_name=run_name,
         )
     config.debug = debug
-    _n_tab_features = 11 if tabular_filename == "tabular_features_extended.pt" else 7
+    if tabular_filename == "tabular_features_extended.pt":
+        _n_tab_features = 11
+    elif tabular_filename == "tabular_features_no_funding.pt":
+        _n_tab_features = 6
+    else:
+        _n_tab_features = 7
     config.model.tabular_input_size = _n_tab_features + 16  # +16 for asset embedding
 
     # ── CLI overrides: apply ALL explicitly-passed args after config creation ──
@@ -1046,6 +1052,7 @@ def main(args):
         import json
 
         _features_dir = Path(features_dir)
+        _tabular_dir  = Path(tabular_dir)
         btc_subdir = _features_dir / "BTC"
         eth_subdir = _features_dir / "ETH"
 
@@ -1053,12 +1060,12 @@ def main(args):
             # ---- load per-asset tensors and concatenate ----
             _btc_text  = torch.load(btc_subdir / "text_embeddings.pt",  map_location="cpu")
             _btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
-            _btc_tab   = torch.load(btc_subdir / tabular_filename,       map_location="cpu")
+            _btc_tab   = torch.load(_tabular_dir / "BTC" / tabular_filename, map_location="cpu")
             _btc_tgt   = torch.load(btc_subdir / "target_scores.pt",    map_location="cpu")
 
             _eth_text  = torch.load(eth_subdir / "text_embeddings.pt",  map_location="cpu")
             _eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
-            _eth_tab   = torch.load(eth_subdir / tabular_filename,       map_location="cpu")
+            _eth_tab   = torch.load(_tabular_dir / "ETH" / tabular_filename, map_location="cpu")
             _eth_tgt   = torch.load(eth_subdir / "target_scores.pt",    map_location="cpu")
 
             _btc_len = _btc_text.shape[0]
@@ -1072,7 +1079,7 @@ def main(args):
             # Fallback: single consolidated files + split_metadata.json
             _test_text  = torch.load(_features_dir / "text_embeddings.pt",  map_location="cpu")
             _test_image = torch.load(_features_dir / "image_embeddings.pt", map_location="cpu")
-            _test_tab   = torch.load(_features_dir / tabular_filename,        map_location="cpu")
+            _test_tab   = torch.load(_tabular_dir  / tabular_filename,        map_location="cpu")
             _test_tgt   = torch.load(_features_dir / "target_scores.pt",    map_location="cpu")
             _total = _test_text.shape[0]
             _btc_len = _total // 2
@@ -1211,7 +1218,7 @@ def main(args):
 
         walk_forward_generator = create_walk_forward_dataloaders(
             config, features_dir=features_dir, num_folds=num_folds, num_workers=0, pin_memory=True,
-            tabular_filename=tabular_filename,
+            tabular_filename=tabular_filename, tabular_dir=tabular_dir,
         )
 
         fold_results_mt = {}
@@ -1330,6 +1337,7 @@ def main(args):
             num_workers=0,
             pin_memory=True,
             tabular_filename=tabular_filename,
+            tabular_dir=tabular_dir,
         )
 
         # Fresh model for this target (single-target mode: num_targets=1)
@@ -1867,9 +1875,15 @@ if __name__ == "__main__":
     parser.add_argument("--tabular-file", type=str, default="tabular_features.pt", dest="tabular_file",
                         help=(
                             "Filename of the tabular features tensor inside each asset subdir. "
-                            "Use 'tabular_features.pt' (default, 7 base features) for the original experiment "
-                            "or 'tabular_features_extended.pt' (11 features = 7 base + MA7/MA25/RSI/MACD) "
-                            "for the technical-indicator ablation."
+                            "Use 'tabular_features.pt' (default, 7 base features), "
+                            "'tabular_features_extended.pt' (11 features = 7 base + MA7/MA25/RSI/MACD), "
+                            "or 'tabular_features_no_funding.pt' (6 features, funding_rate removed)."
+                        ))
+    parser.add_argument("--tabular-dir", type=str, default=None, dest="tabular_dir",
+                        help=(
+                            "Directory containing BTC/ and ETH/ subdirs with the tabular feature file. "
+                            "Defaults to --features-dir. Set to /kaggle/working when tabular files "
+                            "were created there by create_ablation_features.py."
                         ))
 
     args = parser.parse_args()
