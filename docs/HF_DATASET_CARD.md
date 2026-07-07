@@ -256,7 +256,7 @@ This HuggingFace dataset is **sourced for local extraction only**. For training:
 
 2. **Upload to Kaggle** (optional):
    ```bash
-   python src/training/extract_features.py --asset MULTI --kaggle-upload
+   python src/training/extract_features.py --asset MULTI --push-to-kaggle --kaggle-dataset-name crypto-sentiment-embeddings --kaggle-username <your-username> --kaggle-key <your-key>
    ```
 
 3. **Train on Kaggle** (zero HuggingFace dependencies):

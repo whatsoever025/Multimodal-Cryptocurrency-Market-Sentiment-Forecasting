@@ -1,33 +1,16 @@
 """
-MultimodalFusionNet: Production-grade multimodal sentiment forecasting with [FUSION] token.
+MultimodalFusionNet (MFN): intermediate-fusion architecture for multimodal forecasting.
 
-Architecture (Offline Feature Extraction):
-1. Pre-Computed Embeddings (extracted offline via extract_features.py):
-   - FinBERT text embeddings: (batch, seq_len, 256)
-   - Vision Transformer (ViT) image embeddings: (batch, seq_len, 256)
-   
-2. Tabular MLP Encoder:
-   - MLP encoding of 7 raw tabular features -> (batch, seq_len, 256)
-
-3. Learnable [FUSION] Token:
-   - Trainable 256D parameter vector (detector token)
-   - Expands to (batch, seq_len, 256) for attention
-
-4. Cross-Modal Attention with [FUSION] Token:
-   - 4 tokens ([FUSION], text, image, tabular) attend to each other
-   - All tokens: 256D (all match)
-   - Extracts only [FUSION] token output (no mean pooling)
-
-5. Temporal LSTM:
-   - Captures temporal dynamics across seq_len timesteps
-   - Input/Hidden: 256D (from [FUSION] token)
-   - 1 layer with dropout
-
-6. Prediction Head:
-   - MLP reducing to scaled single continuous output
-   - Input: 256D (from LSTM final hidden state)
-
-Innovation: Learnable [FUSION] token replaces mean pooling for better fusion.
+Architecture overview:
+  1. Pre-extracted embeddings: FinBERT text (batch, seq_len, 256),
+     ViT image (batch, seq_len, 256).
+  2. TabularEncoder MLP: (batch, seq_len, 7+16) → (batch, seq_len, 256).
+  3. Learnable [FUSION] token (256D) acts as a cross-modal aggregator.
+  4. CrossModalAttentionLayer: 4-token self-attention ([FUSION], text, image, tabular)
+     — only the [FUSION] token output is retained.
+  5. Bottleneck Linear: 256 → 64.
+  6. TemporalLSTM: (batch, seq_len, 64) → (batch, 64) final hidden state.
+  7. PredictionHead: 64 → 1 per target (single or multi-target mode).
 """
 
 import torch
@@ -41,9 +24,9 @@ logger = logging.getLogger(__name__)
 class TabularEncoder(nn.Module):
     """
     MLP encoder for tabular features.
-    
-    Input: (batch, seq_len, 7) numeric features
-    Output: (batch, seq_len, hidden_dim) encoded features
+
+    Input:  (batch, seq_len, input_size)  — raw tabular + 16-dim asset embedding
+    Output: (batch, seq_len, hidden_dim)
     """
     
     def __init__(self, hidden_dim: int = 256, input_size: int = 7, dropout: float = 0.4):
@@ -64,8 +47,7 @@ class TabularEncoder(nn.Module):
     def forward(self, tabular: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            tabular: (batch, seq_len, 7)
-        
+            tabular: (batch, seq_len, input_size)
         Returns:
             (batch, seq_len, hidden_dim)
         """
@@ -83,20 +65,18 @@ class TabularEncoder(nn.Module):
 
 class CrossModalAttentionLayer(nn.Module):
     """
-    Cross-modal attention with learnable [FUSION] token pooling.
-    
-    Treats [FUSION] token + 3 modalities (4 total) as a sequence and applies multi-head attention.
-    At each timestep, all 4 tokens attend to each other, then extracts only [FUSION] token output.
-    
-    STABILITY FIX (2025-04-17, v2):
-    - Pre-LN structure: LayerNorm BEFORE attention (not after residual)
-    - NO dropout INSIDE attention mechanism (mha_dropout=0)
-    - Dropout applied ONLY AFTER residual (safer path)
-    - Prevents NaN in scaled dot-product attention backward pass
-    - Essential for stability: dropout inside attention can cause extreme gradients
-    
-    Input: (batch, seq_len, 4, hidden_dim)
-    Output: (batch, seq_len, hidden_dim) - [FUSION] token representation only (no mean pooling)
+    Single-layer cross-modal attention with a learnable [FUSION] token.
+
+    Treats the four modality tokens ([FUSION], text, image, tabular) as a
+    4-element sequence and applies multi-head self-attention. Only the [FUSION]
+    token output (position 0) is returned — no mean pooling.
+
+    Uses Pre-LN structure (LayerNorm before attention) and zero dropout inside
+    the attention backward path to avoid NaN gradients in scaled dot-product
+    attention.
+
+    Input:  (batch, seq_len, 4, hidden_dim)
+    Output: (batch, seq_len, hidden_dim)  — [FUSION] token only
     """
     
     def __init__(self, hidden_dim: int = 256, num_heads: int = 4, dropout: float = 0.1):
@@ -124,10 +104,9 @@ class CrossModalAttentionLayer(nn.Module):
         """
         Args:
             modality_stack: (batch, seq_len, 4, hidden_dim)
-                           4 = [fusion_token, text, image, tabular] tokens
-        
+                            order: [fusion_token, text, image, tabular]
         Returns:
-            (batch, seq_len, hidden_dim) - [FUSION] token output only
+            (batch, seq_len, hidden_dim)  — [FUSION] token representation
         """
         batch_size, seq_len, num_modalities, hidden_dim = modality_stack.shape
         
@@ -160,10 +139,10 @@ class CrossModalAttentionLayer(nn.Module):
 
 class TemporalLSTMLayer(nn.Module):
     """
-    LSTM for temporal modeling across sequence.
-    
-    Input: (batch, seq_len, lstm_hidden_dim)
-    Output: (batch, lstm_hidden_dim) - final hidden state
+    Single-layer LSTM for temporal modelling across the 24-hour input window.
+
+    Input:  (batch, seq_len, input_dim)
+    Output: (batch, input_dim)  — final hidden state
     """
     
     def __init__(self, input_dim: int = 64, num_layers: int = 1, dropout: float = 0.4):
@@ -180,9 +159,8 @@ class TemporalLSTMLayer(nn.Module):
         """
         Args:
             x: (batch, seq_len, lstm_hidden_dim)
-        
         Returns:
-            (batch, lstm_hidden_dim) - final hidden state from last layer
+            (batch, lstm_hidden_dim)
         """
         # LSTM forward
         # output: (batch, seq_len, lstm_hidden_dim)
@@ -196,14 +174,7 @@ class TemporalLSTMLayer(nn.Module):
 
 class PredictionHead(nn.Module):
     """
-    MLP prediction head for continuous sentiment score.
-    
-    Input: (batch, lstm_hidden_dim)
-    Output: (batch, 1) - scaled continuous score
-    
-    Intermediate dimension scales dynamically with input_dim (input_dim // 2)
-    to avoid information bottleneck when lstm_hidden_dim increases (e.g. 64 → 128).
-    """
+    Two-layer MLP prediction head. Input: (batch, input_dim). Output: (batch, 1)."""
     
     def __init__(self, input_dim: int = 64, dropout: float = 0.4):
         super().__init__()
@@ -222,8 +193,7 @@ class PredictionHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch, lstm_hidden_dim=64)
-        
+            x: (batch, input_dim)
         Returns:
             (batch, 1)
         """
@@ -232,27 +202,19 @@ class PredictionHead(nn.Module):
 
 class MultimodalFusionNet(nn.Module):
     """
-    Production-grade multimodal fusion network with [FUSION] token pooling.
-    
-    Architecture:
-    1. Create learnable [FUSION] token (256D, detector for cross-modal fusion)
-    2. Accept pre-extracted embeddings (FinBERT text & ViT images)
-    3. Encode tabular features with lightweight MLP (output: 256D to match embeddings)
-    4. Stack [FUSION] token + 3 modalities and apply cross-modal attention (4 total tokens)
-    5. Extract only [FUSION] token output (no mean pooling)
-    6. Bottleneck layer: Linear(256 → 64) - compress fused features
-    7. Apply temporal LSTM for temporal dynamics (64D hidden state, 1 layer)
-    8. Simplified MLP prediction head (64 → 16 → 1) for continuous output
-    
-    Key Innovation: [FUSION] token acts as learnable aggregator, replacing mean pooling
-    - Token learns to extract relevant information from 3 modalities
-    - Entirely trainable fusion mechanism
-    - No fixed pooling operation
-    
-    Pure float32 training (no AMP, no GradScaler):
-    - All activations and weights stay in float32
-    - Gradient clipping (L2 norm <= 1.0)
-    - VRAM: 16GB sufficient with batch_size=8, seq_len=24
+    Full MultimodalFusionNet model.
+
+    Combines a TabularEncoder, CrossModalAttentionLayer (with [FUSION] token),
+    bottleneck linear, TemporalLSTM, and one or more PredictionHeads.
+
+    Ablation modes zero-out modalities before the attention step:
+        "full"         — all modalities active (default)
+        "tabular_only" — text and image embeddings zeroed
+        "no_text"      — text embedding zeroed
+        "no_image"     — image embedding zeroed
+
+    In multi-target mode (num_targets > 1), independent prediction heads are
+    used to avoid gradient interference between targets.
     """
     
     def __init__(self, config, ablation_mode: str = "full", num_targets: int = 1):
@@ -343,16 +305,16 @@ class MultimodalFusionNet(nn.Module):
     
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Forward pass through multimodal fusion network with [FUSION] token.
-        
         Args:
             batch: Dict with keys:
-                - tabular: (batch, seq_len, 7) - raw tabular features
-                - text_embedding: (batch, seq_len, 256) - pre-extracted FinBERT embeddings
-                - image_embedding: (batch, seq_len, 256) - pre-extracted ViT embeddings
-        
+                tabular:         (batch, seq_len, n_tab_features)
+                text_embedding:  (batch, seq_len, 256)
+                image_embedding: (batch, seq_len, 256)
+                asset_id:        (batch,)  — 0=BTC, 1=ETH
+
         Returns:
-            (batch,) - continuous sentiment predictions
+            Single-target: (batch,)
+            Multi-target:  (batch, num_targets)
         """
         batch_size, seq_len = batch["tabular"].shape[0], batch["tabular"].shape[1]
         

@@ -2,35 +2,23 @@
 Create tabular feature variants for ablation experiments.
 
 Currently supports:
-  no_funding  — drops funding_rate (col 2) from tabular_features.pt → 6 features
+    no_funding — drops funding_rate (col 2) from the 7-feature base tensor
+                 → output is a 6-feature tensor (is_post_ETF shifts to idx 5).
 
-Kaggle usage (input is read-only, write to /kaggle/working/):
+Kaggle usage:
     python src/training/create_ablation_features.py \\
-        --input-dir /kaggle/input/<dataset-name> \\
+        --input-dir /kaggle/input/<dataset-name>/features \\
         --output-dir /kaggle/working \\
-        --asset MULTI \\
-        --variant no_funding
-
-Then train with:
-    python src/training/train.py \\
-        --tabular-file tabular_features_no_funding.pt \\
-        --tabular-dir /kaggle/working \\
-        --ablation tabular_only
-
-Local usage (input and output in the same dir):
-    python src/training/create_ablation_features.py \\
-        --input-dir ./data/features \\
-        --asset MULTI \\
-        --variant no_funding
+        --asset MULTI --variant no_funding
 
 Feature order in tabular_features.pt (7 cols):
-  0  return_1h
-  1  volume
-  2  funding_rate        ← dropped in no_funding variant
-  3  gdelt_econ_volume
-  4  gdelt_econ_tone
-  5  gdelt_conflict_volume
-  6  is_post_ETF
+    0  return_1h
+    1  volume
+    2  funding_rate        ← dropped in no_funding variant
+    3  gdelt_econ_volume
+    4  gdelt_econ_tone
+    5  gdelt_conflict_volume
+    6  is_post_ETF
 """
 
 import argparse
@@ -43,7 +31,7 @@ FUNDING_RATE_IDX = 2  # column index of funding_rate in the 7-feature base tenso
 
 
 def create_no_funding(input_dir: Path, output_dir: Path, asset: str, force: bool = False) -> None:
-    """Drop funding_rate column; read from input_dir, write to output_dir."""
+    """Drop the funding_rate column (idx 2) from the base 7-feature tensor and save as a new file."""
     coins = ["BTC", "ETH"] if asset == "MULTI" else [asset]
 
     for coin in coins:

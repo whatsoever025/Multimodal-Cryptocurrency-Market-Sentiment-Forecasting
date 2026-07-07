@@ -50,12 +50,7 @@ data/raw/**
 .coverage
 htmlcov/
 
-# Crawlers specific pycache
-src/crawlers/__pycache__/
-
 google_credentials.json
-src/crawlers/__pycache__/sentiment_crawler.cpython-311.pyc
-/src/crawlers/__pycache__
 
 # Model checkpoints and artifacts
 src/training/checkpoints/
@@ -63,3 +58,6 @@ src/training/checkpoints/
 *.pth
 *.ckpt
 /kaggle/working/checkpoints/
+
+# Debug artifacts
+data/features_debug/

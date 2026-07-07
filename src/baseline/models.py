@@ -1,14 +1,11 @@
 """
-Baseline model wrappers for tabular-only prediction.
+Baseline tabular-only regressors for comparison against MultimodalFusionNet.
 
-All models accept:
-    X: (n_samples, seq_len * n_features)  — flattened 24-step tabular windows
-    y: (n_samples,)                        — raw engineered target values
+All models share the same interface:
+    X: (n_samples, seq_len × n_features)  — flattened 24-step tabular windows
+    y: (n_samples,)                        — engineered target values
 
-Models:
-    HistoricalMean    — naive benchmark (train-set mean)
-    LinearRegressionModel — sklearn LinearRegression on flattened windows
-    XGBoostModel      — XGBRegressor (fallback: GradientBoostingRegressor)
+Models: HistoricalMeanModel, LinearRegressionModel, XGBoostModel.
 """
 
 import numpy as np
@@ -32,7 +29,8 @@ from sklearn.linear_model import LinearRegression
 class HistoricalMeanModel:
     """
     Predicts the training-set mean for every test sample.
-    This is the naive benchmark used as the denominator in R²_OOS (historical mean variant).
+
+    Serves as the naive benchmark for the historical-mean R²_OOS denominator.
     """
 
     name = "HistoricalMean"
@@ -55,10 +53,7 @@ class HistoricalMeanModel:
 # ─── 2. Linear Regression ────────────────────────────────────────────────────
 
 class LinearRegressionModel:
-    """
-    sklearn LinearRegression on flattened 24-step tabular windows.
-    Input dimension: seq_len × n_tabular_features = 24 × 7 = 168.
-    """
+    """sklearn LinearRegression on flattened 24-step tabular windows (168 features)."""
 
     name = "LinearRegression"
 
@@ -79,11 +74,10 @@ class LinearRegressionModel:
 class XGBoostModel:
     """
     XGBRegressor on flattened 24-step tabular windows.
-    Falls back to GradientBoostingRegressor if xgboost is not installed.
 
-    Hyperparameters are set to competitive defaults for tabular regression:
-        n_estimators=500, max_depth=6, learning_rate=0.05
-        subsample=0.8, colsample_bytree=0.8
+    Falls back to sklearn GradientBoostingRegressor if xgboost is not installed.
+    Hyperparameters: n_estimators=500, max_depth=6, learning_rate=0.05,
+    subsample=0.8, colsample_bytree=0.8.
     """
 
     name = "XGBoost" if _XGBOOST_AVAILABLE else "GradientBoosting"

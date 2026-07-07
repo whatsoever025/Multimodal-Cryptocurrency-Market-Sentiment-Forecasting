@@ -1,17 +1,34 @@
+# ============================================================
+# NOTE: Training runs on Kaggle (T4 GPU). These packages are
+# for local use: data pipeline, EDA, and evaluation only.
+# On Kaggle, the environment already has torch/sklearn/etc.
+# ============================================================
+
 # Core ML/DL
 torch>=2.0.0
 torchvision>=0.15.0
 transformers>=4.30.0
-datasets>=2.10.0
 
 # Data processing
 numpy>=1.24.0
 pandas>=2.0.0
 Pillow>=9.0.0
+scikit-learn>=1.2.0
+
+# Baselines
+xgboost>=1.7.0
+scipy>=1.10.0
+
+# HuggingFace (dataset push / EDA)
+datasets>=2.10.0
+huggingface_hub>=0.15.0
+
+# Visualization
+matplotlib>=3.7.0
 
 # Logging & experiment tracking
 wandb>=0.14.0
 
-# Optional but recommended
+# Utilities
 python-dotenv>=0.21.0
 tqdm>=4.65.0

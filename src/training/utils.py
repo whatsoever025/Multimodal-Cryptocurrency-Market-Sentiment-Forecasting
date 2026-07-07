@@ -1,19 +1,10 @@
-"""
-Shared utility functions used across the project.
-
-Consolidates common functions to prevent duplication.
-"""
+"""Shared utility functions (logging setup, duration formatting)."""
 
 import logging
 
 
 def setup_logging(level=logging.INFO) -> None:
-    """
-    Configure logging with standard format.
-    
-    Args:
-        level: Logging level (default: logging.INFO)
-    """
+    """Configure the root logger with a standard timestamp format."""
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -22,15 +13,7 @@ def setup_logging(level=logging.INFO) -> None:
 
 
 def format_duration(seconds: float) -> str:
-    """
-    Format duration in seconds to human-readable string.
-    
-    Args:
-        seconds: Duration in seconds
-    
-    Returns:
-        Formatted string (e.g., "1.2s", "2.5m", "1.5h")
-    """
+    """Convert seconds to a human-readable string (e.g. 1.2s, 2.5m, 1.5h)."""
     if seconds < 60:
         return f"{seconds:.1f}s"
     elif seconds < 3600:

@@ -1,24 +1,9 @@
 """
-Production training loop with VRAM management, W&B integration, and best model checkpointing.
+Training loop for MultimodalFusionNet.
 
-Key Features:
-- Trainer class with full state management (save/load/train/validate)
-- Pure float32 training for numerical stability (no mixed precision)
-- Gradient accumulation configured via config.training.accumulate_steps
-- Gradient clipping via config.model.grad_clip
-- W&B integration per-branch via wandb_run_name
-- Best model checkpointing with experiment naming
-- NaN detection and diagnostics (2025-04-17):
-  * Pre-backward check: Validates loss and predictions are finite
-  * Post-backward check: Validates gradients are finite and not extreme
-  * Problematic batches are saved for offline analysis
-  * Early detection prevents silent NaN propagation
-
-Stability Improvements (2025-04-17):
-- Fixed attention layer to use Pre-LN structure (normalize before attention, not after)
-- Reduced attention dropout from 0.3 to 0.1 for backward stability
-- Moved dropout outside residual path in attention layer
-- Enhanced gradient monitoring throughout training loop
+Implements walk-forward cross-validation across 3 independent targets
+(y_baseline, y_heuristic, y_vol_adj_return), with per-fold weight resets,
+EMA-smoothed early stopping, and optional W&B logging.
 """
 
 import torch
@@ -55,26 +40,21 @@ from .utils import setup_logging, format_duration
 
 logger = logging.getLogger(__name__)
 
-# v5 target columns — one independent model is trained per target
+# v5 target columns — one independent model is trained per target.
+# NOTE: "y_baseline" in code = "y_funding" in the thesis document.
+# The thesis renamed it to y_funding for clarity; the code predates that change.
 TARGET_NAMES = ["y_baseline", "y_heuristic", "y_vol_adj_return"]
 
 
 def _reset_weights(module: nn.Module) -> None:
     """
-    Reinitialize the weights of a module to their default distributions.
-    
-    Called via `model.apply(_reset_weights)` at the start of each walk-forward fold
-    to ensure each fold trains from a fresh initialization.
-    
-    WHY THIS MATTERS: Without per-fold reset, fold N's model starts from fold N-1's
-    trained weights. By the final fold the model has implicitly seen ALL prior folds'
-    train+val data, making validation R² optimistically biased relative to test R².
-    
-    Handles:
-    - nn.Linear: kaiming_uniform (matches PyTorch default)
-    - nn.LSTM: orthogonal for weight_hh, kaiming for weight_ih, zeros for bias
-    - nn.LayerNorm: ones for weight, zeros for bias
-    - nn.Parameter (fusion_token): normal(0, 0.02) matching model.py initialization
+    Re-initialise module weights to their default distributions.
+
+    Called at the start of each walk-forward fold so that fold N does not
+    inherit weights from fold N-1 — which would cause optimistic validation
+    R² by the final fold (the model would have implicitly seen all prior
+    fold data). Uses kaiming_uniform for Linear/LSTM-ih, orthogonal for
+    LSTM-hh, and normal(0, 0.02) for the [FUSION] token.
     """
     if isinstance(module, nn.Linear):
         nn.init.kaiming_uniform_(module.weight, a=0, mode='fan_in', nonlinearity='leaky_relu')
@@ -97,10 +77,7 @@ def _reset_weights(module: nn.Module) -> None:
         nn.init.normal_(module.fusion_token, mean=0.0, std=0.02)
 
 def check_for_nan(loss: torch.Tensor, batch_idx: int, predictions: torch.Tensor, targets: torch.Tensor) -> bool:
-    """
-    Check for NaN/Inf in loss and predictions before backward pass.
-    Returns True if NaN/Inf detected (should skip this batch).
-    """
+    """Check for NaN/Inf in loss and predictions. Returns True if found (batch should be skipped)."""
     if torch.isnan(loss).any():
         logger.error(f"✗ Batch {batch_idx}: Loss is NaN")
         logger.error(f"  Predictions - Min: {predictions.min():.6e}, Max: {predictions.max():.6e}, Mean: {predictions.mean():.6e}")
@@ -123,10 +100,7 @@ def check_for_nan(loss: torch.Tensor, batch_idx: int, predictions: torch.Tensor,
 
 
 def check_gradients(model: nn.Module, batch_idx: int) -> bool:
-    """
-    Check for NaN/Inf in gradients after backward pass.
-    Returns True if issues found.
-    """
+    """Check for NaN/Inf in gradients after backward. Returns True if anomalies found."""
     has_issues = False
     for name, param in model.named_parameters():
         if param.grad is not None:
@@ -146,15 +120,8 @@ def check_gradients(model: nn.Module, batch_idx: int) -> bool:
 
 def compute_train_targets_mean(train_loader: DataLoader, target_idx: int = 0) -> float:
     """
-    Compute mean of training targets for a specific target variable.
-    Used as benchmark for R² OOS historical mean formula.
-    
-    Args:
-        train_loader: Training DataLoader
-        target_idx: Target index (0=y_baseline, 1=y_heuristic, 2=y_vol_adj_return)
-    
-    Returns:
-        Mean of training targets (scalar float)
+    Return the mean of training targets for a given target index.
+    Used as the historical-mean benchmark in the R²_OOS denominator for y_baseline.
     """
     all_targets = []
     for batch in train_loader:
@@ -173,30 +140,24 @@ def _compute_metrics(
     train_targets_mean: Optional[float] = None
 ) -> Dict[str, float]:
     """
-    Compute comprehensive regression metrics with target-specific R² OOS formula.
-    
+    Compute regression metrics with target-specific R²_OOS benchmark.
+
+    R²_OOS benchmark selection (Gu, Kelly & Xiu 2020):
+        y_baseline       → Historical Mean  (funding rate has structural positive bias; mean ≠ 0)
+        y_heuristic      → Zero-predictor   (Z-score normalised; mean ≈ 0)
+        y_vol_adj_return → Zero-predictor   (log-return; mean ≈ 0)
+
     Args:
-        predictions: Model predictions (torch.Tensor)
-        targets: Ground truth targets (torch.Tensor)
-        target_name: One of "y_baseline", "y_heuristic", "y_vol_adj_return"
-                     Determines which R² OOS benchmark to use.
-        train_targets_mean: Mean of training targets (for historical mean benchmark).
-                           Required if target_name is "y_baseline".
-    
+        predictions: Model predictions (N,)
+        targets: Ground truth values (N,)
+        target_name: "y_baseline", "y_heuristic", or "y_vol_adj_return"
+        train_targets_mean: Training-set mean (required for y_baseline benchmark)
+
     Returns:
-        Dict with keys: 'mse', 'mae', 'rmse',
-                       'r2'     - Standard R² (benchmarks against test-set mean ȳ)
-                       'r2_oos' - OOS R² with target-specific benchmark:
-                                  * y_vol_adj_return: Zero-predictor (Gu, Kelly & Xiu 2020)
-                                    Benchmark: ŷ=0 (not test mean, since true mean ≈ 0)
-                                  * y_baseline: Historical mean (structural funding rate positive bias)
-                                    Benchmark: ŷ=mean(y_train)
-                                  * y_heuristic: Zero-predictor (Z-score normalized, mean ≈ 0)
-                                    Benchmark: ŷ=0
-                       'r2_oos_benchmark_zero' - Always GKX 2020 (debug)
-                       'r2_oos_benchmark_historical_mean' - Always historical mean (debug)
-                       'correlation', 'prediction_error_mean', 'prediction_error_std',
-                       'pred_min', 'pred_max', 'target_min', 'target_max'
+        Dict with keys: mse, mae, rmse, r2, r2_oos, r2_oos_benchmark_zero,
+                        r2_oos_benchmark_historical_mean, correlation,
+                        prediction_error_mean, prediction_error_std,
+                        pred_min, pred_max, target_min, target_max
     """
     # MSE, MAE, RMSE
     mse = torch.mean((predictions - targets) ** 2).item()
@@ -280,23 +241,19 @@ def _compute_metrics(
 
 class EarlyStopping:
     """
-    Early stopping callback to prevent overfitting.
-    Stops training if validation loss doesn't improve by at least min_delta
-    for N consecutive epochs.
-    
-    min_delta is critical for financial time-series: without it, a noise improvement
-    of 1e-6 resets the patience counter, causing the model to train far longer than
-    necessary and memorize validation-period patterns.
+    Early stopping based on EMA-smoothed validation loss.
+
+    Uses a min_delta threshold so that noise-level decreases (< 1e-5) do not
+    reset the patience counter — important for financial time-series where
+    validation loss plateaus for many epochs before meaningfully improving.
     """
     
     def __init__(self, patience: int = 7, min_delta: float = 1e-4, verbose: bool = True):
         """
         Args:
-            patience:  Number of epochs with no meaningful improvement before stopping
-            min_delta: Minimum absolute improvement in val loss to count as 'improved'.
-                       Prevents noise-level decreases from resetting the patience counter.
-                       Default 1e-4 = loss must drop by at least 0.01% of its magnitude.
-            verbose:   Whether to log early stopping events
+            patience: Epochs without meaningful improvement before stopping.
+            min_delta: Minimum absolute improvement in val loss to reset the counter.
+            verbose: Log early-stopping events.
         """
         self.patience = patience
         self.min_delta = min_delta
@@ -306,15 +263,7 @@ class EarlyStopping:
         self.early_stop = False
     
     def __call__(self, val_loss: float) -> bool:
-        """
-        Check if training should be stopped.
-        
-        Args:
-            val_loss: Current validation loss
-        
-        Returns:
-            True if training should stop, False otherwise
-        """
+        """Return True if training should stop, False otherwise."""
         if self.best_loss is None:
             self.best_loss = val_loss
             return False
@@ -349,9 +298,7 @@ class EarlyStopping:
 
 
 class Trainer:
-    """
-    Training orchestrator with state management, checkpointing, and MLOps integration.
-    """
+    """Orchestrates training, validation, checkpointing, and W&B logging for one target."""
     
     def __init__(
         self,
@@ -361,13 +308,12 @@ class Trainer:
         target_scaler=None,
     ):
         """
-        Initialize trainer.
-        
         Args:
-            config: ExperimentConfig instance
-            model: MultimodalFusionNet or similar
-            device: "cuda" or "cpu"
-            target_scaler: Fitted RobustScaler for inverse transforms on test/val metrics (optional)
+            config: ExperimentConfig instance.
+            model: MultimodalFusionNet instance.
+            device: "cuda" or "cpu".
+            target_scaler: Fitted RobustScaler for inverse-transforming predictions/targets
+                           to the original scale during validation reporting.
         """
         self.config = config
         self.model = model.to(device)
@@ -394,19 +340,12 @@ class Trainer:
     
     def setup_optimizer(self) -> None:
         """
-        Initialize optimizer with conservative hyperparameters for offline feature extraction.
-        
-        CRITICAL: Learning Rate Strategy (Pure Float32)
-        - Off-line features: only TabularEncoder, CrossModalAttention, LSTM, and PredictionHead are trainable
-        - Safe range: 1e-4 to 5e-4 (learnable components only, no backbones)
-        - Default: 1e-4 (balanced between stability and convergence speed)
-        - If encountering NaN or gradient explosion: reduce to 5e-5 to 1e-5
-        
-        - Pure float32 advantages:
-          - No gradient scaling complexity (no underflow/overflow)
-          - Direct gradient magnitudes (easier debugging)
-          - Sufficient VRAM on Kaggle 16GB (BS=128, MULTI asset, offline features)
-          - Gradient clipping handles LSTM/Attention instability
+        Initialise AdamW optimizer and optional cosine warmup scheduler.
+
+        Learning rate is 1e-4 because only the fusion components are trainable
+        — frozen backbones mean the effective parameter count is small and
+        high LRs cause gradient explosion in the LSTM.
+        Uses pure float32 (no AMP/GradScaler).
         """
         # AdamW optimizer with conservative defaults for multimodal training
         self.optimizer = optim.AdamW(
@@ -445,49 +384,22 @@ class Trainer:
     
     def train_epoch(self, train_loader: DataLoader, target_idx: int = 0, train_targets_mean: Optional[float] = None) -> Dict[str, float]:
         """
-        Run one training epoch with gradient accumulation and explicit gradient clipping.
-        Pure float32 implementation (no AMP) for numerical stability.
-        Collects predictions for comprehensive metric computation.
-        
-        ============================================================================
-        TRAINING LOOP STRUCTURE (Pure Float32 + tqdm)
-        ============================================================================
-        
-        1. Forward pass:         model(batch) → predictions (float32)
-        2. Compute loss:         MSE(predictions, targets)
-        3. Scale loss:           loss / accumulate_steps (for accumulation)
-        4. Backward pass:        loss.backward() (standard PyTorch)
-        5. Accumulation check:   if (batch_idx + 1) % accumulate_steps == 0
-        6. Gradient clipping:    clip_grad_norm_(model.parameters(), max_norm=1.0)
-        7. Optimizer step:       optimizer.step() (standard update)
-        8. Schedule step:        scheduler.step() (learning rate decay)
-        9. Zero gradients:       optimizer.zero_grad() (reset for next accumulation)
-        10. tqdm update:         Update progress bar with moving loss average
-        
-        Why pure float32?
-        - Eliminates float16 underflow/overflow in backward pass
-        - Eliminates GradScaler scaling complexity
-        - Direct gradient magnitudes → easier debugging
-        - Kaggle 16GB VRAM sufficient for BS=128 with offline features
-        
-        ============================================================================
-        
-        VRAM Management:
-        - Batch size 128 (MULTI asset: BTC+ETH combined, seq_len=24)
-        - Frozen backbones + offline feature extraction → backbones NOT in VRAM
-        - Only trainable components in VRAM: TabularEncoder, CrossModalAttn,
-          Bottleneck, TemporalLSTM, PredictionHead (~few MB)
-        - Gradient accumulation: accumulate_steps=2 → effective batch=256
-        - Precision: Native float32 (no mixed precision)
-        - Gradient clipping: max_norm=1.0 (prevents explosion in LSTM/Attention)
-        
+        Run one training epoch with gradient accumulation and gradient clipping.
+
+        Adds Gaussian noise to pre-extracted embeddings (std=embedding_noise_std)
+        as regularisation against overfitting on frozen features. Loss is HuberLoss
+        averaged over active prediction heads. Returns a metrics dict including
+        'predictions' and 'targets' tensors for epoch-level R² computation.
+
         Args:
-            train_loader: Training DataLoader
-        
+            train_loader: Training DataLoader.
+            target_idx: Index of the primary target (0=y_baseline, 1=y_heuristic, 2=y_vol_adj_return).
+            train_targets_mean: Training-set mean used for the historical-mean R²_OOS benchmark.
+
         Returns:
-            Dict with keys: 'loss', 'mse', 'mae', 'rmse', 'r2', 'r2_oos', 'correlation',
-                          'prediction_error_mean', 'prediction_error_std',
-                          'predictions', 'targets'
+            Dict with keys: loss, mse, mae, rmse, r2, r2_oos, correlation,
+                            prediction_error_mean, prediction_error_std,
+                            avg_gradient_norm, max_gradient_norm, predictions, targets.
         """
         self.model.train()
         total_loss = 0.0
@@ -719,24 +631,22 @@ class Trainer:
     
     def validate(self, val_loader: DataLoader, target_idx: int = 0, train_targets_mean: Optional[float] = None) -> Dict[str, float]:
         """
-        Run validation (pure float32, no AMP) with comprehensive metrics collection.
-        
-        Collects predictions and targets for:
-        - Standard metrics: MSE, MAE, RMSE
-        - Statistical metrics: R², correlation, prediction bias, error std
-        - Ground truth vs prediction logging
-        
-        If target_scaler is available: applies inverse transforms to report metrics in original scale.
-        Otherwise: reports metrics in normalized scale.
-        
+        Run validation in eval mode (no gradient).
+
+        If target_scaler is set, applies inverse transform before computing metrics
+        so that mse/mae/rmse/r2 are in the original (denormalised) scale.
+        'normalized_huber' is always on the normalised scale and is used for
+        early stopping to ensure consistent comparisons across folds.
+
         Args:
-            val_loader: Validation DataLoader
-        
+            val_loader: Validation DataLoader.
+            target_idx: Primary target index.
+            train_targets_mean: Training-set mean for the historical-mean R²_OOS benchmark.
+
         Returns:
-            Dict with keys: 'mse', 'mae', 'rmse', 'r2', 'r2_oos', 'correlation', 
-                          'prediction_error_mean', 'prediction_error_std',
-                          'predictions', 'targets', 'is_denormalized',
-                          'normalized_huber', 'normalized_mae'
+            Dict with keys: mse, mae, rmse, r2, r2_oos, correlation,
+                            normalized_huber, normalized_mae, is_denormalized,
+                            predictions, targets, is_post_etf.
         """
         self.model.eval()
         total_huber = 0.0  # Accumulates HuberLoss (NOT MSE) — used for val_losses tracking
@@ -853,13 +763,7 @@ class Trainer:
         return metrics
     
     def save_checkpoint(self, path: Path, is_best: bool = False) -> None:
-        """
-        Save training checkpoint.
-        
-        Args:
-            path: Path to save checkpoint
-            is_best: If True, mark as best model
-        """
+        """Save model + optimiser + scheduler state to disk."""
         checkpoint = {
             "epoch": self.epoch,
             "global_step": self.global_step,
@@ -883,12 +787,7 @@ class Trainer:
             wandb.save(str(path))
     
     def load_checkpoint(self, path: Path) -> None:
-        """
-        Load training checkpoint and restore state.
-        
-        Args:
-            path: Path to checkpoint
-        """
+        """Restore training state from a saved checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -907,10 +806,7 @@ class Trainer:
         logger.info(f"✓ Loaded checkpoint from {path}")
     
     def cleanup_old_checkpoints(self) -> None:
-        """
-        Delete old checkpoints, keeping only the last N periodic checkpoints.
-        Preserves best model checkpoint always.
-        """
+        """Delete periodic checkpoints beyond keep_last_n, preserving the best-model file."""
         checkpoint_dir = self.config.mlops.checkpoint_dir
         keep_last_n = self.config.mlops.keep_last_n
         
@@ -928,10 +824,11 @@ class Trainer:
 
 def main(args):
     """
-    Main training script.
-    
-    Args:
-        args: Parsed command-line arguments (or Namespace object with attributes)
+    Entry point: train one model per target under walk-forward cross-validation.
+
+    Supports single-target mode (3 independent models) and multi-target mode
+    (one shared model with N prediction heads). Saves test-set predictions to
+    .npz for downstream Diebold-Mariano testing.
     """
     # Set safe defaults for all args attributes (in case called from notebook without argparse)
     asset = getattr(args, 'asset', 'MULTI')
@@ -998,12 +895,10 @@ def main(args):
             wandb_run_name=run_name,
         )
     config.debug = debug
-    if tabular_filename == "tabular_features_extended.pt":
-        _n_tab_features = 11
-    elif tabular_filename == "tabular_features_no_funding.pt":
-        _n_tab_features = 6
+    if tabular_filename == "tabular_features_no_funding.pt":
+        _n_tab_features = 6   # funding_rate col dropped → 6 features; is_post_ETF shifts to idx 5
     else:
-        _n_tab_features = 7
+        _n_tab_features = 7   # standard 7-feature base set
     config.model.tabular_input_size = _n_tab_features + 16  # +16 for asset embedding
 
     # ── CLI overrides: apply ALL explicitly-passed args after config creation ──
@@ -1430,10 +1325,8 @@ def main(args):
                 logger.info(f"Resumed from checkpoint — starting at epoch {start_epoch}")
 
             # Early stopping reset.
-            # min_delta=1e-5 (reduced from 1e-4): financial time-series improvements are
-            # often < 1e-4 per epoch in the slow-learning phase (epoch 2-9 plateau observed).
-            # 1e-4 was cutting training at epoch ~16 when loss was still decreasing.
-            # 1e-5 responds to genuine stagnation without triggering on normal noise.
+            # min_delta=1e-5: financial time-series loss improvements are typically small
+            # (< 1e-4 per epoch); a larger threshold triggers premature stopping.
             early_stopping = EarlyStopping(
                 patience=config.training.early_stopping_patience,
                 min_delta=config.training.early_stopping_min_delta,
@@ -1798,7 +1691,6 @@ def main(args):
             wandb.finish()
 
     # END of per-target loop
-    # END of per-target loop
     # ==================== GLOBAL SUMMARY ====================
     logger.info("\n" + "=" * 80)
     logger.info("ALL TARGETS — TRAINING COMPLETE")
@@ -1833,10 +1725,8 @@ if __name__ == "__main__":
     parser.add_argument("--asset", choices=["MULTI"], default="MULTI",
                         help="Cryptocurrency asset (multi-asset: BTC+ETH combined)")
     parser.add_argument("--features-dir", type=str, default="./data/features", dest="features_dir",
-                        help="Directory containing BTC/ and ETH/ feature subdirs (default: ./data/features). "
+                        help="Directory containing BTC/ and ETH/ feature subdirs. "
                              "On Kaggle: /kaggle/input/<dataset-name>")
-    parser.add_argument("--features-dir", type=str, default="./data/features",
-                        help="Local path to pre-extracted features directory")
     parser.add_argument("--run-name", type=str, default=None,
                         help="W&B run name")
     parser.add_argument("--config", type=str, default=None,
@@ -1865,7 +1755,7 @@ if __name__ == "__main__":
                         ))
     # ── Training hyperparameter overrides (all optional; default = config.py values) ──
     parser.add_argument("--learning-rate", type=float, default=None, dest="learning_rate",
-                        help="AdamW learning rate (default: TrainingConfig.learning_rate = 1e-5)")
+                        help="AdamW learning rate (default: TrainingConfig.learning_rate = 1e-4)")
     parser.add_argument("--weight-decay", type=float, default=None, dest="weight_decay",
                         help="AdamW weight decay (default: TrainingConfig.weight_decay = 3e-3)")
     parser.add_argument("--early-stopping-patience", type=int, default=None, dest="early_stopping_patience",
@@ -1881,8 +1771,7 @@ if __name__ == "__main__":
     parser.add_argument("--tabular-file", type=str, default="tabular_features.pt", dest="tabular_file",
                         help=(
                             "Filename of the tabular features tensor inside each asset subdir. "
-                            "Use 'tabular_features.pt' (default, 7 base features), "
-                            "'tabular_features_extended.pt' (11 features = 7 base + MA7/MA25/RSI/MACD), "
+                            "Use 'tabular_features.pt' (default, 7 base features) "
                             "or 'tabular_features_no_funding.pt' (6 features, funding_rate removed)."
                         ))
     parser.add_argument("--tabular-dir", type=str, default=None, dest="tabular_dir",

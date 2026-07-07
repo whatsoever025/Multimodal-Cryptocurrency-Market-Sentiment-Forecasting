@@ -1,35 +1,18 @@
 """
-DataAligner v5: Multimodal Cryptocurrency Sentiment Dataset
+DataAligner: assembles the multimodal cryptocurrency dataset from raw sources.
 
-ARCHITECTURAL CHANGES (v5):
-  - DROPPED features: fear_greed_index, Open Interest, vol_30d, mom_30d
-  - ADDED feature: is_post_ETF (binary, 1 if timestamp >= 2024-01-01)
-  - KEPT tabular: return_1h, volume, funding_rate, gdelt_econ_volume,
-                  gdelt_econ_tone, gdelt_conflict_volume
-  - KEPT multimodal: text_content (FinBERT), image_path (ViT)
+Loads and temporally aligns 5 data streams — Binance OHLCV, Binance funding rates
+(8-hour, forward-filled), GDELT macro indicators, CoinDesk news text, and
+candlestick chart images — into a single hourly DataFrame.
 
-TARGET ENGINEERING (t vs t+1 — NO DATA LEAKAGE):
-  Features at time t; targets are values observed at time t+1.
+Hours without any news article are filled with "[NO_EVENT] market is quiet"
+so that FinBERT always receives a valid text input. Approximately 15% of hourly
+rows use this placeholder.
 
-  Step-differences (computed at each row t):
-    delta_funding   = funding_rate(t) - funding_rate(t-1)
-    delta_tone      = gdelt_econ_tone(t) - gdelt_econ_tone(t-1)
-    delta_conflict  = gdelt_conflict_volume(t) - gdelt_conflict_volume(t-1)
-
-  Shift backward by 1 (.shift(-1)) so each row t carries what happens at t+1:
-    target_delta_funding  -> delta_funding shifted to t
-    target_return         -> return_1h shifted to t
-    target_delta_tone     -> delta_tone shifted to t
-    target_delta_conflict -> delta_conflict shifted to t
-
-  Final targets:
-    y_baseline       = funding_rate(t+1h) per row — the +7 index offset in
-                       WalkForwardDataset.__getitem__ makes this effectively
-                       predict funding_rate 8 hours after the last input step.
-    y_heuristic      = weighted sum of Z-scored target variables (1-hour horizon)
-    y_vol_adj_return = Volatility-Adjusted Log Return (1-hour horizon)
-
-OUTPUT: Single DataFrame (no train/val/test split here).
+Targets (engineered at t, representing t+1):
+    y_baseline       — raw funding_rate at t+1 (8h-ahead horizon via +7 offset in dataset.py)
+    y_heuristic      — weighted expanding-Z-score composite (t+1h)
+    y_vol_adj_return — log-return / rolling-168h-vol (t+1h)
 """
 
 import os
@@ -66,25 +49,10 @@ ETF_APPROVAL_DATE = pd.Timestamp("2024-01-01 00:00:00", tz="UTC")
 
 class DataAligner:
     """
-    Aligns multimodal cryptocurrency market data into a single flat DataFrame.
+    Assembles and aligns multimodal data for a single asset (BTC or ETH).
 
-    Data sources:
-      1. Binance OHLCV (hourly): return_1h, volume
-      2. Binance funding rates (8-hour, forward-filled): funding_rate
-      3. GDELT exogenous (hourly): gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume
-      4. CoinDesk news (hourly aggregated): text_content
-      5. Candlestick chart images: image_path
-
-    Features at time t (8 total):
-      return_1h, volume, funding_rate,
-      gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
-      is_post_ETF,
-      text_content, image_path
-
-    Targets (3):
-      y_baseline       — raw delta_funding at t+1
-      y_heuristic      — weighted Z-score composite at t+1
-      y_vol_adj_return — Volatility-Adjusted Log Return at t+1
+    Runs a 5-phase pipeline: load → map images → engineer features → engineer
+    targets → assemble final DataFrame. Optionally pushes to Hugging Face Hub.
     """
 
     def __init__(

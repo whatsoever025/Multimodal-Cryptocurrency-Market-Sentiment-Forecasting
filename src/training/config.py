@@ -1,8 +1,9 @@
 """
-Configuration management for Multimodal Crypto Sentiment Forecasting.
+Dataclass-based configuration for MultimodalFusionNet training.
 
-Strictly typed dataclass-based configuration with MLOps metadata.
-Each branch can have unique wandb_run_name for isolated experiment tracking.
+All sub-configs (DataConfig, ModelConfig, TrainingConfig, MLOpsConfig) are
+composed into ExperimentConfig. Use create_config() to build a config with
+selective overrides while keeping dataclass defaults for unspecified fields.
 """
 
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DataConfig:
-    """Data loading and preprocessing configuration."""
+    """Data loading and preprocessing settings."""
     asset: str = "MULTI"  # "MULTI" for BTC+ETH combined, or single "BTC"/"ETH"
     seq_len: int = 24  # Sliding window length in hours
     batch_size: int = 128  # Per-GPU batch size
@@ -33,17 +34,16 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    """Architecture configuration."""
+    """Architecture hyperparameters."""
     hidden_dim: int = 256
-    bottleneck_dim: int = 64   # Reverted from 128: larger capacity caused overfitting.
-                                # Val loss increased while train loss decreased with 128.
+    bottleneck_dim: int = 64
     lstm_layers: int = 1
-    lstm_hidden_dim: int = 64  # Reverted from 128: same reason.
-    lstm_dropout: float = 0.4  # Increased back: need stronger regularization against overfitting.
+    lstm_hidden_dim: int = 64
+    lstm_dropout: float = 0.4
     attention_heads: int = 4
     mha_dropout: float = 0.1
-    encoder_dropout: float = 0.3  # Increased back: need stronger regularization.
-    head_dropout: float = 0.4     # Increased back: same reason.
+    encoder_dropout: float = 0.3
+    head_dropout: float = 0.4
     grad_clip: float = 1.0
     frozen_backbones: bool = True
     tabular_input_size: int = 23  # 7 base features + 16 asset embedding (extended: 11+16=27)
@@ -68,29 +68,19 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """Training loop configuration."""
+    """Training loop hyperparameters."""
     max_epochs: int = 60
-    learning_rate: float = 1e-5   # Comparison run: testing 3e-5 (between 1e-5 too-low and 7e-5 best).
-                                   # Completes the LR sensitivity curve for thesis comparison.
-    weight_decay: float = 3e-3    # Increased from 1e-3: stronger L2 penalty to prevent weight growth.
-                                   # With lr=1e-4, wd/lr ratio = 30 (moderate, still protective).
+    learning_rate: float = 1e-4
+    weight_decay: float = 3e-3
     accumulate_steps: int = 2
-    warmup_steps: int = 100       # ~4 epochs warmup (walk-forward fold: ~23 steps/epoch with ~5,500 samples).
-                                   # Original 800 steps = 35+ epochs of warmup — LR never reached peak.
+    warmup_steps: int = 100
     use_warmup: bool = True
     num_training_steps: Optional[int] = None
-    early_stopping_patience: int = 10  # Reduced from 15: overfitting confirmed (val loss increases
-                                        # from epoch 2 while train loss decreases). Stop earlier
-                                        # to save the best val checkpoint before overfitting worsens.
-    early_stopping_min_delta: float = 1e-5  # Minimum val loss improvement to count as 'improved'.
-                                             # 1e-5 (not 1e-4) to avoid premature stopping in slow-learning phase.
-    ema_alpha: float = 0.3                  # EMA smoothing factor for val loss used in early stopping.
-                                             # α=0.3: responds to real trends while filtering per-epoch noise.
-    embedding_noise_std: float = 0.01       # Std of Gaussian noise injected into text/image embeddings
-                                             # during training. Acts as regularization against overfitting.
-                                             # Set to 0.0 to disable.
-    huber_delta: float = 1.0                # Delta parameter for HuberLoss (used in both train & validate).
-                                             # Must be consistent across both phases.
+    early_stopping_patience: int = 10
+    early_stopping_min_delta: float = 1e-5
+    ema_alpha: float = 0.3
+    embedding_noise_std: float = 0.01  # Set to 0.0 to disable embedding noise regularization.
+    huber_delta: float = 1.0           # Must be the same value in both train and validate.
 
     def __post_init__(self):
         """Validate training config."""
@@ -118,7 +108,7 @@ class TrainingConfig:
 
 @dataclass
 class MLOpsConfig:
-    """Weights & Biases and artifact management."""
+    """Weights & Biases logging and checkpoint management."""
     wandb_project: str = "crypto-sentiment-forecasting"
     wandb_run_name: str = field(default_factory=lambda: f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     use_wandb: bool = True
@@ -152,7 +142,7 @@ class MLOpsConfig:
 
 @dataclass
 class ExperimentConfig:
-    """Master configuration combining all sub-configs."""
+    """Top-level config composing all sub-configs. Validated on construction."""
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -212,28 +202,27 @@ def create_config(
     **kwargs
 ) -> ExperimentConfig:
     """
-    Factory function to create ExperimentConfig with custom parameters.
+    Factory that builds an ExperimentConfig with selective overrides.
 
-    All training hyperparameters default to None — if None, the field's default
-    value defined in TrainingConfig is kept. This avoids any double-default problem.
+    Parameters default to None — if None, the field's default in TrainingConfig
+    is kept unchanged. Only explicitly provided values are applied.
 
     Args:
-        asset: "BTC", "ETH", or "MULTI"
-        seq_len: Sliding window length in hours
-        batch_size: Batch size per GPU (None = use DataConfig default)
-        hidden_dim: Model hidden dimension
-        learning_rate: AdamW learning rate
-        weight_decay: AdamW weight decay
-        early_stopping_patience: Epochs without improvement before stopping
-        early_stopping_min_delta: Minimum val-loss drop to count as improvement
-        ema_alpha: EMA smoothing factor for val loss (0 < alpha < 1)
-        embedding_noise_std: Std of noise added to embeddings during training (0 = disabled)
-        huber_delta: Delta for HuberLoss (must be same in train & validate)
-        wandb_run_name: Unique run identifier for W&B tracking
-        **kwargs: Additional config overrides (applied to top-level ExperimentConfig attrs)
+        asset: "BTC", "ETH", or "MULTI".
+        seq_len: Sliding window length in hours.
+        batch_size: Batch size per GPU (None = DataConfig default = 128).
+        hidden_dim: Model hidden dimension.
+        learning_rate: AdamW learning rate.
+        weight_decay: AdamW L2 penalty.
+        early_stopping_patience: Epochs without improvement before stopping.
+        early_stopping_min_delta: Minimum val-loss drop to count as improvement.
+        ema_alpha: EMA factor for smoothing val loss in early stopping (0 < α < 1).
+        embedding_noise_std: Gaussian noise std for embedding regularisation (0 = off).
+        huber_delta: HuberLoss delta; must match between train and validate.
+        wandb_run_name: W&B run identifier.
 
     Returns:
-        ExperimentConfig instance
+        ExperimentConfig
     """
     config = ExperimentConfig()
 

@@ -1,11 +1,10 @@
 """
-Offline Feature Extraction Pipeline
+Offline feature extraction pipeline for FinBERT text and ViT image embeddings.
 
-Extracts embeddings from frozen FinBERT and Vision Transformer (ViT) once, saves to disk.
-Eliminates per-batch backbone computations and I/O overhead during training.
-
-Usage:
-    python src/training/extract_features.py --asset MULTI --output_dir /path/to/features
+Extracts and caches embeddings from frozen backbones once per asset, so the
+training loop reads pre-computed tensors instead of running the encoders per batch.
+Run once on Kaggle before training:
+    python src/training/extract_features.py --asset MULTI --output_dir /kaggle/working/features
 """
 
 import os
@@ -57,10 +56,10 @@ logger = logging.getLogger(__name__)
 
 class FrozenTextEncoder(nn.Module):
     """
-    Frozen FinBERT encoder for extracting text embeddings.
-    
-    Input: (batch, max_text_length) token IDs
-    Output: (batch, 256) embeddings
+    Frozen FinBERT encoder with a trainable 768→256 projection head.
+
+    Input:  (batch, seq_len) token IDs
+    Output: (batch, 256) projected [CLS] embeddings
     """
     
     def __init__(self, hidden_dim: int = 256):
@@ -82,9 +81,8 @@ class FrozenTextEncoder(nn.Module):
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input_ids: (batch, max_text_length)
+            input_ids:      (batch, max_text_length)
             attention_mask: (batch, max_text_length)
-        
         Returns:
             (batch, hidden_dim)
         """
@@ -98,10 +96,10 @@ class FrozenTextEncoder(nn.Module):
 
 class FrozenImageEncoder(nn.Module):
     """
-    Frozen Vision Transformer (ViT) encoder for extracting image embeddings.
-    
-    Input: (batch, 3, 224, 224) RGB images (normalized [0, 1])
-    Output: (batch, 256) embeddings
+    Frozen ViT (google/vit-base-patch16-224) encoder with a trainable 768→256 projection head.
+
+    Input:  (batch, 3, 224, 224) normalised RGB images
+    Output: (batch, 256) projected [CLS] embeddings
     """
     
     def __init__(self, hidden_dim: int = 256):
@@ -127,7 +125,6 @@ class FrozenImageEncoder(nn.Module):
         """
         Args:
             images: (batch, 3, 224, 224)
-        
         Returns:
             (batch, hidden_dim)
         """
@@ -142,15 +139,17 @@ class FrozenImageEncoder(nn.Module):
 
 def load_asset_dataset(asset: str, debug: bool = False):
     """
-    Load a single asset dataset (BTC or ETH), concatenating train and test splits
-    to reconstruct the full chronological sequence for walk-forward validation.
+    Download and return the full chronological HuggingFace dataset for one asset.
+
+    Concatenates the train and test splits so that walk-forward splits can be
+    applied downstream without any pre-existing chronological boundary.
 
     Args:
-        asset: "BTC" or "ETH"
-        debug: If True, load only 100 samples for testing
+        asset: "BTC" or "ETH".
+        debug: If True, truncate to 100 samples for quick testing.
 
     Returns:
-        Concatenated HF Dataset (full sequence)
+        HuggingFace Dataset (full sequence, no split).
     """
     logger.info(f"Loading {asset} v5 dataset splits (train + test)...")
 
@@ -181,15 +180,15 @@ def extract_text_embeddings(
     device: str = "cuda",
 ) -> None:
     """
-    Extract text embeddings for all samples and save to disk.
-    
+    Extract FinBERT [CLS] embeddings for all samples and save to disk.
+
     Args:
-        dataset: HuggingFace Dataset
-        encoder: FrozenTextEncoder
-        output_path: Path to save embeddings
-        batch_size: Batch size for processing
-        max_text_length: BERT token sequence length
-        device: "cuda" or "cpu"
+        dataset:         HuggingFace Dataset with a "text_content" column.
+        encoder:         FrozenTextEncoder instance.
+        output_path:     Path to save the (N, 256) float32 tensor.
+        batch_size:      Processing batch size.
+        max_text_length: FinBERT token sequence length.
+        device:          "cuda" or "cpu".
     """
     logger.info(f"Extracting text embeddings ({len(dataset)} samples)...")
     print("[PROGRESS] Extracting text embeddings...")
@@ -251,15 +250,15 @@ def extract_image_embeddings(
     device: str = "cuda",
 ) -> None:
     """
-    Extract image embeddings for all samples and save to disk.
-    
+    Extract ViT [CLS] embeddings for all samples and save to disk.
+
     Args:
-        dataset: HuggingFace Dataset
-        encoder: FrozenImageEncoder
-        output_path: Path to save embeddings
-        batch_size: Batch size for processing
-        image_size: Vision Transformer (ViT) input size
-        device: "cuda" or "cpu"
+        dataset:     HuggingFace Dataset with an "image_path" column.
+        encoder:     FrozenImageEncoder instance.
+        output_path: Path to save the (N, 256) float32 tensor.
+        batch_size:  Processing batch size.
+        image_size:  ViT input resolution (default: 224).
+        device:      "cuda" or "cpu".
     """
     logger.info(f"Extracting image embeddings ({len(dataset)} samples)...")
     print("[PROGRESS] Extracting image embeddings...")
@@ -314,10 +313,7 @@ def extract_image_embeddings(
 
 
 def main(args):
-    """
-    Main extraction script — v5 full sequence.
-    Extracts embeddings for each specified asset and saves them to asset-specific subdirectories.
-    """
+    """Extract text, image, and tabular features for the specified asset(s) and save to disk."""
     setup_logging()
     logger.info("=" * 80)
     logger.info("Offline Feature Extraction Pipeline - v5 FULL SEQUENCE")
@@ -399,6 +395,9 @@ def main(args):
             print(f"[PROGRESS] ({asset}) Image extraction complete ({format_duration(elapsed)})")
 
         # Tabular features (raw, no scaling)
+        # Saves two files:
+        #   tabular_features.pt          — 7 base features (used by default training)
+        #   tabular_features_extended.pt — 11 features (7 base + MA7/MA25/RSI/MACD)
         tabular_output_path = asset_output_dir / "tabular_features_extended.pt"
         if tabular_output_path.exists() and not args.force:
             logger.info(f"✓ Tabular features already exist for {asset}: {tabular_output_path}")
@@ -412,6 +411,15 @@ def main(args):
             elapsed = time.time() - start_time
             logger.info(f"{asset} tabular extraction took {format_duration(elapsed)}")
             print(f"[PROGRESS] ({asset}) Tabular extraction complete ({format_duration(elapsed)})")
+
+        # Also save the 7-base-feature subset as tabular_features.pt for default training
+        base_tabular_path = asset_output_dir / "tabular_features.pt"
+        if base_tabular_path.exists() and not args.force:
+            logger.info(f"✓ Base tabular features already exist for {asset}: {base_tabular_path}")
+        else:
+            extended = torch.load(tabular_output_path, map_location="cpu")
+            torch.save(extended[:, :7].contiguous(), base_tabular_path)
+            logger.info(f"✓ Saved 7-feature base tensor → {base_tabular_path}")
 
         # Target scores (raw, no scaling)
         target_output_path = asset_output_dir / "target_scores.pt"
@@ -461,19 +469,14 @@ def extract_target_scores_sequence(
     output_path: Path,
 ) -> None:
     """
-    Extract RAW v5 targets (no scaling). Scaling done during training.
+    Extract raw target scores (no scaling) and save as (N, 3) float32 tensor.
 
-    v5 has THREE targets instead of the old single `target_score`:
-      - y_baseline       : raw funding_rate at t+1
-      - y_heuristic      : weighted Z-score composite
-      - y_vol_adj_return : Volatility-Adjusted Log Return
-
-    Saves as (N, 3) float32 tensor.
-    Column order: [y_baseline, y_heuristic, y_vol_adj_return]
+    Column order: [y_baseline, y_heuristic, y_vol_adj_return].
+    Scaling and clipping are applied in-memory during training.
 
     Args:
-        dataset: HuggingFace Dataset with y_baseline/y_heuristic/y_vol_adj_return columns
-        output_path: Path to save raw target tensor
+        dataset:     HuggingFace Dataset with y_baseline, y_heuristic, y_vol_adj_return columns.
+        output_path: Path to save the target tensor.
     """
     logger.info(f"Extracting v5 targets ({len(dataset)} samples)...")
     print("[PROGRESS] Extracting v5 targets (y_baseline, y_heuristic, y_vol_adj_return) RAW...")
@@ -499,11 +502,11 @@ def extract_target_scores_sequence(
 
 def _compute_technical_indicators(return_1h_arr: np.ndarray) -> dict:
     """
-    Compute MA7_ratio, MA25_ratio, RSI(14), MACD_hist from return_1h.
+    Compute MA7_ratio, MA25_ratio, RSI(14), and MACD histogram from return_1h.
 
-    Price is reconstructed via cumulative product of (1 + return/100).
-    MA features use percent-deviation ratios to stay scale-invariant across BTC/ETH.
-    No leakage: all computations look backward only.
+    Price is reconstructed as the cumulative product of (1 + return/100).
+    MA ratios are expressed as percent deviations to stay scale-invariant across
+    BTC and ETH. All computations are backward-looking (no look-ahead).
     """
     returns = pd.Series(return_1h_arr.astype(np.float64))
     price = (1.0 + returns.fillna(0.0) / 100.0).cumprod()
@@ -552,25 +555,20 @@ def extract_tabular_features_sequence(
     output_path: Path,
 ) -> None:
     """
-    Extract 11 tabular features (v6 schema, no scaling).
-    7 base features loaded from HF dataset + 4 technical indicators computed on-the-fly.
-    Scaling is applied in-memory during training.
+    Extract 11 tabular features (7 base + 4 technical indicators) and save to disk.
 
-    v6 Feature columns (saved in this order):
-      [return_1h, volume, funding_rate,
-       gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
-       is_post_ETF,
-       ma7_ratio, ma25_ratio, rsi_14, macd_hist]
+    Feature order:
+        [return_1h, volume, funding_rate,
+         gdelt_econ_volume, gdelt_econ_tone, gdelt_conflict_volume,
+         is_post_ETF,
+         ma7_ratio, ma25_ratio, rsi_14, macd_hist]
 
-    Technical indicators are derived from return_1h via price reconstruction:
-      price_index = cumprod(1 + return_1h/100)
-    No look-ahead bias: all rolling computations are backward-looking.
-
-    Saves as (N, 11) float32 tensor.
+    Technical indicators are derived from return_1h via price reconstruction.
+    No scaling is applied here — scaling happens in-memory during training.
 
     Args:
-        dataset: HuggingFace Dataset (v5, single flat split)
-        output_path: Path to save raw tabular tensor
+        dataset:     HuggingFace Dataset.
+        output_path: Path to save the (N, 11) float32 tensor.
     """
     logger.info(f"Extracting v6 tabular features ({len(dataset)} samples)...")
     print("[PROGRESS] Extracting tabular features (v6: 7 base + 4 technical indicators)...")
@@ -610,13 +608,13 @@ def push_features_to_hf(
     private: bool = False,
 ) -> None:
     """
-    Upload extracted features to Hugging Face dataset.
-    
+    Upload extracted .pt feature files to a Hugging Face dataset repository.
+
     Args:
-        output_dir: Directory containing .pt files
-        repo_id: HF repo ID (e.g., username/crypto-features)
-        token: HF API token (uses cached if not provided)
-        private: Whether to make repo private
+        output_dir: Directory containing .pt files to upload.
+        repo_id:    HF repo ID (e.g., "username/crypto-features").
+        token:      HF API token (uses cached token if None).
+        private:    Whether to create a private repository.
     """
     logger.info(f"\nUploading features to HuggingFace: {repo_id}...")
     print(f"\n[PROGRESS] Uploading features to {repo_id}...")
@@ -680,17 +678,17 @@ def push_features_to_kaggle(
     public: bool = False,
 ) -> None:
     """
-    Prepare extracted features for Kaggle dataset upload via CLI.
-    
-    Creates metadata file. Use Kaggle CLI for actual upload:
-    $ kaggle datasets version -m "message" -p .
-    
+    Create a dataset-metadata.json for Kaggle CLI upload.
+
+    Writes the metadata file to output_dir. Upload with:
+        cd <output_dir> && kaggle datasets version -m "message" -p .
+
     Args:
-        output_dir: Directory containing .pt files
-        dataset_name: Kaggle dataset name (e.g., crypto-sentiment-embeddings)
-        kaggle_username: Kaggle API username (for metadata reference)
-        kaggle_key: Kaggle API key (unused, kept for backward compatibility)
-        public: Whether to make dataset public (for future use)
+        output_dir:       Directory containing .pt files.
+        dataset_name:     Kaggle dataset name slug.
+        kaggle_username:  Kaggle account username (for metadata).
+        kaggle_key:       Unused; kept for API compatibility.
+        public:           Whether to make the dataset public.
     """
     logger.info(f"\nPreparing features for Kaggle upload: {dataset_name}...")
     print(f"\n[PROGRESS] Preparing features for Kaggle upload: {dataset_name}...")

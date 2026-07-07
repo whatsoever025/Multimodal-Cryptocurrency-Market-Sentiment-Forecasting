@@ -2,119 +2,44 @@
 
 ## Overview
 
-This document summarizes all raw data files collected by the cryptocurrency market sentiment forecasting system. The data spans from **October 2019 to March 2026** and includes historical crypto news, market data, funding rates, liquidations, sentiment indices, macroeconomic news sentiment, and cryptocurrency discussion sentiment.
+This document describes all raw data files used by the cryptocurrency market sentiment
+forecasting system. The data spans **January 2020 to January 2025** across three modalities:
+market data, news text, and candlestick chart images.
 
-**Total Records Across All Files: ~515,000+**
-- Crypto News Articles: 229,172 records (HuggingFace dataset, 2019-2025)
-- Market & On-Chain Data: 105,487 records (2023-2026)
-- Sentiment Data: 179,524 records (Reddit + crypto news, 2023-2026)
+**Data used in the thesis (v5):**
+- Crypto News Articles: 229,172 records (CoinDesk via HuggingFace, 2019–2025)
+- Market & Funding Rate Data: ~89,136 records (Binance OHLCV + funding rates, 2020–2025)
+- GDELT Macro Indicators: 43,909 hourly records (2020–2025)
 - Generated Chart Images: 89,048 candlestick charts with technical indicators (BTC: 44,524 + ETH: 44,524)
 
 ---
 
 ## Data Files
 
-### 0. **huggingface_crypto_news.csv** - Cryptocurrency News Dataset (HuggingFace)
-- **Purpose:** Comprehensive crypto news sentiment dataset from Coindesk
+### 0. **huggingface_crypto_news.csv** — Cryptocurrency News Dataset (CoinDesk)
+- **Purpose:** Comprehensive crypto news dataset from CoinDesk, used as the text modality
 - **Rows:** 229,172 news articles
 - **Date Range:** 2019-10-29 to 2025-02-01 (5.3 years)
-- **Source:** HuggingFace Hub - `maryamfakhari/crypto-news-coindesk-2020-2025`
+- **Source:** HuggingFace Hub — `khanh252004/multimodal_crypto_sentiment_btc` / `_eth`
 - **Granularity:** Individual articles (timestamps at publication time)
 
 #### Fields:
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | int | Unique article identifier |
-| `guid` | string | Global unique identifier |
-| `published_on` | datetime | Publication timestamp (ISO 8601 with microseconds) |
-| `title` | string | Article headline (cleaned) |
-| `body` | string | Article body text (cleaned) |
-| `url` | string | Source URL to original article |
-| `imageurl` | string | URL to associated image/thumbnail |
-| `tags` | string | Article tags/keywords |
-| `categories` | string | Article categories (News, Analysis, etc.) |
-| `source` | string | News source (Coindesk, etc.) |
-| `upvotes` | int | Engagement metric (upvotes/reactions) |
-| `downvotes` | int | Downvotes or negative reactions |
-| `last_update` | datetime | Last modification timestamp |
-
-#### Data Quality:
-- **Total records:** 229,172 (100% unique by publication date + title)
-- **Date coverage:** Full 5.3-year span 2019-10-29 to 2025-02-01 (no major gaps)
-- **Missing values:** <0.1% (mostly in optional fields like tags/categories)
-- **Time-aligned:** Can be merged with price data on hourly basis
+| `published_on` | datetime | Publication timestamp (UTC) |
+| `title` | string | Article headline |
+| `body` | string | Article body text |
+| `combined_text` | string | Title + body concatenated (used for FinBERT encoding) |
 
 #### Key Statistics:
 - **Average articles per day:** ~120
-- **Peak coverage:** 2021-2022 (bull market period)
-- **Assets mentioned:** Primary focus on BTC/ETH market movements
-- **Topics:** Market news, regulation, technology updates, price analysis
-
-#### Use Cases:
-- Long-term sentiment analysis (5+ year history)
-- Training language models for crypto sentiment classification
-- Identifying major news cycles and market catalysts
-- Backtesting sentiment-based trading strategies
+- **Hours with at least one article:** ~84.9% of the hourly index
+- **Missing hours:** Filled with `"[NO_EVENT] market is quiet"` placeholder during alignment
 
 ---
 
-### 1. **reddit_posts.csv** - Reddit + Crypto News Sentiment (Combined)
-- **Purpose:** Combined sentiment data from Reddit discussions and Coindesk crypto news articles
-- **Rows:** 179,524 records (176,543 crypto news + 2,981 Reddit discussions)
-- **Date Range:** 2023-01-01 to 2026-03-24 (3+ years)
-- **Sources:** 
-  - Crypto news: `maryamfakhari/crypto-news-coindesk-2020-2025` dataset from Hugging Face
-  - Reddit: r/CryptoCurrency, r/Bitcoin, r/Ethereum (via public .json endpoint)
-- **Granularity:** Hourly (timestamps aligned to hour boundary)
-
-#### Fields:
-| Field | Type | Description |
-|-------|------|-------------|
-| `timestamp` | datetime | UTC timestamp in ISO 8601 format (YYYY-MM-DDTHH:MM:SS) |
-| `subreddit` | string | Source: subreddit name (\"CryptoCurrency\", \"Bitcoin\", \"Ethereum\") or \"news\" for articles |
-| `title` | string | Article/post title (cleaned, URLs removed) |
-| `text` | string | Article body or post selftext (cleaned) |
-| `combined_text` | string | Title + text concatenated (used for sentiment encoding) |
-| `url` | string | Source URL to original content |
-| `score` | int | Reddit upvotes or news engagement (upvotes for news) |
-| `num_comments` | int | Reddit comment count or downvotes (for news sources) |
-| `author` | string | Reddit username or news source name |
-| `assets` | string | Detected crypto assets: \"BTC\", \"ETH\", \"BTC,ETH\", or \"OTHER\" |
-| `text_hash` | string | SHA256 hash of combined_text (for deduplication, 100% unique) |
-| `source` | string | Data source: \"reddit\" or \"crypto_news_sentiment\" |
-
-#### Asset Detection (Regex-based):
-- **BTC:** Matches patterns `\bbtc\b` or `\bbitcoin\b` → **72.1%** of records mention BTC
-- **ETH:** Matches patterns `\beth\b` or `\bethereum\b` → **35.5%** of records mention ETH  
-- **OTHER:** No BTC/ETH mentions → **7.4%** of records
-
-#### Data Quality Metrics:
-- **Total records:** 179,524 (100% unique text hashes)
-- **Duplicates removed:** 281 (detected and removed during merge)
-- **Date coverage:** Full 3-year span 2023-01-01 to 2026-03-24 (no gaps > 5 months)
-- **Missing values:** <1% nulls (mostly in non-critical fields like text/body)
-- **Source split:** 98.3% crypto news sentiment, 1.7% Reddit discussions
-
-#### Sample Records:
-```
-Crypto News Record:
-timestamp,subreddit,title,text,combined_text,url,score,num_comments,author,assets,text_hash,source
-2023-06-15T14:00:00,news,Bitcoin ETF approval signals institutional adoption,"Bitcoin spot ETF application...",<combined>,https://coindesk.com/...,1200,0,coindesk,BTC,abc123def456...,crypto_news_sentiment
-
-Reddit Record:
-2026-03-24T01:00:00,CryptoCurrency,"Daily Crypto Discussion - March 24 2026","**Welcome to daily...",<combined>,https://reddit.com/r/Crypto.../...,13,51,AutoModerator,OTHER,881171a5ef5a...,reddit
-```
-
-#### Preprocessing Applied:
-- Text cleaning: URL removal, HTML entity decoding, emoji removal, whitespace normalization
-- Timestamp alignment: All timestamps floored to hour boundary
-- Deduplication: Exact match duplicates removed by text_hash (kept first occurrence)
-- Asset detection: Case-insensitive regex pattern matching
-
----
-
-### 2. **BTCUSDT_klines.csv** - Bitcoin OHLCV Candles
-- **Purpose:** Bitcoin hourly price data (OHLC) and trading volume
+### 1. **BTCUSDT_klines.csv** — Bitcoin OHLCV Candles
+- **Purpose:** Bitcoin hourly price data (OHLCV) — master hourly index for BTC
 - **Rows:** 44,568
 - **Date Range:** 2020-01-01 to 2025-01-31 (5 years)
 - **Source:** Binance Vision API
@@ -123,265 +48,77 @@ Reddit Record:
 #### Fields:
 | Field | Type | Description |
 |-------|------|-------------|
-| `timestamp` | datetime | UTC timestamp in format `YYYY-MM-DD HH:MM:SS` |
+| `timestamp` | datetime | UTC timestamp (`YYYY-MM-DD HH:MM:SS`) |
 | `open` | float | Opening price (USDT) |
 | `high` | float | Highest price in the period (USDT) |
 | `low` | float | Lowest price in the period (USDT) |
 | `close` | float | Closing price (USDT) |
 | `volume` | float | Trading volume (BTC) |
 
-#### Sample Data:
-```
-timestamp,open,high,low,close,volume
-2023-01-01 00:00:00,16537.5,16540.9,16504.0,16527.0,5381.399
-2023-01-01 01:00:00,16527.1,16554.3,16524.1,16550.4,3210.826
-```
-
 ---
 
-### 3. **BTCUSDT_fundingRate.csv** - Bitcoin Perpetual Funding Rates
-- **Purpose:** Bitcoin perpetual futures funding rates (8-hour intervals)
-- **Rows:** 3,465
-- **Date Range:** 2023-01-01 to 2026-02-28
+### 2. **BTCUSDT_fundingRate.csv** — Bitcoin Perpetual Funding Rates
+- **Purpose:** Perpetual futures funding rates — key sentiment/positioning signal
+- **Rows:** 5,574
+- **Date Range:** 2020-01-01 to 2025-01-31
 - **Source:** Binance Vision API
-- **Granularity:** Every 8 hours
+- **Granularity:** Every 8 hours (forward-filled to hourly in the alignment pipeline)
 
 #### Fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `calc_time` | int | Unix timestamp in milliseconds |
 | `funding_interval_hours` | int | Funding interval in hours (always 8) |
-| `last_funding_rate` | float | Funding rate value (decimal, e.g., 0.0001 = 0.01%) |
+| `last_funding_rate` | float | Funding rate (decimal, e.g., 0.0001 = 0.01%) |
 
 #### Interpretation:
-- **Positive rate:** Long positions pay shorts (bullish sentiment)
+- **Positive rate:** Long positions pay shorts (bullish sentiment / excess leverage)
 - **Negative rate:** Shorts pay longs (bearish sentiment)
-- Rates capture market leverage and sentiment
-
-#### Sample Data:
-```
-calc_time,funding_interval_hours,last_funding_rate
-1672531200000,8,0.0001
-1672560000008,8,0.0001
-```
 
 ---
 
-### 4. **ETHUSDT_klines.csv** - Ethereum OHLCV Candles
-- **Purpose:** Ethereum hourly price data (OHLC) and trading volume
+### 3. **ETHUSDT_klines.csv** — Ethereum OHLCV Candles
+- **Purpose:** Ethereum hourly price data — master hourly index for ETH
 - **Rows:** 44,568
 - **Date Range:** 2020-01-01 to 2025-01-31 (5 years)
 - **Source:** Binance Vision API
 - **Granularity:** Hourly
 
 #### Fields: Same as BTCUSDT_klines.csv
-| Field | Type | Description |
-|-------|------|-------------|
-| `timestamp` | datetime | UTC timestamp |
-| `open` | float | Opening price (USDT) |
-| `high` | float | Highest price (USDT) |
-| `low` | float | Lowest price (USDT) |
-| `close` | float | Closing price (USDT) |
-| `volume` | float | Trading volume (ETH) |
 
 ---
 
-### 5. **ETHUSDT_fundingRate.csv** - Ethereum Perpetual Funding Rates
-- **Purpose:** Ethereum perpetual futures funding rates
-- **Rows:** 3,465
-- **Date Range:** 2023-01-01 to 2026-02-28
+### 4. **ETHUSDT_fundingRate.csv** — Ethereum Perpetual Funding Rates
+- **Purpose:** ETH perpetual futures funding rates
+- **Rows:** 5,574
+- **Date Range:** 2020-01-01 to 2025-01-31
 - **Source:** Binance Vision API
-- **Granularity:** Every 8 hours
+- **Granularity:** Every 8 hours (forward-filled to hourly)
 
 #### Fields: Same as BTCUSDT_fundingRate.csv
-| Field | Type | Description |
-|-------|------|-------------|
-| `calc_time` | int | Unix timestamp in milliseconds |
-| `funding_interval_hours` | int | Funding interval (8 hours) |
-| `last_funding_rate` | float | Funding rate (decimal percentage) |
 
 ---
 
-### 6. **coinalyze_open_interest.csv** - Perpetual Open Interest
-- **Purpose:** Track aggregate open interest on Bybit PERP (Bybit perpetuals exchange)
-- **Rows:** 3,034
-- **Date Range:** 2026-01-19 to 2026-03-23 (recent data, ~2 months)
-- **Source:** Coinalyze API
-- **Granularity:** Hourly
-- **Assets:** BTC, ETH
-
-#### Fields:
-| Field | Type | Description |
-|-------|------|-------------|
-| `timestamp` | datetime | UTC timestamp in ISO format `YYYY-MM-DDTHH:MM:SS` |
-| `asset` | string | Crypto symbol (BTC or ETH) |
-| `open` | float | Opening open interest (in USD) |
-| `high` | float | Highest open interest (in USD) |
-| `low` | float | Lowest open interest (in USD) |
-| `close` | float | Closing open interest (in USD) |
-
-#### Purpose:
-Open interest represents the total value of outstanding perpetual contracts. Rising OI signals increased leverage and conviction in price moves; falling OI suggests unwinding of positions.
-
-#### Sample Data:
-```
-timestamp,asset,open,high,low,close
-2026-01-19T11:00:00,BTC,8827827806.378601,8834181033.232399,8827228099.167301,8830276929.0418
-```
-
----
-
-### 7. **coinalyze_liquidations.csv** - Perpetual Liquidations
-- **Purpose:** Track hourly liquidations on Bybit PERP (long vs. short)
-- **Rows:** 4,172
-- **Date Range:** 2025-12-25 to 2026-03-23 (~3 months)
-- **Source:** Coinalyze API
-- **Granularity:** Hourly
-- **Assets:** BTC, ETH
-
-#### Fields:
-| Field | Type | Description |
-|-------|------|-------------|
-| `timestamp` | datetime | UTC timestamp in ISO format |
-| `asset` | string | Crypto symbol (BTC or ETH) |
-| `long_liquidations` | float | BTC/ETH liquidated from long positions (in units) |
-| `short_liquidations` | float | BTC/ETH liquidated from short positions (in units) |
-
-#### Purpose:
-Liquidations indicate forced closures of leveraged positions. High liquidations suggest market participants were over-leveraged; pattern shifts indicate momentum or trend reversals.
-
-#### Interpretation:
-- **High long liquidations:** Suggests short squeeze or forced closure of bull positions
-- **High short liquidations:** Suggests long squeeze or forced closure of bear positions
-
-#### Sample Data:
-```
-timestamp,asset,long_liquidations,short_liquidations
-2025-12-25T07:00:00,BTC,0.0,0.751
-2025-12-25T08:00:00,BTC,0.0,0.818
-```
-
----
-
-### 8. **coinalyze_long_short_ratio.csv** - Perpetual Long/Short Ratio
-- **Purpose:** Track trader sentiment via open position ratios on Bybit PERP
-- **Rows:** 4,032
-- **Date Range:** 2025-12-29 to 2026-03-23 (~3 months)
-- **Source:** Coinalyze API
-- **Granularity:** Hourly
-- **Assets:** BTC, ETH
-
-#### Fields:
-| Field | Type | Description |
-|-------|------|-------------|
-| `timestamp` | datetime | UTC timestamp in ISO format |
-| `asset` | string | Crypto symbol (BTC or ETH) |
-| `ratio` | float | Long Open Interest ÷ Short Open Interest (e.g., 2.72 = 2.72:1) |
-| `long_percentage` | float | % of total OI in long positions (0-100) |
-| `short_percentage` | float | % of total OI in short positions (0-100) |
-
-#### Purpose:
-Long/short ratio is a sentiment indicator. High ratios indicate bullish trader sentiment; low ratios indicate bearish sentiment. Extreme ratios often precede reversals.
-
-#### Interpretation:
-- **Ratio > 3.0:** Extremely bullish (potential reversal risk)
-- **Ratio 1.5-3.0:** Moderately bullish
-- **Ratio 1.0-1.5:** Neutral to slightly bullish
-- **Ratio < 1.0:** More shorts than longs (bearish)
-
-#### Sample Data:
-```
-timestamp,asset,ratio,long_percentage,short_percentage
-2025-12-29T16:00:00,BTC,2.7216,73.13,26.87
-2025-12-29T16:00:00,ETH,2.686,72.87,27.13
-```
-
----
-
-### 9. **fear_greed_index.csv** - Cryptocurrency Fear & Greed Index
-- **Purpose:** Daily cryptocurrency market sentiment index
-- **Rows:** 2,970
-- **Date Range:** 2018-02-01 to 2026-03-24 (8+ years)
-- **Source:** Alternative.me API
-- **Granularity:** Daily
-- **Update Frequency:** Daily (UTC)
-
-#### Fields:
-| Field | Type | Description |
-|-------|------|-------------|
-| `timestamp` | int | Unix timestamp (seconds) |
-| `datetime` | string | ISO 8601 datetime format with timezone |
-| `value` | int | Fear & Greed Index value (0-100) |
-| `value_classification` | string | Text classification: "Extreme Fear", "Fear", "Neutral", "Greed", "Extreme Greed" |
-| `time_until_update` | float | Hours until next update (typically null) |
-| `source` | string | Data source (alternative.me) |
-
-#### Index Levels:
-| Value Range | Classification |
-|-------------|-----------------|
-| 0-25 | **Extreme Fear** - High capitulation |
-| 25-46 | **Fear** - Negative sentiment |
-| 46-54 | **Neutral** - Balanced sentiment |
-| 54-75 | **Greed** - Positive sentiment |
-| 75-100 | **Extreme Greed** - Euphoria/overbought |
-
-#### Methodology:
-The Fear & Greed Index combines multiple signals:
-- Volatility (25% weight)
-- Market momentum and volume (25%)
-- Social media intensity (15%)
-- Market dominance (10%)
-- Trending searches (10%)
-- Surveys (15%)
-
-#### Sample Data:
-```
-timestamp,datetime,value,value_classification,time_until_update,source
-1517443200,2018-02-01T00:00:00+00:00,30,Fear,,alternative.me
-1517529600,2018-02-02T00:00:00+00:00,15,Extreme Fear,,alternative.me
-```
-
----
-
-### 9. **gdelt_exogenous_data.csv** - GDELT Exogenous Data (Economy + Conflict)
-- **Purpose:** Global macroeconomic and geopolitical news sentiment (v3 feature set)
+### 5. **gdelt_exogenous_data.csv** — GDELT Exogenous Macro Indicators
+- **Purpose:** Global macroeconomic and geopolitical news sentiment (exogenous signals)
 - **Rows:** 43,909
-- **Date Range:** 2020-01-01 to 2025-01-31 (5+ years)
-- **Source:** GDELT v2.1 BigQuery Dataset
+- **Date Range:** 2020-01-01 to 2025-01-31 (5 years)
+- **Source:** GDELT v2.1 BigQuery Dataset (pre-computed CSV)
 - **Granularity:** Hourly (aggregated)
-- **Themes:** Economy/inflation + Conflict/politics (dual focus)
+- **Themes:** Economy/inflation (`ECON_INFLATION`) + Conflict/politics (`ARMEDCONFLICT`)
 
-#### Fields (3 exogenous macro indicators):
+#### Fields:
 | Field | Type | Description |
 |-------|------|-------------|
-| `timestamp` | datetime | UTC timestamp in ISO 8601 format |
-| `gdelt_econ_volume` | int | # articles on economy/inflation (ECON_INFLATION theme) |
-| `gdelt_econ_tone` | float | Average sentiment tone of economic articles (-100 to +100) |
-| `gdelt_conflict_volume` | int | # articles on conflict/politics (ARMEDCONFLICT theme) |
+| `timestamp` | datetime | UTC timestamp (ISO 8601) |
+| `gdelt_econ_volume` | int | # articles on economy/inflation themes |
+| `gdelt_econ_tone` | float | Average sentiment tone of economic articles (−100 to +100) |
+| `gdelt_conflict_volume` | int | # articles on conflict/politics themes |
 
-#### Sentiment Tone Scale:
-- **-100 to -50:** Very negative news (crises, conflicts, unemployment)
-- **-50 to -10:** Negative news (economic concerns)
-- **-10 to +10:** Neutral / mixed news
-- **+10 to +50:** Positive news (growth, stability)
-- **+50 to +100:** Very positive news (booming, prosperity)
-
-#### Purpose (v3 Integration):
-Exogenous macro data provides **exogenous shock signals** for crypto markets:
-- **Economic articles** capture inflation/policy changes affecting risk sentiment
-- **Conflict articles** capture geopolitical risk and flight-to-safety dynamics
-- Used alongside endogenous signals (funding rates, returns) for comprehensive sentiment
-
-#### Themes Tracked:
-- `ECON_INFLATION` - Inflation, economic policy, interest rates
-- `ARMEDCONFLICT` - Geopolitical conflicts, political instability
-
-#### Sample Data:
-```
-timestamp,gdelt_econ_volume,gdelt_econ_tone,gdelt_conflict_volume
-2023-01-01T00:00:00+00:00,45,-12.3,8
-2023-01-01T01:00:00+00:00,32,5.1,3
-```
+#### Tone Scale:
+- **−100 to −10:** Negative news (crises, conflicts, policy concerns)
+- **−10 to +10:** Neutral / mixed
+- **+10 to +100:** Positive news (growth, stability)
 
 ---
 
@@ -389,66 +126,63 @@ timestamp,gdelt_econ_volume,gdelt_econ_tone,gdelt_conflict_volume
 
 ### Final Dataset Fields (After Alignment & Processing)
 
-The **data_aligner.py** pipeline produces a **13-field multimodal dataset** (10 features + 3 targets) with chronological train/test splits:
+The **data_aligner.py** pipeline produces a **13-field multimodal dataset** (10 features + 3 targets):
 
 #### 1. Meta Group (1 field)
 | Field | Type | Source | Purpose |
-|-------|------|--------|----------|
+|-------|------|--------|---------|
 | `timestamp` | datetime | All sources (hourly index) | Time identifier (UTC) |
 
-#### 2. Tabular Data Group (7 fields) - For LSTM/MLP
+#### 2. Tabular Data Group (7 fields)
 | Field | Type | Source | Purpose |
-|-------|------|--------|----------|
-| `return_1h` | float (%) | OHLCV | Endogenous: hourly % price change |
+|-------|------|--------|---------|
+| `return_1h` | float (%) | OHLCV | Hourly % price change |
 | `volume` | float | OHLCV | Trading activity (asset units) |
-| `funding_rate` | float | Binance funding rates | Derivatives sentiment (8-hour ffill) |
-| `gdelt_econ_volume` | int | GDELT exogenous | # macro news articles (economy) |
-| `gdelt_econ_tone` | float (-100 to +100) | GDELT exogenous | Sentiment tone of economic news |
+| `funding_rate` | float | Binance funding rates | Derivatives sentiment (8-hour, forward-filled) |
+| `gdelt_econ_volume` | int | GDELT exogenous | # macro economy articles |
+| `gdelt_econ_tone` | float (−100 to +100) | GDELT exogenous | Sentiment tone of economic news |
 | `gdelt_conflict_volume` | int | GDELT exogenous | # geopolitical/conflict articles |
-| `is_post_ETF` | int (0 or 1) | Calendar date | Regime flag: 1 if >= 2024-01-01 (post-ETF approval) |
+| `is_post_ETF` | int (0 or 1) | Calendar date | Regime flag: 1 if timestamp ≥ 2024-01-01 |
 
-#### 3. Textual Data Group (1 field) - For BERT/LLM
+#### 3. Textual Data Group (1 field)
 | Field | Type | Source | Purpose |
-|-------|------|--------|----------|
-| `text_content` | string | CoinDesk news (aggregated) | Hourly crypto news articles [SEP] joined |
+|-------|------|--------|---------|
+| `text_content` | string | CoinDesk news (hourly aggregated) | Articles joined with `[SEP]`; `"[NO_EVENT] market is quiet"` for empty hours |
 
-#### 4. Visual Data Group (1 field) - For CNN/ViT
+#### 4. Visual Data Group (1 field)
 | Field | Type | Source | Purpose |
-|-------|------|--------|----------|
-| `image_path` | image (224×224 PNG) | chart_generator.py | Candlestick + MA7/MA25/RSI/MACD |
+|-------|------|--------|---------|
+| `image_path` | image (224×224 PNG) | chart_generator.py | Candlestick + MA7/MA25/RSI(14)/MACD |
 
 #### 5. Target Labels (3 fields)
-| Field | Type | Description | Purpose |
-|-------|------|-------------|---------|
-| `y_baseline` | float | `target_raw_funding` | Raw perpetual funding rate at t+1 (shifted to t+8 in dataset.py) |
-| `y_heuristic` | float | Z-score composite of changes at t+1 | Weighted sum: 0.4*Z(delta_funding) + 0.3*Z(return) + 0.2*Z(delta_tone) - 0.1*Z(delta_conflict) |
-| `y_vol_adj_return` | float | Volatility-Adjusted Log Return at t+1 | Formula: `log_return(t+1) / (vol_168(t) + 1e-6)` (un-clipped) |
+| Field | Type | Description |
+|-------|------|-------------|
+| `y_baseline` | float | Raw funding rate at t+1 (shifted to t+8 in `dataset.py`; scaled ×1000 during training) |
+| `y_heuristic` | float | Weighted Z-score composite at t+1: 0.4·Z(Δfunding) + 0.3·Z(return) + 0.2·Z(Δtone) − 0.1·Z(Δconflict) |
+| `y_vol_adj_return` | float | Volatility-adjusted log return at t+1: log\_return(t+1) / (vol\_168h(t) + 1e-6) |
 
-**Total: 10 features + 3 targets = 13 columns per row**
+**Total: 1 meta + 7 tabular + 1 text + 1 visual + 3 targets = 13 columns per row**
 
-### Data Alignment Process (Phases 1-5)
+### Data Alignment Process (Phases 1–5)
 
 | Phase | Operation | Input | Output |
 |-------|-----------|-------|--------|
-| **1** | Load 4 sources | CSV files | Hourly index alignment (raw merged) |
-| **2** | Map & validate images | Image directory | Drop missing image rows |
-| **3** | Feature engineering | Close returns + ETF flag | 7 tabular features |
-| **4** | Target engineering | Volatility + diffs | +3 target columns (y_baseline, y_heuristic, y_vol_adj_return) |
-| **5** | Final Assembly & Split | Chronological split | Train (85%) / Test (15%) |
+| **1** | Load 4 sources | CSV files | Hourly index alignment |
+| **2** | Map & validate images | Image directory | Drop rows with missing chart images |
+| **3** | Feature engineering | Close, funding, GDELT | 7 tabular features (return_1h, is_post_ETF, etc.) |
+| **4** | Target engineering | Returns, funding, GDELT | 3 target columns |
+| **5** | Final assembly | All columns | 13-column DataFrame; push to HuggingFace Hub |
 
 ### Chronological Split
 
-**Key Feature:** Chronological splitting isolates the last 15% of each asset's timeline for final testing, preventing data leakage. Walk-forward cross-validation dynamically splits the first 85% into train/val folds.
-
 ```
-Timeline (Chronological):
-|-------------------------- Train Split (85%) --------------------------|-------- Test Split (15%) --------|
-│                                                                        │                                   │
-🕐 2020-01-02 21:00 UTC                                                2024-04-29 00:00                2025-01-30 00:00
+Timeline:
+|────────────── Train + Val (85%) ──────────────|──── Test (15%) ────|
+2020-01-02                                   2024-04-29         2025-01-31
 ```
 
-- **Train/Val Fold Splitting:** Performed in-memory via `create_walk_forward_dataloaders`.
-- **Test Set Isolation:** Kept strictly separate for final evaluation. (A sliding window buffer of 8 steps prevents overlap).
+- **Walk-forward folds:** Applied in-memory via `create_walk_forward_dataloaders` on the 85% window
+- **Test set:** Strictly held out; 8-step buffer prevents overlap with training windows
 
 ---
 
@@ -458,150 +192,48 @@ Timeline (Chronological):
 
 **Location:** `data/processed/images/{btc,eth}/`
 
-#### Specifications:
-- **BTC Charts:** 44,524 images
-- **ETH Charts:** 44,524 images
-- **Total:** 89,048 chart images
-- **Image Size:** 224×224 pixels (standard for deep learning)
-- **Format:** PNG
-- **Date Range:** 2020-01-02 to 2025-01-31
+| Property | Value |
+|----------|-------|
+| BTC charts | 44,524 images |
+| ETH charts | 44,524 images |
+| Total | 89,048 images |
+| Resolution | 224×224 pixels (standard ViT input) |
+| Format | PNG |
+| Date range | 2020-01-02 to 2025-01-31 |
+| Lookback window | 24 candles per chart |
 
-#### Chart Contents:
-1. **Candlestick Pattern:** OHLC bars with wicks
-2. **Technical Indicators:**
-   - **MA7:** 7-hour moving average (blue line)
-   - **MA25:** 25-hour moving average (red line)
-   - **RSI(14):** 14-period Relative Strength Index (oscillator at bottom)
-   - **MACD:** Moving Average Convergence Divergence with signal line
-
-#### Use Cases:
-- Training computer vision models (ViT, CNN)
-- Multimodal prediction model input (combined with text sentiment)
-- Pattern recognition and technical analysis
-- Visualization of price action with indicators
-
-#### Generation Stats:
-- **Processing time:** ~25 minutes (12.25 min BTC + 12.19 min ETH)
-- **Parallel workers:** 21
-- **Generation rate:** ~60 images/second
-- **Preprocessing:** Automatic indicator calculation on full dataset
+**Chart overlays:**
+1. Candlestick (OHLC bars with wicks) on dark background
+2. MA7 — 7-period moving average
+3. MA25 — 25-period moving average
+4. RSI(14) — oscillator panel
+5. MACD — histogram panel
 
 ---
 
-### Coverage Summary:
+## Coverage Summary
 
-| Data Source | Asset(s) | Coverage | Records | Reliability |
-|------------|----------|----------|---------|-------------|
-| **HuggingFace Crypto News** | **BTC, ETH** | **2019-2025** | **229,172** | **⭐⭐⭐⭐⭐ - Comprehensive historical dataset** |
-| Binance Vision (klines) | BTC, ETH | 2020-2025 | 89,136 | ⭐⭐⭐⭐⭐ - Official exchange data |
-| Binance Vision (funding) | BTC, ETH | 2023-2026 | 11,148 | ⭐⭐⭐⭐⭐ - Official exchange data |
-| Coinalyze (OI, liquidations, L/S) | BTC, ETH | Recent (2-3 mo) | 11,238 | ⭐⭐⭐⭐ - Aggregator, good coverage |
-| Fear & Greed Index | Crypto market | 2018-2026 | 2,970 | ⭐⭐⭐⭐⭐ - Well-established index |
-| **GDELT Exogenous Data** | Global macro (economy + conflict) | 2020-2026 | 43,909 | ⭐⭐⭐⭐ - Dual-focus macro indicators |
-| Reddit Discussion | BTC, ETH | 2025-2026 | 2,981 | ⭐⭐⭐⭐ - Real-time Reddit data |
-| **Generated Chart Images** | **BTC, ETH** | **2020-2025** | **89,048** | **✓ 224×224 px with technical indicators** |
-
----
-
-## Time Alignment & Joins
-
-### Recommended Join Keys:
-
-1. **Price + Funding Rates:** 
-   - Join on `timestamp` (both hourly)
-   - Files: `BTCUSDT_klines.csv` ↔ `BTCUSDT_fundingRate.csv`
-
-2. **Price + Sentiment:**
-   - Join on hourly `timestamp`
-   - Files: `BTCUSDT_klines.csv` ↔ `fear_greed_index.csv` (daily, up-sample or group)
-
-3. **On-Chain Metrics (OI, Liquidations, L/S):**
-   - All at hourly granularity
-   - Join on `timestamp` and `asset` (BTC or ETH)
-   - Files: `coinalyze_*.csv`
-
-4. **Macro Sentiment (GDELT Exogenous):**
-   - Hourly timestamp
-   - Join with price data on `timestamp`
-   - File: `gdelt_exogenous_data.csv`
-
----
-
-## Suggested Use Cases
-
-### 1. **Price Prediction Model**
-- Input: OHLCV (klines) + funding rates + Fear/Greed + macro sentiment
-- Target: Next 1-24 hour price movement
-- Files: BTC/ETH klines, funding rates, fear_greed, GDELT
-
-### 2. Multimodal Sentiment Forecasting (v5)
-- Input: OHLCV (`return_1h`, `volume`) + `funding_rate` + `is_post_ETF` + GDELT exogenous (3 fields) + `text_content` + `image_path`
-- Target: 3 targets (`y_baseline` predicted 8 hours ahead, `y_heuristic` predicted 1 hour ahead, `y_vol_adj_return` predicted 1 hour ahead)
-- Architecture: LSTM/MLP + FinBERT + ViT (multi-branch fusion with learnable [FUSION] token)
-- Files: Hugging Face Hub (BTC/ETH datasets v5)
-- Training: ~37,688 rows per asset (85% train split, dynamically split into walk-forward folds)
-
-### 3. Liquidation Cascade Detection
-- Input: Liquidation volume + OI changes + L/S ratio extreme values
-- Target: Detect potential price reversals
-- Files: coinalyze_liquidations, coinalyze_open_interest, coinalyze_long_short_ratio
-
-### 4. Sentiment Features
-- Input: GDELT exogenous (econ volume/tone + conflict) + news volume + is_post_ETF
-- Use as: Feature for machine learning models
-- Files: gdelt_exogenous_data
-
-### 5. Risk Management
-- Monitor funding rates for leverage extremes
-- Track liquidation volumes for capitulation signals
-- Check macro sentiment for systemic risk
-- Files: Funding rates + liquidations + GDELT exogenous
+| Data Source | Asset(s) | Coverage | Records | Notes |
+|------------|----------|----------|---------|-------|
+| CoinDesk News (HuggingFace) | BTC, ETH | 2019–2025 | 229,172 articles | Text modality |
+| Binance Vision (klines) | BTC, ETH | 2020–2025 | 89,136 hourly rows | OHLCV |
+| Binance Vision (funding) | BTC, ETH | 2020–2025 | 11,148 (8h) → hourly | Funding rate |
+| GDELT Exogenous | Global macro | 2020–2025 | 43,909 hourly rows | Economy + conflict |
+| Generated Chart Images | BTC, ETH | 2020–2025 | 89,048 images | 224×224 candlestick |
 
 ---
 
 ## Data Collection Methods
 
-| Crawler | API | Update Frequency | Notes |
-|---------|-----|------------------|-------|
-| `binance_vision_crawler.py` | Binance Vision (Historical) | One-time download | 37 months of 1-hour candles |
-| `coinalyze_crawler.py` | Coinalyze REST API | Configurable (months_back) | Recent data, rolling window ~3 months |
-| `sentiment_crawler.py` | Alternative.me (Free API) | All-time history | 8+ years of daily fear/greed |
-| `gdelt_bq_crawler.py` | Google BigQuery GDELT | Recent (query-based) | Hourly macro news sentiment |
-
----
-
-## Next Steps for Analysis
-
-1. **Align time series:** Ensure all timestamps are UTC and hourly/daily granularity matches
-2. **Handle missing data:** Use forward-fill or interpolation for hourly gaps
-3. **Feature engineering:** Create lagged features, rolling averages, momentum indicators
-4. **Correlation analysis:** Check which sentiment signals lead price movements
-5. **Backtesting:** Validate prediction signals against actual price history
-6. **Model training:** Combine multimodal data (price + sentiment + macro) for forecasting
+| Script | API / Source | Purpose |
+|--------|-------------|---------|
+| `src/crawlers/binance_vision_crawler.py` | Binance Vision (historical) | OHLCV klines + funding rates |
+| `src/crawlers/huggingface_crawler.py` | HuggingFace Hub | CoinDesk news articles |
+| *(GDELT CSV)* | Pre-computed from GDELT BigQuery | `gdelt_exogenous_data.csv` loaded directly |
 
 ---
 
 **Generated:** 2026-05-24  
-**Total Data Points:** 515,000+ records (229,172 HF news + 105,487 market/on-chain + 179,524 sentiment)  
-**Total Chart Images:** 89,048 candlestick charts (BTC: 44,524 + ETH: 44,524) with technical indicators  
-**Historical Data Time Span:** 2019-10-29 to 2025-02-01 (HuggingFace news articles)  
-**Market Data Time Span:** 2020-01-01 to 2025-01-31 (Price + funding data)  
-**Sentiment Data Time Span:** 2023-01-01 to 2026-03-24 (combined Reddit + macro analysis)  
-**Fear & Greed Index Span:** 2018-02-01 to 2026-03-24 (8+ years)  
-
-#### Recent Updates:
-- **2026-05-24:** Fixed IndexError in `WalkForwardDataset` by updating target index buffer from 7 to 8 steps to prevent index overflow on the 8h target at slice endpoints. Legacy dataset loading logic and unused wrappers removed.
-- **2026-03-26:** v5 Implementation Complete - Multimodal Datasets Pushed to Hub
-  - **BTC Dataset:** `khanh252004/multimodal_crypto_sentiment_btc` (splits: train 85% / test 15%, 13 cols)
-  - **ETH Dataset:** `khanh252004/multimodal_crypto_sentiment_eth` (splits: train 85% / test 15%, 13 cols)
-  - Replaced GDELT macro with gdelt_exogenous_data.csv (dual-focus: economy + conflict)
-  - Implemented return_1h (% price change) replacing raw OHLCV
-  - 13-field structure: 1 meta + 7 tabular + 1 text + 1 visual + 3 targets
-  - Chronological splits with dynamic per-fold validation in train pipeline
-  - 100% image coverage: 44,477 valid images per asset (224×224 candlestick charts)
-- **2026-03-25:** Complete data pipeline overhaul
-  - Added HuggingFace `crypto-news-coindesk-2020-2025` dataset: 229,172 articles (2019-2025)
-  - Extended crawler time ranges to match HuggingFace historical data
-  - Generated 89,048 chart images (224×224 px) with MA7, MA25, RSI(14), MACD indicators
-  - Updated BTC/ETH klines to 5-year span: 44,568 records each (2020-1-1 to 2025-01-31)
-  - Sentiment crawler: 1,922 Fear & Greed records (filtered to 2019-2025 range)
+**Market Data Time Span:** 2020-01-01 to 2025-01-31  
+**News Data Time Span:** 2019-10-29 to 2025-02-01  
+**Total Chart Images:** 89,048 (BTC: 44,524 + ETH: 44,524)  

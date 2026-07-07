@@ -1,6 +1,8 @@
 """
-Shared metrics for baseline evaluation.
-Mirrors _compute_metrics() in src/training/train.py exactly.
+Regression metrics for baseline evaluation.
+
+Mirrors _compute_metrics() in src/training/train.py to ensure consistent
+R²_OOS values across the MFN training pipeline and the baseline scripts.
 """
 
 import numpy as np
@@ -17,12 +19,22 @@ def compute_metrics(
     train_targets_mean: Optional[float] = None,
 ) -> Dict[str, float]:
     """
-    Compute MAE, RMSE, R², R²_OOS with target-specific benchmark.
+    Compute MAE, RMSE, R², and R²_OOS with target-specific benchmark.
 
-    R²_OOS benchmark selection (mirrors train.py):
-        y_baseline        → Historical Mean  (structural positive bias; mean ≠ 0)
-        y_heuristic       → Zero-predictor   (GKX 2020; mean ≈ 0 after Z-scoring)
-        y_vol_adj_return  → Zero-predictor   (GKX 2020; log-return mean ≈ 0)
+    R²_OOS benchmark (mirrors train.py):
+        y_baseline       → Historical Mean (structural positive bias; mean ≠ 0)
+        y_heuristic      → Zero-predictor  (GKX 2020; Z-score normalised, mean ≈ 0)
+        y_vol_adj_return → Zero-predictor  (GKX 2020; log-return, mean ≈ 0)
+
+    Args:
+        predictions:        Predicted values (N,).
+        targets:            Ground truth values (N,).
+        target_name:        One of "y_baseline", "y_heuristic", "y_vol_adj_return".
+        train_targets_mean: Training-set mean required for y_baseline benchmark.
+
+    Returns:
+        Dict with keys: mae, mse, rmse, r2, r2_oos, r2_oos_gkx, r2_oos_hist,
+                        correlation, prediction_bias, n_samples.
     """
     predictions = np.asarray(predictions, dtype=np.float64)
     targets = np.asarray(targets, dtype=np.float64)

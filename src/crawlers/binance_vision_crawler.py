@@ -4,8 +4,6 @@ Binance Vision Crawler for Historical Monthly Data Collection.
 Downloads and extracts monthly historical data directly from Binance Vision for:
 - klines (1h): OHLCV candlestick data
 - fundingRate: Futures funding rates
-- openInterestHist: Open interest history
-- liquidationSnapshot: Liquidation events
 
 Uses in-memory processing with pandas for efficient data handling.
 """
@@ -95,7 +93,7 @@ class BinanceVisionCrawler(BaseCrawler):
         
         Args:
             symbol: Trading symbol (e.g., 'BTCUSDT')
-            data_type: Data type ('klines', 'fundingRate', 'openInterestHist', 'liquidationSnapshot')
+            data_type: Data type ('klines', 'fundingRate')
             month_str: Month string in YYYY-MM format
         
         Returns:

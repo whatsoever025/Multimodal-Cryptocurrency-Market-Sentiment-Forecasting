@@ -1,23 +1,10 @@
 """
-Walk-Forward Multimodal Dataset
+Walk-forward multimodal dataset for BTC+ETH panel data.
 
-Provides WalkForwardDataset and create_walk_forward_dataloaders for
-temporal walk-forward cross-validation over multi-asset (BTC + ETH) panel data.
-
-Features are loaded from pre-extracted .pt files stored in per-asset
-subdirectories (BTC/, ETH/) or a single consolidated directory.
-
-Scaling (StandardScaler for tabular, RobustScaler for targets) is fitted
-independently per asset on each fold's training window — no cross-asset or
-temporal leakage.
-
-Key classes / functions:
-- WalkForwardDataset: Sliding-window dataset supporting dual-asset panels.
-- walk_forward_split: Generator yielding (train_slice, val_slice) pairs.
-- create_walk_forward_dataloaders: Full pipeline — load data, engineer
-  targets, fit per-fold per-asset scalers, yield (fold, train_loader,
-  val_loader, scalers_dict).
-- multimodal_collate_fn: Collate function for DataLoader.
+Provides WalkForwardDataset (sliding-window) and create_walk_forward_dataloaders
+(full pipeline: load, engineer targets, fit per-fold per-asset scalers, yield folds).
+Scaling (StandardScaler for tabular, RobustScaler for targets) is fitted independently
+per asset on each fold's training window to prevent temporal and cross-asset leakage.
 """
 
 import sys
@@ -38,17 +25,15 @@ logger = logging.getLogger(__name__)
 def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
     """
     Collate function for multimodal batches.
-    
-    Args:
-        batch: List of dicts from WalkForwardDataset
-    
+
     Returns:
         Dict with stacked tensors:
-            - tabular: (batch_size, seq_len, 7)
-            - text_embedding: (batch_size, seq_len, 256)
-            - image_embedding: (batch_size, seq_len, 256)
-             - target: (batch_size, 3)
-            - timestamp: (batch_size,)
+            tabular:         (batch, seq_len, n_features)
+            text_embedding:  (batch, seq_len, 256)
+            image_embedding: (batch, seq_len, 256)
+            target:          (batch, 3)
+            timestamp:       (batch,)
+            asset_id:        (batch,)
     """
     stacked = {
         "tabular": torch.stack([sample["tabular"] for sample in batch]),
@@ -69,24 +54,19 @@ def multimodal_collate_fn(batch: list) -> Dict[str, torch.Tensor]:
 
 def walk_forward_split(data_len: int, window_size: int, step_size: int):
     """
-    Generate walk-forward train/val splits.
-    
-    CRITICAL: Walk-forward validation prevents look-ahead bias by training on
-    [0, train_end], validating on [train_end, train_end+step_size], then
-    progressively advancing the window forward.
-    
+    Generate expanding-window train/val splits in chronological order.
+
+    Fold 1: train=[0:window_size],           val=[window_size:window_size+step_size]
+    Fold 2: train=[0:window_size+step_size], val=[window_size+step_size:...]
+    ...
+
     Args:
-        data_len: Total data length
-        window_size: Initial train window size
-        step_size: Number of samples for each validation fold
-    
+        data_len: Total data length (training pool only, test set excluded).
+        window_size: Initial training window size.
+        step_size: Validation fold size (and expansion step per fold).
+
     Yields:
-        Tuple of (train_slice, val_slice) representing temporal folds
-    
-    Example:
-        data_len = 100, window_size = 70, step_size = 15
-        Fold 1: train=[0:70], val=[70:85]
-        Fold 2: train=[0:85], val=[85:100]
+        (train_slice, val_slice)
     """
     for i in range(0, data_len - window_size - step_size, step_size):
         train_end = i + window_size
@@ -104,9 +84,12 @@ def walk_forward_split(data_len: int, window_size: int, step_size: int):
 
 class WalkForwardDataset(torch.utils.data.Dataset):
     """
-    Walk-forward dataset supporting multi-asset panel data (BTC + ETH concatenated).
-    Ensures sliding windows never cross the boundary between assets.
-    Predicts baseline target 8 hours ahead, and other targets 1 hour ahead.
+    Sliding-window dataset over a concatenated BTC+ETH panel.
+
+    Ensures that 24-hour windows never cross the BTC/ETH boundary.
+    y_baseline (col 0) is fetched at index + seq_len + 7, making the effective
+    prediction horizon 8 hours ahead of the last input step.
+    y_heuristic (col 1) and y_vol_adj_return (col 2) are fetched at index + seq_len (t+1h).
     """
     def __init__(
         self,
@@ -205,27 +188,26 @@ def create_walk_forward_dataloaders(
     tabular_dir: str = None,
 ):
     """
-    Create walk-forward validation folds.
-    
-    Loads concatenated train/validation/test embeddings, then applies
-    temporal walk-forward splits for proper chronological validation.
-    
-    CRITICAL: Walk-forward respects temporal ordering:
-    - Fold 1: Train on [0:70%], validate on [70%:85%]
-    - Fold 2: Train on [0:85%], validate on [85%:100%]
-    
+    Load pre-extracted feature tensors and yield walk-forward validation folds.
+
+    Supports per-asset subdirectory layout (BTC/, ETH/) and legacy single-directory
+    layout. Applies target engineering (y_baseline ×1000, y_heuristic clip ±5) and
+    fits independent StandardScaler/RobustScaler per asset per fold on the training
+    window only.
+
     Args:
-        config: ExperimentConfig instance
-        features_dir: Local directory with extracted embeddings
-        num_folds: Number of temporal validation folds
-        num_workers: Data loading workers (always 0 on Kaggle)
-        pin_memory: Pin memory for GPU transfer
-        tabular_filename: Filename of the tabular features tensor inside each asset subdir.
-            Use "tabular_features.pt" (default, 7 features) for the original experiment
-            or "tabular_features_extended.pt" (11 features) for the ablation with TI.
-    
+        config: ExperimentConfig instance.
+        features_dir: Directory containing BTC/ and ETH/ feature subdirs.
+        num_folds: Number of walk-forward folds.
+        num_workers: DataLoader workers (always 0 on Kaggle).
+        pin_memory: Pin memory for GPU transfer.
+        tabular_filename: Tabular tensor filename inside each asset subdir.
+                          "tabular_features.pt" (7 features, default) or
+                          "tabular_features_no_funding.pt" (6 features).
+        tabular_dir: Override directory for tabular files (defaults to features_dir).
+
     Yields:
-        Tuple of (fold_num, train_loader, val_loader, scalers_dict)
+        (fold_num, train_loader, val_loader, scalers_dict)
     """
     num_workers = 0  # Force num_workers=0 for Kaggle safety
     features_dir = Path(features_dir) if features_dir else Path("./data/features")

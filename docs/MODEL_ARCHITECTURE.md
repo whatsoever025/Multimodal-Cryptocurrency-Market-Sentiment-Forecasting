@@ -1,7 +1,7 @@
 # MultimodalFusionNet Architecture Documentation
 
 **Last Updated:** June 3, 2026  
-**Model Version:** 5.1 (Hyperparameter Re-tuning — Plateau Fix)  
+**Model Version:** 5.0  
 **Status:** Production-Ready
 
 ---
@@ -99,8 +99,8 @@ Linear Projection: 256 → 64
        ↓
 Output: (batch, seq_len, 64)
 ```
-Compresses features before LSTM. **64** (reverted from 128) provides sufficient capacity
-to encode 24-hour multimodal context while preventing overfitting.
+Compresses features before LSTM. **64** dimensions encode the 24-hour multimodal context
+before the LSTM.
 
 ### 4. Temporal LSTM Layer
 ```
@@ -109,7 +109,7 @@ Input: (batch, seq_len, 64)
 LSTM Cell (1 layer, batch-first)
 ├─ Input Size: 64
 ├─ Hidden Size: 64
-├─ Dropout: 0.4 (increased back to provide stronger regularization)
+├─ Dropout: 0.4
 └─ Batch First: True
        ↓
 Extract Final Hidden State h_n[-1] → (batch, 64)
@@ -143,14 +143,14 @@ batch_size: 128                         # Default batch size
 ### ModelConfig (`config.py`)
 ```python
 hidden_dim: 256                         # Internal embedding dimension
-bottleneck_dim: 64                      # Bottleneck dimension (reverted from 128: larger capacity caused overfitting)
+bottleneck_dim: 64                      # Bottleneck dimension
 lstm_layers: 1                          # LSTM layers
-lstm_hidden_dim: 64                     # LSTM hidden dimension (reverted from 128)
-lstm_dropout: 0.4                       # Increased back: need stronger regularization against overfitting
+lstm_hidden_dim: 64                     # LSTM hidden dimension
+lstm_dropout: 0.4                       # LSTM dropout
 attention_heads: 4                      # Cross-modal attention heads
-mha_dropout: 0.1                        # MHA dropout (keeps backward dot-product stable)
-encoder_dropout: 0.3                    # TabularEncoder dropout (increased from 0.2 to prevent overfitting)
-head_dropout: 0.4                       # Prediction head dropout (increased from 0.3 to prevent overfitting)
+mha_dropout: 0.1                        # MHA dropout (kept ≤0.1 for attention gradient stability)
+encoder_dropout: 0.3                    # TabularEncoder dropout
+head_dropout: 0.4                       # Prediction head dropout
 grad_clip: 1.0                          # Gradient norm clipping (L2)
 frozen_backbones: True                  # Freeze FinBERT & ViT
 ```
@@ -158,25 +158,13 @@ frozen_backbones: True                  # Freeze FinBERT & ViT
 ### TrainingConfig (`config.py`)
 ```python
 max_epochs: 60                          # Training epochs
-learning_rate: 3e-5                     # Comparison run: testing 3e-5 (between 1e-5 too-low and 7e-5 best)
-                                        # Completes the LR sensitivity curve for thesis comparison
-weight_decay: 3e-3                      # Increased from 1e-3: stronger L2 penalty to prevent weight growth
+learning_rate: 1e-4                     # AdamW learning rate (selected from LR sensitivity analysis)
+weight_decay: 3e-3                      # AdamW L2 weight decay
 accumulate_steps: 2                     # Gradient accumulation steps (effective batch = 256)
-warmup_steps: 100                       # Reduced from 800: ~4 epochs (walk-forward fold ≈ 23 steps/epoch)
-                                        # Original 800 steps = 35+ epochs of warmup (LR never reached peak)
+warmup_steps: 100                       # Cosine warmup steps (~4 epochs per fold)
 use_warmup: True                        # Enable warmup schedule
-early_stopping_patience: 10             # Patience epochs (reduced from 15: overfitting confirmed; stop earlier)
+early_stopping_patience: 10             # EMA-smoothed early stopping patience (epochs)
 ```
-
-> **v5.1 Rationale — Plateau Fix & Overfitting Mitigation:**  
-> Walk-forward folds contain ~5,500 training samples (60% of one asset's 37,764 rows).  
-> With `batch_size=128`, `accumulate_steps=2` → **~23 optimizer steps/epoch**.  
-> The original `warmup_steps=800` therefore spanned **≈ 35+ epochs of warmup**, meaning  
-> the LR never reached its peak before cosine decay returned it to near-zero.  
-> Combined with `weight_decay=1e-2` (10× the LR) actively counteracting gradient updates,  
-> the model had essentially zero effective learning rate for 60% of training.
-> 
-> *Overfitting Correction:* In post-v5.1 runs, raising the bottleneck and LSTM dimension to 128 caused training loss to decrease while validation loss rose. The model was reverted to 64 dimensions for both bottleneck and LSTM, and dropout rates were increased across all layers (encoder: 0.3, lstm: 0.4, head: 0.4) to improve generalization on out-of-sample data. Early stopping patience was reduced to 10 to halt training before validation metrics degraded.
 
 ---
 
