@@ -60,10 +60,15 @@ logger = logging.getLogger(__name__)
 TARGET_NAMES  = ["y_baseline", "y_heuristic", "y_vol_adj_return"]
 SEQ_LEN       = 24      # 24-hour sliding window
 N_TABULAR     = 7       # number of tabular features
-BUFFER        = 8       # prevents t+8 index overflow
+BUFFER        = 8       # default funding_horizon; prevents t+funding_horizon index overflow
 TEST_PCT      = 0.15    # last 15% = hold-out test set (per asset)
 INIT_WIN_PCT  = 0.70    # initial training window fraction
 VAL_FOLD_PCT  = 0.15    # validation pool fraction
+
+# Column order per src/preprocessing/data_aligner.py final_columns (tabular section):
+# ["return_1h", "volume", "funding_rate", "gdelt_econ_volume", "gdelt_econ_tone",
+#  "gdelt_conflict_volume", "is_post_ETF"]
+FUNDING_RATE_COL_IDX = 2
 
 # =============================================================================
 # SECTION 1: METRICS
@@ -187,6 +192,38 @@ class HistoricalMeanModel:
         return np.full(len(X), self.train_mean, dtype=np.float32)
 
 
+class PersistenceModel:
+    """
+    Persistence baseline: ŷ = funding_rate_t (raw, ×1000 to match target engineering).
+
+    Only meaningful for y_baseline (funding) — no natural analogue exists for
+    y_heuristic / y_vol_adj_return, which lack a directly-persistable raw input
+    feature (thesis Section 4.1). run_baselines() only evaluates this model for
+    target_idx == 0 and skips it for the other two targets.
+
+    Rule-based: no fitting required. Unlike the other models, prediction is
+    computed from the RAW (unscaled) tabular window via predict_from_raw() —
+    NOT from the StandardScaler-transformed, flattened X used by the other
+    baselines — because z-scoring funding_rate would destroy the raw value
+    this baseline is defined on.
+    """
+    name = "Persistence"
+
+    def fit(self, X, y):
+        return self
+
+    @staticmethod
+    def predict_from_raw(tabular_raw_windows):
+        """
+        Args:
+            tabular_raw_windows: (n, seq_len, n_features) — RAW, unscaled tabular windows.
+        Returns:
+            (n,) — funding_rate at the last input timestep of each window, ×1000.
+        """
+        last_step_funding_rate = tabular_raw_windows[:, -1, FUNDING_RATE_COL_IDX]
+        return (last_step_funding_rate * 1000.0).astype(np.float32)
+
+
 class LinearRegressionModel:
     """sklearn LinearRegression on flattened 24-step tabular window (168 features)."""
     name = "LinearRegression"
@@ -246,6 +283,8 @@ def _fresh_model(template, seed=42):
     """Return a new instance of the same model class (mirrors per-fold weight reset)."""
     if isinstance(template, HistoricalMeanModel):
         return HistoricalMeanModel()
+    elif isinstance(template, PersistenceModel):
+        return PersistenceModel()
     elif isinstance(template, LinearRegressionModel):
         return LinearRegressionModel()
     else:
@@ -304,7 +343,10 @@ def get_valid_starts(data_slice, btc_len, eth_len, seq_len=SEQ_LEN, buffer=BUFFE
     """
     Mirrors WalkForwardDataset.__init__ valid_starts logic:
         - Never cross asset boundary (BTC / ETH are separate timelines)
-        - Leave buffer=8 steps at end to safely access t+7 target index
+        - Leave buffer=funding_horizon steps at end to safely access the
+          funding target index (t + seq_len + funding_horizon - 1).
+          Pass buffer=funding_horizon explicitly when funding_horizon != 8
+          (the diagnostic horizon-sensitivity check).
     """
     start = data_slice.start or 0
     stop  = data_slice.stop
@@ -339,41 +381,67 @@ def fit_scale_tabular(tabular_raw, btc_len, eth_len, train_slice):
     return scaled
 
 
-def build_Xy(tabular_scaled, targets_eng, valid_starts, target_idx, seq_len=SEQ_LEN):
+def build_Xy(tabular_scaled, targets_eng, valid_starts, target_idx, seq_len=SEQ_LEN, funding_horizon=BUFFER):
     """
     Build (X, y) arrays from valid start indices.
         X shape: (n, seq_len * N_TABULAR) — flattened 24-step window
         y shape: (n,)                      — raw engineered target
     Target horizons (mirror WalkForwardDataset.__getitem__):
-        y_baseline (idx=0): t + seq_len + 7  (8 hours ahead)
-        y_heuristic (idx=1): t + seq_len     (1 hour ahead)
-        y_vol_adj_return (idx=2): t + seq_len (1 hour ahead)
+        y_baseline (idx=0): t + seq_len + (funding_horizon - 1)  (funding_horizon hours ahead;
+                            default 8. 16/24 are diagnostic-only robustness checks — see
+                            thesis Section 4.x, "Funding-Rate Horizon Sensitivity".)
+        y_heuristic (idx=1): t + seq_len     (1 hour ahead, unaffected by funding_horizon)
+        y_vol_adj_return (idx=2): t + seq_len (1 hour ahead, unaffected by funding_horizon)
     """
+    funding_offset = funding_horizon - 1
     X, y = [], []
     for i in valid_starts:
         X.append(tabular_scaled[i: i + seq_len].flatten())
         if target_idx == 0:
-            y.append(targets_eng[i + seq_len + 7, 0])
+            y.append(targets_eng[i + seq_len + funding_offset, 0])
         elif target_idx == 1:
             y.append(targets_eng[i + seq_len, 1])
         else:
             y.append(targets_eng[i + seq_len, 2])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
+
+def build_raw_windows(tabular_raw, valid_starts, seq_len=SEQ_LEN):
+    """
+    (n, seq_len, n_features) RAW (unscaled) tabular windows — used only by
+    PersistenceModel, which needs the true funding_rate value, not its
+    per-fold StandardScaler-transformed z-score.
+    """
+    return np.stack([tabular_raw[i: i + seq_len] for i in valid_starts], axis=0)
+
 # =============================================================================
 # SECTION 4: MAIN RUNNER
 # =============================================================================
 
 def run_baselines(features_dir="./data/features", num_folds=5, seed=42,
-                  out_dir="./baseline_results"):
+                  out_dir="./baseline_results", funding_horizon=BUFFER):
     """
     Run all baseline models with the exact walk-forward protocol as MultimodalFusionNet.
+
+    Args:
+        funding_horizon: Prediction horizon in hours for y_baseline (funding). Default 8
+            = thesis's primary scope. 16/24 are diagnostic-only robustness checks (2/3
+            settlement cycles) — see thesis Section 4.x, "Funding-Rate Horizon
+            Sensitivity" — NOT a proposed change of scope. Does not affect
+            y_heuristic / y_vol_adj_return (fixed at t+1h).
 
     Returns:
         dict: { model_name: { target_name: { "fold_results": {...}, "test_metrics": {...} } } }
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    if funding_horizon != BUFFER:
+        logger.warning(
+            f"⚠ DIAGNOSTIC RUN: funding_horizon={funding_horizon}h (default={BUFFER}h). "
+            f"This is a robustness check on the funding target's autocorrelation decay, "
+            f"not a proposed operating horizon — the deployed system remains fixed at t+8h."
+        )
 
     # ── Load & engineer data ──────────────────────────────────────────────────
     tabular_raw, targets_raw, btc_len, eth_len = load_data(features_dir)
@@ -389,10 +457,10 @@ def run_baselines(features_dir="./data/features", num_folds=5, seed=42,
     logger.info(
         f"\nWalk-forward config: data_len={data_len} | window={window_size} | "
         f"step={step_size} | folds={num_folds} | "
-        f"test=[{test_start}:{btc_len}] per asset"
+        f"test=[{test_start}:{btc_len}] per asset | funding_horizon={funding_horizon}h"
     )
 
-    model_templates = [HistoricalMeanModel(), LinearRegressionModel(), XGBoostModel(seed=seed)]
+    model_templates = [HistoricalMeanModel(), PersistenceModel(), LinearRegressionModel(), XGBoostModel(seed=seed)]
     all_results = {}
     
     # Dictionary to store raw test predictions for significance testing
@@ -410,6 +478,13 @@ def run_baselines(features_dir="./data/features", num_folds=5, seed=42,
 
         # ── Target loop ───────────────────────────────────────────────────────
         for target_idx, target_name in enumerate(TARGET_NAMES):
+            if isinstance(template, PersistenceModel) and target_idx != 0:
+                logger.info(
+                    f"\n  TARGET {target_idx + 1}/3: {target_name} — skipping Persistence "
+                    f"(undefined: no raw input feature analogue; see thesis Section 4.1)"
+                )
+                continue
+
             logger.info(f"\n  TARGET {target_idx + 1}/3: {target_name}")
 
             fold_results    = {}
@@ -433,11 +508,11 @@ def run_baselines(features_dir="./data/features", num_folds=5, seed=42,
                 tab_scaled = fit_scale_tabular(tabular_raw, btc_len, eth_len, train_slice)
 
                 # Build arrays
-                train_starts = get_valid_starts(train_slice, btc_len, eth_len)
-                val_starts   = get_valid_starts(val_slice,   btc_len, eth_len)
+                train_starts = get_valid_starts(train_slice, btc_len, eth_len, buffer=funding_horizon)
+                val_starts   = get_valid_starts(val_slice,   btc_len, eth_len, buffer=funding_horizon)
 
-                X_train, y_train = build_Xy(tab_scaled, targets_eng, train_starts, target_idx)
-                X_val,   y_val   = build_Xy(tab_scaled, targets_eng, val_starts,   target_idx)
+                X_train, y_train = build_Xy(tab_scaled, targets_eng, train_starts, target_idx, funding_horizon=funding_horizon)
+                X_val,   y_val   = build_Xy(tab_scaled, targets_eng, val_starts,   target_idx, funding_horizon=funding_horizon)
 
                 if len(X_train) == 0 or len(X_val) == 0:
                     logger.warning(f"  Fold {fold_count}: empty split — skipping")
@@ -449,7 +524,12 @@ def run_baselines(features_dir="./data/features", num_folds=5, seed=42,
                 model = _fresh_model(template, seed=seed)
                 model.fit(X_train, y_train)
 
-                val_preds   = model.predict(X_val)
+                if isinstance(model, PersistenceModel):
+                    # Persistence needs the RAW funding_rate, not the z-scored X_val
+                    raw_val_windows = build_raw_windows(tabular_raw, val_starts)
+                    val_preds = PersistenceModel.predict_from_raw(raw_val_windows)
+                else:
+                    val_preds = model.predict(X_val)
                 val_metrics = compute_metrics(
                     val_preds, y_val,
                     target_name=target_name,
@@ -472,10 +552,14 @@ def run_baselines(features_dir="./data/features", num_folds=5, seed=42,
                 test_metrics = None
                 logger.warning(f"  No folds ran for {target_name}")
             else:
-                test_starts          = get_valid_starts(test_slice, btc_len, eth_len)
-                X_test, y_test       = build_Xy(last_tab_scaled, targets_eng, test_starts, target_idx)
-                test_preds           = last_model.predict(X_test)
-                
+                test_starts          = get_valid_starts(test_slice, btc_len, eth_len, buffer=funding_horizon)
+                X_test, y_test       = build_Xy(last_tab_scaled, targets_eng, test_starts, target_idx, funding_horizon=funding_horizon)
+                if isinstance(last_model, PersistenceModel):
+                    raw_test_windows = build_raw_windows(tabular_raw, test_starts)
+                    test_preds = PersistenceModel.predict_from_raw(raw_test_windows)
+                else:
+                    test_preds = last_model.predict(X_test)
+
                 # Cache predictions and targets for significance testing
                 test_preds_cache[target_name][model_name] = test_preds
                 if target_name not in test_targets_cache:
@@ -495,7 +579,7 @@ def run_baselines(features_dir="./data/features", num_folds=5, seed=42,
                 
                 # Automatic Significance Testing vs Historical Mean
                 if model_name != "HistoricalMean" and "HistoricalMean" in test_preds_cache[target_name]:
-                    h = 8 if target_name == "y_baseline" else 1
+                    h = funding_horizon if target_name == "y_baseline" else 1
                     y_pred_hist = test_preds_cache[target_name]["HistoricalMean"]
                     cw_stat, cw_pval = clark_west_test(y_test, y_pred_hist, test_preds, h=h)
                     logger.info(f"         Clark-West test vs HistoricalMean: stat={cw_stat:.4f}, p={cw_pval:.4f}")

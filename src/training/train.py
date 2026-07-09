@@ -842,6 +842,7 @@ def main(args):
     num_folds = getattr(args, 'num_folds', 5)
     tabular_filename = getattr(args, 'tabular_file', 'tabular_features.pt')
     ablation_mode = getattr(args, 'ablation', 'full')
+    funding_horizon = getattr(args, 'funding_horizon', 8)  # diagnostic-only; default = thesis's primary t+8h scope
     targets_filter = getattr(args, 'targets', None)  # e.g. ["y_baseline"] or None for all
     num_targets = getattr(args, 'num_targets', 1)    # 1 = single-target (default), 3 = multi-target joint loss
     learning_rate            = getattr(args, 'learning_rate', None)
@@ -1035,6 +1036,7 @@ def main(args):
             seq_len=config.data.seq_len,
             btc_len=_btc_len,
             eth_len=_eth_len,
+            funding_horizon=funding_horizon,
         )
 
         test_loader = torch.utils.data.DataLoader(
@@ -1123,7 +1125,7 @@ def main(args):
 
         walk_forward_generator = create_walk_forward_dataloaders(
             config, features_dir=features_dir, num_folds=num_folds, num_workers=0, pin_memory=True,
-            tabular_filename=tabular_filename, tabular_dir=tabular_dir,
+            tabular_filename=tabular_filename, tabular_dir=tabular_dir, funding_horizon=funding_horizon,
         )
 
         fold_results_mt = {}
@@ -1243,6 +1245,7 @@ def main(args):
             pin_memory=True,
             tabular_filename=tabular_filename,
             tabular_dir=tabular_dir,
+            funding_horizon=funding_horizon,
         )
 
         # Fresh model for this target (single-target mode: num_targets=1)
@@ -1756,6 +1759,13 @@ if __name__ == "__main__":
                         help="Ablation mode: full (all modalities), tabular_only, no_text, no_image, "
                              "text_only (fusion-free, text embedding -> LSTM -> head, no tabular), "
                              "image_only (fusion-free, image embedding -> LSTM -> head, no tabular)")
+    parser.add_argument("--funding-horizon", type=int, default=8, dest="funding_horizon",
+                        choices=[8, 16, 24],
+                        help="Prediction horizon in hours for the funding target (y_baseline). "
+                             "Default 8 = thesis's primary scope. 16/24 are diagnostic-only "
+                             "robustness checks (2/3 settlement cycles) to test whether apparent "
+                             "tractability decays with horizon; NOT a proposed change of scope. "
+                             "Does not affect y_heuristic / y_vol_adj_return (fixed at t+1h).")
     parser.add_argument("--targets", nargs="+", default=None,
                         choices=["y_baseline", "y_heuristic", "y_vol_adj_return"],
                         help="Which targets to train (default: all 3). Example: --targets y_baseline")

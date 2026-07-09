@@ -87,9 +87,16 @@ class WalkForwardDataset(torch.utils.data.Dataset):
     Sliding-window dataset over a concatenated BTC+ETH panel.
 
     Ensures that 24-hour windows never cross the BTC/ETH boundary.
-    y_baseline (col 0) is fetched at index + seq_len + 7, making the effective
-    prediction horizon 8 hours ahead of the last input step.
-    y_heuristic (col 1) and y_vol_adj_return (col 2) are fetched at index + seq_len (t+1h).
+    y_baseline (col 0) is fetched at index + seq_len + (funding_horizon - 1), making the
+    effective prediction horizon `funding_horizon` hours ahead of the last input step
+    (default funding_horizon=8, matching the thesis's primary t+8h target).
+    y_heuristic (col 1) and y_vol_adj_return (col 2) are fetched at index + seq_len (t+1h),
+    unaffected by funding_horizon.
+
+    funding_horizon is exposed purely as a diagnostic robustness knob (Section 4.x,
+    "Funding-Rate Horizon Sensitivity") to test whether the funding target's apparent
+    tractability decays as the forecast horizon spans additional 8-hour settlement
+    cycles. It is NOT a proposed change to the thesis's primary t+8h scope.
     """
     def __init__(
         self,
@@ -103,8 +110,13 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         total_samples_per_asset: int = 44500,
         btc_len: int = None,
         eth_len: int = None,
+        funding_horizon: int = 8,
     ):
         self.seq_len = seq_len
+        if funding_horizon < 1:
+            raise ValueError(f"funding_horizon must be >= 1, got {funding_horizon}")
+        self.funding_horizon = funding_horizon
+        self.funding_offset = funding_horizon - 1  # index offset added to (real_idx + seq_len)
         # Fallback to total_samples_per_asset if dynamic lengths are not provided
         self.btc_len = btc_len if btc_len is not None else total_samples_per_asset
         self.eth_len = eth_len if eth_len is not None else total_samples_per_asset
@@ -121,12 +133,12 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         start = data_slice.start if data_slice.start is not None else 0
         stop = data_slice.stop if data_slice.stop is not None else self.btc_len
         
-        # Buffer to prevent index overflow on the 8h-ahead target.
-        # __getitem__ accesses target_full[real_idx + seq_len + 7], so we need:
-        #   real_idx + seq_len + 7  <=  N - 1   →   real_idx  <=  N - seq_len - 8
+        # Buffer to prevent index overflow on the funding_horizon-ahead target.
+        # __getitem__ accesses target_full[real_idx + seq_len + funding_offset], so we need:
+        #   real_idx + seq_len + funding_offset  <=  N - 1   →   real_idx  <=  N - seq_len - funding_horizon
         # With range(..., N - seq_len - buffer + 1) the last value is N - seq_len - buffer,
-        # so buffer must equal 8 (not 7) for the last target index to be N - 1.
-        buffer = 8
+        # so buffer must equal funding_horizon (not funding_offset) for the last target index to be N - 1.
+        buffer = self.funding_horizon
         
         # Valid starts for BTC (within the slice)
         btc_valid_starts = list(range(start, min(stop - seq_len - buffer + 1, self.btc_len - seq_len - buffer + 1)))
@@ -141,7 +153,7 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         self.valid_starts = btc_valid_starts + eth_valid_starts
         
         logger.info(
-            f"  Created 8h-shifted WalkForwardDataset slice [{start}:{stop}] -> "
+            f"  Created {self.funding_horizon}h-shifted WalkForwardDataset slice [{start}:{stop}] -> "
             f"BTC starts: {len(btc_valid_starts)}, ETH starts: {len(eth_valid_starts)} (Total: {len(self.valid_starts)})"
         )
 
@@ -158,8 +170,9 @@ class WalkForwardDataset(torch.utils.data.Dataset):
         asset_id = 0 if real_idx < self.total_samples_per_asset else 1
         
         # Target splitting:
-        # Col 0 (y_baseline) is target_raw_funding, predict at t+8 (real_idx + seq_len + 7)
-        target_baseline = self.target_full[real_idx + self.seq_len + 7, 0]
+        # Col 0 (y_baseline) is target_raw_funding, predict at t+funding_horizon
+        # (real_idx + seq_len + funding_offset); funding_offset = funding_horizon - 1.
+        target_baseline = self.target_full[real_idx + self.seq_len + self.funding_offset, 0]
         
         # Col 1 (y_heuristic) and Col 2 (y_vol_adj_return) remain at t+1 (real_idx + seq_len)
         target_heuristic = self.target_full[real_idx + self.seq_len, 1]
@@ -186,6 +199,7 @@ def create_walk_forward_dataloaders(
     pin_memory: bool = True,
     tabular_filename: str = "tabular_features.pt",
     tabular_dir: str = None,
+    funding_horizon: int = 8,
 ):
     """
     Load pre-extracted feature tensors and yield walk-forward validation folds.
@@ -205,6 +219,10 @@ def create_walk_forward_dataloaders(
                           "tabular_features.pt" (7 features, default) or
                           "tabular_features_no_funding.pt" (6 features).
         tabular_dir: Override directory for tabular files (defaults to features_dir).
+        funding_horizon: Prediction horizon in hours for the funding target (y_baseline,
+                         col 0), default 8 (the thesis's primary target). Diagnostic-only
+                         override for the horizon-sensitivity robustness check (e.g. 16, 24);
+                         does not affect y_heuristic / y_vol_adj_return, which remain t+1h.
 
     Yields:
         (fold_num, train_loader, val_loader, scalers_dict)
@@ -366,8 +384,9 @@ def create_walk_forward_dataloaders(
             seq_len=config.data.seq_len,
             btc_len=btc_len,
             eth_len=eth_len,
+            funding_horizon=funding_horizon,
         )
-        
+
         val_dataset = WalkForwardDataset(
             text_embeddings=text_embeddings,
             image_embeddings=image_embeddings,
@@ -378,6 +397,7 @@ def create_walk_forward_dataloaders(
             seq_len=config.data.seq_len,
             btc_len=btc_len,
             eth_len=eth_len,
+            funding_horizon=funding_horizon,
         )
         
         logger.info(f"  ✓ Val dataset: {len(val_dataset)} sequences")
