@@ -1723,11 +1723,17 @@ def main(args):
         )
         if tm and "predictions" in tm:
             mfn_preds_dict[f"{tname}_MFN"] = tm["predictions"].numpy() if hasattr(tm["predictions"], "numpy") else tm["predictions"]
-            
-    # Save to npz
+            # Also save ground-truth targets so Persistence-relative R²_OOS (and any other
+            # benchmark) can be recomputed post-hoc without needing to re-run training —
+            # train.py itself only computes R²_OOS vs Historical Mean / Zero-predictor here.
+            if tm and "targets" in tm:
+                mfn_preds_dict[f"{tname}_y_true"] = tm["targets"].numpy() if hasattr(tm["targets"], "numpy") else tm["targets"]
+
+    # Save to npz. funding_horizon is included in the filename so that runs at different
+    # horizons (the diagnostic robustness check) do not silently overwrite each other.
     out_dir = config.mlops.checkpoint_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    mfn_preds_file = out_dir / f"mfn_test_predictions_{args.ablation}.npz"
+    mfn_preds_file = out_dir / f"mfn_test_predictions_{args.ablation}_h{funding_horizon}.npz"
     if mfn_preds_dict:
         np.savez(mfn_preds_file, **mfn_preds_dict)
         logger.info(f"✓ MFN Test predictions saved → {mfn_preds_file} (Use this for DM tests vs baselines)")
