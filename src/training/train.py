@@ -34,7 +34,7 @@ except ImportError:
 
 from .config import ExperimentConfig, create_config
 from .dataset import multimodal_collate_fn, create_walk_forward_dataloaders
-from .model import MultimodalFusionNet
+from .model import MultimodalFusionNet, SingleModalityRegressor
 from .utils import setup_logging, format_duration
 
 
@@ -1092,6 +1092,13 @@ def main(args):
     # One shared model with N independent prediction heads, trained with mean Huber loss
     # across all heads simultaneously. Used to produce the multi-target baseline for RQ3.
     if num_targets > 1:
+        if ablation_mode in ("text_only", "image_only"):
+            raise ValueError(
+                f"ablation={ablation_mode!r} is fusion-free (SingleModalityRegressor) and is not "
+                f"compatible with multi-target mode, which requires a shared fused backbone. "
+                f"Use --num-targets 1 with --ablation {ablation_mode}."
+            )
+
         # Ensure num_targets does not exceed available targets
         num_targets = min(num_targets, len(TARGET_NAMES))
 
@@ -1239,8 +1246,13 @@ def main(args):
         )
 
         # Fresh model for this target (single-target mode: num_targets=1)
-        model = MultimodalFusionNet(config, ablation_mode=ablation_mode, num_targets=1)
-        logger.info(f"  Fresh model initialised for {target_name}")
+        if ablation_mode in ("text_only", "image_only"):
+            modality = ablation_mode.replace("_only", "")
+            model = SingleModalityRegressor(config, modality=modality)
+            logger.info(f"  Fresh fusion-free SingleModalityRegressor ({modality}) initialised for {target_name}")
+        else:
+            model = MultimodalFusionNet(config, ablation_mode=ablation_mode, num_targets=1)
+            logger.info(f"  Fresh model initialised for {target_name}")
 
         # W&B run per target
         if config.mlops.use_wandb and wandb is not None:
@@ -1740,8 +1752,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-folds", type=int, default=5,
                         help="Number of walk-forward folds (default: 5)")
     parser.add_argument("--ablation", type=str, default="full",
-                        choices=["full", "tabular_only", "no_text", "no_image"],
-                        help="Ablation mode: full (all modalities), tabular_only, no_text, no_image")
+                        choices=["full", "tabular_only", "no_text", "no_image", "text_only", "image_only"],
+                        help="Ablation mode: full (all modalities), tabular_only, no_text, no_image, "
+                             "text_only (fusion-free, text embedding -> LSTM -> head, no tabular), "
+                             "image_only (fusion-free, image embedding -> LSTM -> head, no tabular)")
     parser.add_argument("--targets", nargs="+", default=None,
                         choices=["y_baseline", "y_heuristic", "y_vol_adj_return"],
                         help="Which targets to train (default: all 3). Example: --targets y_baseline")

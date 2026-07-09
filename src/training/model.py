@@ -393,6 +393,72 @@ class MultimodalFusionNet(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
 
+class SingleModalityRegressor(nn.Module):
+    """
+    Standalone single-modality regressor — bypasses cross-modal fusion entirely.
+
+    Answers a different question than the no_text/no_image ablations of
+    MultimodalFusionNet: those remove one modality while keeping the tabular
+    anchor and the fusion mechanism (attention over mostly-zeroed tokens).
+    This class instead asks "how much can text (or image) alone predict, with
+    no tabular input and no fusion mechanism at all?" — a plain single-input
+    temporal regression.
+
+    Uses the same bottleneck -> LSTM -> PredictionHead stack (same dimensions)
+    as MultimodalFusionNet, so results are directly comparable across variants:
+    only the input modality and the absence of fusion differ.
+
+    Input:  batch["text_embedding"] or batch["image_embedding"], (batch, seq_len, hidden_dim)
+    Output: (batch,)
+    """
+
+    def __init__(self, config, modality: str):
+        super().__init__()
+        if modality not in ("text", "image"):
+            raise ValueError(f"modality must be 'text' or 'image', got {modality!r}")
+        self.modality = modality
+        self.batch_key = f"{modality}_embedding"
+
+        logger.info(f"Initializing SingleModalityRegressor (modality={modality}, no fusion, no tabular)...")
+
+        # Bottleneck: project the raw 256D embedding down to the same dimension
+        # used downstream of fusion in MultimodalFusionNet, for capacity parity.
+        self.bottleneck = nn.Linear(config.model.hidden_dim, config.model.bottleneck_dim)
+        nn.init.xavier_uniform_(self.bottleneck.weight)
+
+        self.temporal_lstm = TemporalLSTMLayer(
+            input_dim=config.model.bottleneck_dim,
+            num_layers=config.model.lstm_layers,
+            dropout=config.model.lstm_dropout,
+        )
+
+        self.prediction_head = PredictionHead(
+            input_dim=config.model.bottleneck_dim,
+            dropout=config.model.head_dropout,
+        )
+
+        logger.info("✓ SingleModalityRegressor initialized")
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            batch: Dict containing at least batch[self.batch_key], shape (batch, seq_len, hidden_dim)
+        Returns:
+            (batch,)
+        """
+        features = batch[self.batch_key]  # (batch, seq_len, hidden_dim) — pre-extracted, offline
+
+        bottleneck_features = self.bottleneck(features)      # (batch, seq_len, bottleneck_dim)
+        temporal_output = self.temporal_lstm(bottleneck_features)  # (batch, bottleneck_dim)
+        predictions = self.prediction_head(temporal_output).view(-1)  # (batch,)
+
+        return predictions
+
+    def get_trainable_params(self):
+        """Return iterator of trainable parameters."""
+        return [p for p in self.parameters() if p.requires_grad]
+
+
 if __name__ == "__main__":
     """Test model initialization and forward pass."""
     import sys
