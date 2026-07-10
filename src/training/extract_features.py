@@ -94,33 +94,59 @@ class FrozenTextEncoder(nn.Module):
         return self.dropout(projected)
 
 
+IMAGE_BACKBONE_CHECKPOINTS = {
+    "vit": "google/vit-base-patch16-224",
+    "clip": "openai/clip-vit-base-patch16",
+}
+
+
 class FrozenImageEncoder(nn.Module):
     """
-    Frozen ViT (google/vit-base-patch16-224) encoder with a trainable 768→256 projection head.
+    Frozen image encoder with a trainable 768→256 projection head.
+
+    backbone="vit"  (default): google/vit-base-patch16-224, ImageNet-pretrained, CLS token
+                     taken from last_hidden_state (position 0).
+    backbone="clip": openai/clip-vit-base-patch16 vision tower only (no text tower), using
+                     CLIP's own pooler_output as the pooled embedding. Both backbones share
+                     the same 768-dim output width, so the projection head is unchanged;
+                     this is a diagnostic swap to test whether CLIP's image-text contrastive
+                     pretraining transfers better to candlestick charts than ImageNet
+                     classification pretraining (thesis Section 5.3, "Future Work").
 
     Input:  (batch, 3, 224, 224) normalised RGB images
-    Output: (batch, 256) projected [CLS] embeddings
+    Output: (batch, 256) projected pooled embeddings
     """
-    
-    def __init__(self, hidden_dim: int = 256):
+
+    def __init__(self, hidden_dim: int = 256, backbone: str = "vit"):
         super().__init__()
         self.hidden_dim = hidden_dim
-        
-        logger.info("Loading Vision Transformer (ViT)...")
-        vit = AutoModel.from_pretrained("google/vit-base-patch16-224")
-        
+        if backbone not in IMAGE_BACKBONE_CHECKPOINTS:
+            raise ValueError(
+                f"Unknown image backbone {backbone!r}; choices: {list(IMAGE_BACKBONE_CHECKPOINTS)}"
+            )
+        self.backbone_name = backbone
+        checkpoint = IMAGE_BACKBONE_CHECKPOINTS[backbone]
+
+        if backbone == "clip":
+            from transformers import CLIPVisionModel
+            logger.info(f"Loading CLIP vision tower ({checkpoint})...")
+            vision_model = CLIPVisionModel.from_pretrained(checkpoint)
+        else:
+            logger.info(f"Loading Vision Transformer ({checkpoint})...")
+            vision_model = AutoModel.from_pretrained(checkpoint)
+
         # Freeze backbone
-        for param in vit.parameters():
+        for param in vision_model.parameters():
             param.requires_grad = False
-        
-        self.backbone = vit
-        
-        # Project ViT output (768D) to hidden_dim (256D)
-        vit_hidden_size = 768  # google/vit-base-patch16-224 output dimension
+
+        self.backbone = vision_model
+
+        # Both checkpoints output a 768-dim pooled embedding
+        vit_hidden_size = 768
         self.projection = nn.Linear(vit_hidden_size, hidden_dim)
         nn.init.xavier_uniform_(self.projection.weight)
         self.dropout = nn.Dropout(0.2)
-    
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -130,9 +156,11 @@ class FrozenImageEncoder(nn.Module):
         """
         with torch.no_grad():
             outputs = self.backbone(images, return_dict=True)
-            # ViT returns [CLS] token at position 0
-            features = outputs.last_hidden_state[:, 0, :]  # (batch, 768)
-        
+            if self.backbone_name == "clip":
+                features = outputs.pooler_output  # (batch, 768), CLIP's own pooled output
+            else:
+                features = outputs.last_hidden_state[:, 0, :]  # (batch, 768), ViT [CLS]
+
         projected = self.projection(features)  # (batch, hidden_dim)
         return self.dropout(projected)
 
@@ -331,7 +359,13 @@ def main(args):
 
     # Initialize encoders
     text_encoder = FrozenTextEncoder(hidden_dim=256)
-    image_encoder = FrozenImageEncoder(hidden_dim=256)
+    image_encoder = FrozenImageEncoder(hidden_dim=256, backbone=args.image_backbone)
+    # Diagnostic-only backbone swap (thesis Section 5.3): "vit" (default) writes
+    # image_embeddings.pt as before; "clip" writes a separate file so it does not
+    # overwrite the primary ViT embeddings used for the thesis's main results.
+    image_output_filename = (
+        "image_embeddings.pt" if args.image_backbone == "vit" else f"image_embeddings_{args.image_backbone}.pt"
+    )
 
     base_output_dir = Path(args.output_dir)
 
@@ -377,7 +411,7 @@ def main(args):
             print(f"[PROGRESS] ({asset}) Text extraction complete ({format_duration(elapsed)})")
 
         # Image embeddings
-        image_output_path = asset_output_dir / "image_embeddings.pt"
+        image_output_path = asset_output_dir / image_output_filename
         if image_output_path.exists() and not args.force:
             logger.info(f"✓ Image embeddings already exist for {asset}: {image_output_path}")
             print(f"[PROGRESS] ({asset}) Skipping image extraction (file exists)")
@@ -438,7 +472,7 @@ def main(args):
 
         # Verify files for this asset
         text_path = asset_output_dir / "text_embeddings.pt"
-        image_path = asset_output_dir / "image_embeddings.pt"
+        image_path = asset_output_dir / image_output_filename
         tabular_path = asset_output_dir / "tabular_features_extended.pt"
         target_path = asset_output_dir / "target_scores.pt"
 
@@ -757,6 +791,16 @@ if __name__ == "__main__":
         "--debug",
         action="store_true",
         help="Debug mode (extract only 100 samples per split)",
+    )
+    parser.add_argument(
+        "--image-backbone",
+        choices=["vit", "clip"],
+        default="vit",
+        help="Frozen image encoder backbone. 'vit' (default, google/vit-base-patch16-224, "
+             "ImageNet-pretrained) is the thesis's primary configuration, saved as "
+             "image_embeddings.pt. 'clip' (openai/clip-vit-base-patch16 vision tower) is a "
+             "diagnostic-only alternative, saved separately as image_embeddings_clip.pt so it "
+             "does not overwrite the primary ViT embeddings.",
     )
     parser.add_argument(
         "--push-to-hf",

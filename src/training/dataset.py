@@ -200,6 +200,7 @@ def create_walk_forward_dataloaders(
     tabular_filename: str = "tabular_features.pt",
     tabular_dir: str = None,
     funding_horizon: int = 8,
+    image_filename: str = "image_embeddings.pt",
 ):
     """
     Load pre-extracted feature tensors and yield walk-forward validation folds.
@@ -223,6 +224,9 @@ def create_walk_forward_dataloaders(
                          col 0), default 8 (the thesis's primary target). Diagnostic-only
                          override for the horizon-sensitivity robustness check (e.g. 16, 24);
                          does not affect y_heuristic / y_vol_adj_return, which remain t+1h.
+        image_filename: Image embedding tensor filename inside each asset subdir.
+                        "image_embeddings.pt" (ViT, default) or "image_embeddings_clip.pt"
+                        (diagnostic-only CLIP backbone swap, see extract_features.py).
 
     Yields:
         (fold_num, train_loader, val_loader, scalers_dict)
@@ -246,13 +250,13 @@ def create_walk_forward_dataloaders(
         
         # Load BTC
         btc_text = torch.load(btc_subdir / "text_embeddings.pt", map_location="cpu")
-        btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
+        btc_image = torch.load(btc_subdir / image_filename, map_location="cpu")
         btc_tab = torch.load(tabular_dir / "BTC" / tabular_filename, map_location="cpu")
         btc_tgt = torch.load(btc_subdir / "target_scores.pt", map_location="cpu")
 
         # Load ETH
         eth_text = torch.load(eth_subdir / "text_embeddings.pt", map_location="cpu")
-        eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
+        eth_image = torch.load(eth_subdir / image_filename, map_location="cpu")
         eth_tab = torch.load(tabular_dir / "ETH" / tabular_filename, map_location="cpu")
         eth_tgt = torch.load(eth_subdir / "target_scores.pt", map_location="cpu")
         
@@ -287,7 +291,7 @@ def create_walk_forward_dataloaders(
         sys.stdout.flush()
         
         text_embeddings = torch.load(features_dir / "text_embeddings.pt", map_location="cpu")
-        image_embeddings = torch.load(features_dir / "image_embeddings.pt", map_location="cpu")
+        image_embeddings = torch.load(features_dir / image_filename, map_location="cpu")
         tabular_data = torch.load(features_dir / tabular_filename, map_location="cpu")
         target_scores = torch.load(features_dir / "target_scores.pt", map_location="cpu")
         

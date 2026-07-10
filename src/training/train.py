@@ -841,6 +841,7 @@ def main(args):
     debug = getattr(args, 'debug', False)
     num_folds = getattr(args, 'num_folds', 5)
     tabular_filename = getattr(args, 'tabular_file', 'tabular_features.pt')
+    image_filename = getattr(args, 'image_file', 'image_embeddings.pt')  # diagnostic-only: 'image_embeddings_clip.pt' for the CLIP backbone swap
     ablation_mode = getattr(args, 'ablation', 'full')
     funding_horizon = getattr(args, 'funding_horizon', 8)  # diagnostic-only; default = thesis's primary t+8h scope
     targets_filter = getattr(args, 'targets', None)  # e.g. ["y_baseline"] or None for all
@@ -958,12 +959,12 @@ def main(args):
         if btc_subdir.exists() and eth_subdir.exists():
             # ---- load per-asset tensors and concatenate ----
             _btc_text  = torch.load(btc_subdir / "text_embeddings.pt",  map_location="cpu")
-            _btc_image = torch.load(btc_subdir / "image_embeddings.pt", map_location="cpu")
+            _btc_image = torch.load(btc_subdir / image_filename, map_location="cpu")
             _btc_tab   = torch.load(_tabular_dir / "BTC" / tabular_filename, map_location="cpu")
             _btc_tgt   = torch.load(btc_subdir / "target_scores.pt",    map_location="cpu")
 
             _eth_text  = torch.load(eth_subdir / "text_embeddings.pt",  map_location="cpu")
-            _eth_image = torch.load(eth_subdir / "image_embeddings.pt", map_location="cpu")
+            _eth_image = torch.load(eth_subdir / image_filename, map_location="cpu")
             _eth_tab   = torch.load(_tabular_dir / "ETH" / tabular_filename, map_location="cpu")
             _eth_tgt   = torch.load(eth_subdir / "target_scores.pt",    map_location="cpu")
 
@@ -977,7 +978,7 @@ def main(args):
         else:
             # Fallback: single consolidated files + split_metadata.json
             _test_text  = torch.load(_features_dir / "text_embeddings.pt",  map_location="cpu")
-            _test_image = torch.load(_features_dir / "image_embeddings.pt", map_location="cpu")
+            _test_image = torch.load(_features_dir / image_filename, map_location="cpu")
             _test_tab   = torch.load(_tabular_dir  / tabular_filename,        map_location="cpu")
             _test_tgt   = torch.load(_features_dir / "target_scores.pt",    map_location="cpu")
             _total = _test_text.shape[0]
@@ -1126,6 +1127,7 @@ def main(args):
         walk_forward_generator = create_walk_forward_dataloaders(
             config, features_dir=features_dir, num_folds=num_folds, num_workers=0, pin_memory=True,
             tabular_filename=tabular_filename, tabular_dir=tabular_dir, funding_horizon=funding_horizon,
+            image_filename=image_filename,
         )
 
         fold_results_mt = {}
@@ -1246,6 +1248,7 @@ def main(args):
             tabular_filename=tabular_filename,
             tabular_dir=tabular_dir,
             funding_horizon=funding_horizon,
+            image_filename=image_filename,
         )
 
         # Fresh model for this target (single-target mode: num_targets=1)
@@ -1803,6 +1806,13 @@ if __name__ == "__main__":
                             "Filename of the tabular features tensor inside each asset subdir. "
                             "Use 'tabular_features.pt' (default, 7 base features) "
                             "or 'tabular_features_no_funding.pt' (6 features, funding_rate removed)."
+                        ))
+    parser.add_argument("--image-file", type=str, default="image_embeddings.pt", dest="image_file",
+                        help=(
+                            "Filename of the image embedding tensor inside each asset subdir. "
+                            "Use 'image_embeddings.pt' (default, ViT backbone) or "
+                            "'image_embeddings_clip.pt' (diagnostic-only CLIP backbone swap, "
+                            "see extract_features.py --image-backbone)."
                         ))
     parser.add_argument("--tabular-dir", type=str, default=None, dest="tabular_dir",
                         help=(
