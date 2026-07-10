@@ -673,6 +673,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-folds",    type=int, default=5)
     parser.add_argument("--seed",         type=int, default=42)
     parser.add_argument("--out-dir",      default="./baseline_results")
+    parser.add_argument("--funding-horizon", type=int, default=BUFFER, choices=[8, 16, 24])
     # parse_known_args ignores unknown args (e.g. Jupyter/Colab kernel flags)
     args, _ = parser.parse_known_args()
 
@@ -681,5 +682,6 @@ if __name__ == "__main__":
         num_folds=args.num_folds,
         seed=args.seed,
         out_dir=args.out_dir,
+        funding_horizon=args.funding_horizon,
     )
     print_cv_summary(results)
