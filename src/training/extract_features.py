@@ -357,15 +357,19 @@ def main(args):
     else:
         assets_to_process = [args.asset]
 
-    # Initialize encoders
+    # Initialize encoders. Text encoder is created once regardless of how many image
+    # backbones are requested. One image encoder is created per requested backbone so
+    # the dataset (and text embeddings) only need to be loaded/extracted ONCE per asset,
+    # even when extracting embeddings for multiple image backbones in the same run.
     text_encoder = FrozenTextEncoder(hidden_dim=256)
-    image_encoder = FrozenImageEncoder(hidden_dim=256, backbone=args.image_backbone)
+    image_backbones = args.image_backbones
+    image_encoders = {b: FrozenImageEncoder(hidden_dim=256, backbone=b) for b in image_backbones}
     # Diagnostic-only backbone swap (thesis Section 5.3): "vit" (default) writes
-    # image_embeddings.pt as before; "clip" writes a separate file so it does not
-    # overwrite the primary ViT embeddings used for the thesis's main results.
-    image_output_filename = (
-        "image_embeddings.pt" if args.image_backbone == "vit" else f"image_embeddings_{args.image_backbone}.pt"
-    )
+    # image_embeddings.pt as before; any other backbone writes a separate file so it
+    # does not overwrite the primary ViT embeddings used for the thesis's main results.
+    image_output_filenames = {
+        b: ("image_embeddings.pt" if b == "vit" else f"image_embeddings_{b}.pt") for b in image_backbones
+    }
 
     base_output_dir = Path(args.output_dir)
 
@@ -410,23 +414,24 @@ def main(args):
             logger.info(f"{asset} text extraction took {format_duration(elapsed)}")
             print(f"[PROGRESS] ({asset}) Text extraction complete ({format_duration(elapsed)})")
 
-        # Image embeddings
-        image_output_path = asset_output_dir / image_output_filename
-        if image_output_path.exists() and not args.force:
-            logger.info(f"✓ Image embeddings already exist for {asset}: {image_output_path}")
-            print(f"[PROGRESS] ({asset}) Skipping image extraction (file exists)")
-        else:
+        # Image embeddings — one pass per requested backbone, reusing the same full_dataset
+        for backbone in image_backbones:
+            image_output_path = asset_output_dir / image_output_filenames[backbone]
+            if image_output_path.exists() and not args.force:
+                logger.info(f"✓ Image embeddings ({backbone}) already exist for {asset}: {image_output_path}")
+                print(f"[PROGRESS] ({asset}) Skipping image extraction ({backbone}, file exists)")
+                continue
             start_time = time.time()
             extract_image_embeddings(
                 full_dataset,
-                image_encoder,
+                image_encoders[backbone],
                 image_output_path,
                 batch_size=32,
                 device=device,
             )
             elapsed = time.time() - start_time
-            logger.info(f"{asset} image extraction took {format_duration(elapsed)}")
-            print(f"[PROGRESS] ({asset}) Image extraction complete ({format_duration(elapsed)})")
+            logger.info(f"{asset} image extraction ({backbone}) took {format_duration(elapsed)}")
+            print(f"[PROGRESS] ({asset}) Image extraction ({backbone}) complete ({format_duration(elapsed)})")
 
         # Tabular features (raw, no scaling)
         # Saves two files:
@@ -472,22 +477,23 @@ def main(args):
 
         # Verify files for this asset
         text_path = asset_output_dir / "text_embeddings.pt"
-        image_path = asset_output_dir / image_output_filename
+        image_paths = {b: asset_output_dir / image_output_filenames[b] for b in image_backbones}
         tabular_path = asset_output_dir / "tabular_features_extended.pt"
         target_path = asset_output_dir / "target_scores.pt"
 
-        if (text_path.exists() and image_path.exists() and 
+        if (text_path.exists() and all(p.exists() for p in image_paths.values()) and
             tabular_path.exists() and target_path.exists()):
             text_shape = torch.load(text_path, map_location="cpu").shape
-            image_shape = torch.load(image_path, map_location="cpu").shape
+            image_shapes = {b: torch.load(p, map_location="cpu").shape for b, p in image_paths.items()}
             tabular_shape = torch.load(tabular_path, map_location="cpu").shape
             target_shape = torch.load(target_path, map_location="cpu").shape
             logger.info(f"✓ {asset} Verification:")
             logger.info(f"  text_embeddings: {text_shape}")
-            logger.info(f"  image_embeddings: {image_shape}")
+            for b, shape in image_shapes.items():
+                logger.info(f"  image_embeddings ({b}): {shape}")
             logger.info(f"  tabular_features: {tabular_shape}")
             logger.info(f"  target_scores: {target_shape}")
-            print(f"[PROGRESS] ✓ {asset} features ready: text {text_shape}, image {image_shape}, tabular {tabular_shape}, target {target_shape}")
+            print(f"[PROGRESS] ✓ {asset} features ready: text {text_shape}, image {image_shapes}, tabular {tabular_shape}, target {target_shape}")
         else:
             logger.warning(f"✗ {asset} features missing files!")
             print(f"[PROGRESS] ✗ {asset} features missing files!")
@@ -793,14 +799,18 @@ if __name__ == "__main__":
         help="Debug mode (extract only 100 samples per split)",
     )
     parser.add_argument(
-        "--image-backbone",
+        "--image-backbones",
+        nargs="+",
         choices=["vit", "clip"],
-        default="vit",
-        help="Frozen image encoder backbone. 'vit' (default, google/vit-base-patch16-224, "
-             "ImageNet-pretrained) is the thesis's primary configuration, saved as "
-             "image_embeddings.pt. 'clip' (openai/clip-vit-base-patch16 vision tower) is a "
-             "diagnostic-only alternative, saved separately as image_embeddings_clip.pt so it "
-             "does not overwrite the primary ViT embeddings.",
+        default=["vit"],
+        dest="image_backbones",
+        help="Frozen image encoder backbone(s) to extract, e.g. '--image-backbones vit clip' "
+             "extracts both in a single run (dataset/text embeddings are only loaded/extracted "
+             "once, regardless of how many backbones are listed). 'vit' (default, "
+             "google/vit-base-patch16-224, ImageNet-pretrained) is the thesis's primary "
+             "configuration, saved as image_embeddings.pt. 'clip' (openai/clip-vit-base-patch16 "
+             "vision tower) is a diagnostic-only alternative, saved separately as "
+             "image_embeddings_clip.pt so it does not overwrite the primary ViT embeddings.",
     )
     parser.add_argument(
         "--push-to-hf",
