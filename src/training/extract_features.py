@@ -97,23 +97,34 @@ class FrozenTextEncoder(nn.Module):
 IMAGE_BACKBONE_CHECKPOINTS = {
     "vit": "google/vit-base-patch16-224",
     "clip": "openai/clip-vit-base-patch16",
+    "pix2struct": "google/pix2struct-base",
 }
+# Pix2Struct uses a fundamentally different, variable-aspect-ratio patchify scheme
+# (flattened_patches + attention_mask via Pix2StructImageProcessor) instead of a fixed
+# 224x224 resize, so it needs its own preprocessing path in extract_image_embeddings().
+PIX2STRUCT_MAX_PATCHES = 256  # default is 2048 (full-page documents); 256 is ample for a single 224x224 chart
 
 
 class FrozenImageEncoder(nn.Module):
     """
     Frozen image encoder with a trainable 768→256 projection head.
 
-    backbone="vit"  (default): google/vit-base-patch16-224, ImageNet-pretrained, CLS token
-                     taken from last_hidden_state (position 0).
-    backbone="clip": openai/clip-vit-base-patch16 vision tower only (no text tower), using
-                     CLIP's own pooler_output as the pooled embedding. Both backbones share
-                     the same 768-dim output width, so the projection head is unchanged;
-                     this is a diagnostic swap to test whether CLIP's image-text contrastive
-                     pretraining transfers better to candlestick charts than ImageNet
-                     classification pretraining (thesis Section 5.3, "Future Work").
+    backbone="vit"        (default): google/vit-base-patch16-224, ImageNet-pretrained, CLS
+                           token taken from last_hidden_state (position 0).
+    backbone="clip":       openai/clip-vit-base-patch16 vision tower only (no text tower),
+                           using CLIP's own pooler_output as the pooled embedding.
+    backbone="pix2struct": google/pix2struct-base vision encoder, using its own
+                           pooler_output. Pix2Struct is pretrained on visually-situated
+                           language understanding (screenshots/documents/charts), a
+                           domain arguably closer to candlestick charts than ImageNet
+                           photographs or CLIP's web image-text pairs.
+    All three backbones share the same 768-dim output width, so the projection head is
+    unchanged; this is a diagnostic swap to test whether an alternative pretraining
+    domain transfers better to candlestick charts than ImageNet classification
+    pretraining (thesis Section 5.3, "Future Work").
 
-    Input:  (batch, 3, 224, 224) normalised RGB images
+    Input:  (batch, 3, 224, 224) normalised RGB images (vit/clip), or a dict of
+            {flattened_patches, attention_mask} (pix2struct) — see extract_image_embeddings().
     Output: (batch, 256) projected pooled embeddings
     """
 
@@ -131,6 +142,15 @@ class FrozenImageEncoder(nn.Module):
             from transformers import CLIPVisionModel
             logger.info(f"Loading CLIP vision tower ({checkpoint})...")
             vision_model = CLIPVisionModel.from_pretrained(checkpoint)
+        elif backbone == "pix2struct":
+            from transformers import Pix2StructForConditionalGeneration
+            logger.info(f"Loading Pix2Struct vision encoder ({checkpoint})...")
+            # Loading Pix2StructVisionModel directly from this checkpoint mis-maps the
+            # weight keys (checkpoint is saved as the full encoder-decoder model, with the
+            # vision encoder nested one level deeper) and silently falls back to random
+            # init. Loading the full conditional-generation model and taking .encoder
+            # loads the pretrained ViT-style weights correctly.
+            vision_model = Pix2StructForConditionalGeneration.from_pretrained(checkpoint).encoder
         else:
             logger.info(f"Loading Vision Transformer ({checkpoint})...")
             vision_model = AutoModel.from_pretrained(checkpoint)
@@ -141,25 +161,39 @@ class FrozenImageEncoder(nn.Module):
 
         self.backbone = vision_model
 
-        # Both checkpoints output a 768-dim pooled embedding
+        # All checkpoints output a 768-dim pooled embedding
         vit_hidden_size = 768
         self.projection = nn.Linear(vit_hidden_size, hidden_dim)
         nn.init.xavier_uniform_(self.projection.weight)
         self.dropout = nn.Dropout(0.2)
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images) -> torch.Tensor:
         """
         Args:
-            images: (batch, 3, 224, 224)
+            images: (batch, 3, 224, 224) tensor for vit/clip, or a dict with
+                     "flattened_patches"/"attention_mask" tensors for pix2struct.
         Returns:
             (batch, hidden_dim)
         """
         with torch.no_grad():
-            outputs = self.backbone(images, return_dict=True)
-            if self.backbone_name == "clip":
-                features = outputs.pooler_output  # (batch, 768), CLIP's own pooled output
+            if self.backbone_name == "pix2struct":
+                attn_mask = images["attention_mask"]
+                outputs = self.backbone(
+                    flattened_patches=images["flattened_patches"],
+                    attention_mask=attn_mask,
+                    return_dict=True,
+                )
+                # Pix2StructVisionModel has no pooler_output (returns plain BaseModelOutput);
+                # mean-pool over valid (non-padding) patch tokens instead.
+                hidden = outputs.last_hidden_state  # (batch, seq_len, 768)
+                mask = attn_mask.unsqueeze(-1).to(hidden.dtype)  # (batch, seq_len, 1)
+                features = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
             else:
-                features = outputs.last_hidden_state[:, 0, :]  # (batch, 768), ViT [CLS]
+                outputs = self.backbone(images, return_dict=True)
+                if self.backbone_name == "clip":
+                    features = outputs.pooler_output  # (batch, 768), CLIP's own pooled output
+                else:
+                    features = outputs.last_hidden_state[:, 0, :]  # (batch, 768), ViT [CLS]
 
         projected = self.projection(features)  # (batch, hidden_dim)
         return self.dropout(projected)
@@ -276,27 +310,39 @@ def extract_image_embeddings(
     batch_size: int = 32,
     image_size: int = 224,
     device: str = "cuda",
+    backbone: str = "vit",
 ) -> None:
     """
-    Extract ViT [CLS] embeddings for all samples and save to disk.
+    Extract pooled image embeddings for all samples and save to disk.
 
     Args:
         dataset:     HuggingFace Dataset with an "image_path" column.
-        encoder:     FrozenImageEncoder instance.
+        encoder:     FrozenImageEncoder instance (must match `backbone`).
         output_path: Path to save the (N, 256) float32 tensor.
         batch_size:  Processing batch size.
-        image_size:  ViT input resolution (default: 224).
+        image_size:  Input resolution for vit/clip (default: 224); unused for pix2struct,
+                     which patchifies the image at its native aspect ratio instead.
         device:      "cuda" or "cpu".
+        backbone:    "vit"/"clip" use a simple resize+[0,1]-normalise preprocessing.
+                     "pix2struct" instead uses Pix2StructImageProcessor to produce
+                     variable-length flattened_patches + attention_mask, since Pix2Struct's
+                     patchify scheme is fundamentally different (see FrozenImageEncoder docstring).
     """
-    logger.info(f"Extracting image embeddings ({len(dataset)} samples)...")
+    logger.info(f"Extracting image embeddings ({len(dataset)} samples, backbone={backbone})...")
     print("[PROGRESS] Extracting image embeddings...")
     sys.stdout.flush()
-    
+
     encoder = encoder.to(device)
     encoder.eval()
-    
+
+    if backbone == "pix2struct":
+        from transformers import Pix2StructImageProcessor
+        p2s_processor = Pix2StructImageProcessor.from_pretrained(
+            IMAGE_BACKBONE_CHECKPOINTS["pix2struct"], max_patches=PIX2STRUCT_MAX_PATCHES
+        )
+
     all_embeddings = []
-    
+
     # Process in batches
     num_batches = (len(dataset) + batch_size - 1) // batch_size
     with tqdm(total=num_batches, desc="Image extraction", unit="batch") as pbar:
@@ -304,35 +350,43 @@ def extract_image_embeddings(
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, len(dataset))
             batch_samples = dataset[start_idx:end_idx]
-            
-            # Load and preprocess images
-            images_list = []
+
+            # Load images as PIL (shared by all backbones)
+            pil_images = []
             for image_path in batch_samples["image_path"]:
                 if isinstance(image_path, str):
                     img = Image.open(image_path).convert("RGB")
                 else:
                     # Assume PIL Image
                     img = image_path.convert("RGB") if hasattr(image_path, "convert") else image_path
-                
-                # Resize and normalize
-                img = img.resize((image_size, image_size), Image.LANCZOS)
-                img_array = np.array(img, dtype=np.float32) / 255.0
-                img_tensor = torch.tensor(img_array).permute(2, 0, 1)  # (3, H, W)
-                images_list.append(img_tensor)
-            
-            images_batch = torch.stack(images_list).to(device)  # (batch, 3, H, W)
-            
+                pil_images.append(img)
+
+            if backbone == "pix2struct":
+                encoded = p2s_processor(images=pil_images, return_tensors="pt")
+                model_input = {
+                    "flattened_patches": encoded["flattened_patches"].to(device),
+                    "attention_mask": encoded["attention_mask"].to(device),
+                }
+            else:
+                images_list = []
+                for img in pil_images:
+                    img = img.resize((image_size, image_size), Image.LANCZOS)
+                    img_array = np.array(img, dtype=np.float32) / 255.0
+                    img_tensor = torch.tensor(img_array).permute(2, 0, 1)  # (3, H, W)
+                    images_list.append(img_tensor)
+                model_input = torch.stack(images_list).to(device)  # (batch, 3, H, W)
+
             # Extract embeddings
             with torch.no_grad():
-                batch_embeddings = encoder(images_batch)  # (batch, 256)
-            
+                batch_embeddings = encoder(model_input)  # (batch, 256)
+
             all_embeddings.append(batch_embeddings.cpu())
             pbar.update(1)
-    
+
     # Concatenate all embeddings
     image_embeddings = torch.cat(all_embeddings, dim=0)  # (total_samples, 256)
     logger.info(f"Image embeddings shape: {image_embeddings.shape}")
-    
+
     # Save to disk
     torch.save(image_embeddings, output_path)
     logger.info(f"✓ Saved image embeddings to {output_path}")
@@ -428,6 +482,7 @@ def main(args):
                 image_output_path,
                 batch_size=32,
                 device=device,
+                backbone=backbone,
             )
             elapsed = time.time() - start_time
             logger.info(f"{asset} image extraction ({backbone}) took {format_duration(elapsed)}")
@@ -801,16 +856,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--image-backbones",
         nargs="+",
-        choices=["vit", "clip"],
+        choices=["vit", "clip", "pix2struct"],
         default=["vit"],
         dest="image_backbones",
-        help="Frozen image encoder backbone(s) to extract, e.g. '--image-backbones vit clip' "
-             "extracts both in a single run (dataset/text embeddings are only loaded/extracted "
-             "once, regardless of how many backbones are listed). 'vit' (default, "
-             "google/vit-base-patch16-224, ImageNet-pretrained) is the thesis's primary "
-             "configuration, saved as image_embeddings.pt. 'clip' (openai/clip-vit-base-patch16 "
-             "vision tower) is a diagnostic-only alternative, saved separately as "
-             "image_embeddings_clip.pt so it does not overwrite the primary ViT embeddings.",
+        help="Frozen image encoder backbone(s) to extract, e.g. '--image-backbones vit clip "
+             "pix2struct' extracts all three in a single run (dataset/text embeddings are only "
+             "loaded/extracted once, regardless of how many backbones are listed). 'vit' "
+             "(default, google/vit-base-patch16-224, ImageNet-pretrained) is the thesis's "
+             "primary configuration, saved as image_embeddings.pt. 'clip' "
+             "(openai/clip-vit-base-patch16 vision tower) and 'pix2struct' (google/pix2struct-base "
+             "vision encoder) are diagnostic-only alternatives, each saved separately as "
+             "image_embeddings_{backbone}.pt so they do not overwrite the primary ViT embeddings.",
     )
     parser.add_argument(
         "--push-to-hf",
